@@ -233,8 +233,8 @@ def activate_workflow(wf):
 async def home():
     return {"message": "Python server is up!", "time": datetime.utcnow().isoformat()}
 
-@app.post("/test/square")
-async def square_endpoint(x: float = Body(..., embed=True)):
+@app.get("/test/square")
+async def square_endpoint(x: float = -12):
     return {"x": x, "square": x * x}
 
 @app.post("/n8n/local/deactivate_all")
@@ -413,4 +413,5 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
+
 
