@@ -244,16 +244,26 @@ def activate_workflow(wf):
 
 def get_youtube_stream_url(video_url: str) -> str:
     try:
-        # Run yt-dlp command to get the direct stream URL
+        cmd = [
+            "yt-dlp",
+            "--force-ipv4",
+            "--cookies", "youtube_cookies.txt",   # <–– add your exported cookies file
+            "--extractor-args", "youtube:player_client=default",
+            "-g", video_url
+        ]
+
         result = subprocess.run(
-            ["yt-dlp", "-f", "best", "-g", video_url],
+            cmd,
             capture_output=True,
             text=True,
             check=True
         )
+
         return result.stdout.strip()
+
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e.stderr.strip()}")
+
 
 # =====================================================
 # ENDPOINTS
@@ -489,4 +499,3 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
-
