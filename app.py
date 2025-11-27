@@ -250,22 +250,22 @@ def get_youtube_stream_url(video_url: str) -> str:
             "yt-dlp",
             "--force-ipv4",
 
-            # Use cookie file created from env var
+            # use cookie file created earlier
             "--cookies", COOKIE_PATH,
 
-            # Android client is most stable for YouTube streaming
-            "--extractor-args", "youtube:player_client=android",
+            # must use web client because android DOES NOT support cookies
+            "--extractor-args", "youtube:player_client=web",
 
-            # -g = print direct media URL only
-            "-g",
+            # YouTube blocks non-browser UAs when using "web" client
+            "--user-agent", 
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+
+            "-g",  # get direct stream URL
             video_url
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
             raise Exception(result.stderr.strip())
@@ -273,7 +273,7 @@ def get_youtube_stream_url(video_url: str) -> str:
         stream_url = result.stdout.strip()
 
         if not stream_url:
-            raise Exception("yt-dlp returned empty output")
+            raise Exception("Empty URL — YouTube blocked this request.")
 
         return stream_url
 
