@@ -4,6 +4,8 @@ import os
 import socket
 import threading
 import logging
+import subprocess
+
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 
@@ -97,7 +99,9 @@ DEFAULT_WORKFLOWS = [
     "ig-sidehustle PINTEREST 3",
     "office-hours",
     "__backup",
-    "readiness-probe"
+    "readiness-probe",
+    "report-render-cloud-stats",
+
 ]
 
 def pick_tumblr_account(name: str):
@@ -131,7 +135,7 @@ class KiteManager:
 
     def has_token(self) -> bool:
         with self._lock:
-            return bool(self._access_token)
+            return bool(self._access_token and self._access_token.strip())
 
     def login_url(self) -> str:
         url = self._kite.login_url()
@@ -141,14 +145,27 @@ class KiteManager:
     def generate_session(self, request_token: str) -> dict:
         if not request_token:
             raise ValueError("request_token is required")
+        
         with self._lock:
-            data = self._kite.generate_session(request_token, api_secret=self.api_secret)
-            token = data.get("access_token")
-            if not token:
-                raise RuntimeError("No access_token returned from Kite")
-            self.set_access_token(token)
-            logger.info("Kite session generated and token stored")
-            return data
+            try:
+                logger.info("Attempting to generate Kite session with request_token=%s...", request_token[:10])
+                data = self._kite.generate_session(request_token, api_secret=self.api_secret)
+                
+                token = data.get("access_token")
+                if not token:
+                    logger.error("Kite generate_session succeeded but returned NO access_token! Response: %s", data)
+                    raise RuntimeError("Kite returned empty access_token. Likely wrong API_SECRET or revoked app.")
+                
+                self.set_access_token(token)
+                logger.info("Kite session generated SUCCESSFULLY. User: %s", data.get("user_id"))
+                return data
+
+            except Exception as e:
+                logger.exception("Kite generate_session FAILED completely")
+                # Re-raise with clear message
+                if "invalid" in str(e).lower() or "secret" in str(e).lower():
+                    raise RuntimeError(f"Kite session failed: {e} → Check KITE_API_SECRET is correct and matches your app on developers.kite.trade")
+                raise RuntimeError(f"Kite session failed: {e}")
 
     def historical_data(self, instrument_token: int, from_date: datetime, to_date: datetime, interval: str):
         if not self.has_token():
@@ -225,6 +242,19 @@ def activate_workflow(wf):
     logger.info("Activating workflow: %s (%s)", wf["name"], wf["id"])
     return requests.post(url, headers=headers, timeout=10)
 
+def get_youtube_stream_url(video_url: str) -> str:
+    try:
+        # Run yt-dlp command to get the direct stream URL
+        result = subprocess.run(
+            ["yt-dlp", "-f", "best", "-g", video_url],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e.stderr.strip()}")
+
 # =====================================================
 # ENDPOINTS
 # =====================================================
@@ -236,6 +266,14 @@ async def home():
 @app.get("/test/square")
 async def square_endpoint(x: float = -12):
     return {"x": x, "square": x * x}
+
+@app.get("/get_streamable")
+def streamable(video_url: str = Query(..., description="YouTube video URL")):
+    """
+    Returns the direct streamable URL of a YouTube video.
+    """
+    stream_url = get_youtube_stream_url(video_url)
+    return {"video_url": video_url, "stream_url": stream_url}
 
 @app.post("/n8n/local/deactivate_all")
 async def deactivate_all():
@@ -341,16 +379,54 @@ async def kite_set_token(body: KiteSetTokenRequest):
     kite_manager.set_access_token(body.access_token)
     return {"message": "access_token_set"}
 
-@app.post("/kite/candles")
-async def kite_candles(body: KiteCandlesRequest):
-    to_date = datetime.utcnow()
-    from_date = to_date - timedelta(days=body.days)
-    data = kite_manager.historical_data(body.instrument_token, from_date, to_date, body.interval)
-    return {"count": len(data), "candles": data}
-
 @app.post("/kite/ltp")
 async def kite_ltp(body: KiteLTPRequest):
-    return kite_manager.ltp(body.symbols)
+    if not kite_manager.has_token():
+        raise HTTPException(401, "No valid Kite access token. Go to /kite/force_refresh and re-authenticate.")
+    try:
+        return kite_manager.ltp(body.symbols)
+    except Exception as e:
+        if "access_token" in str(e):
+            raise HTTPException(401, "Invalid/expired Kite token. Use /kite/force_refresh to get new login URL.")
+        raise
+
+@app.post("/kite/candles")
+async def kite_candles(body: KiteCandlesRequest):
+    if not kite_manager.has_token():
+        raise HTTPException(401, "No Kite access token. Use /kite/force_refresh")
+    try:
+        to_date = datetime.utcnow()
+        from_date = to_date - timedelta(days=body.days)
+        data = kite_manager.historical_data(body.instrument_token, from_date, to_date, body.interval)
+        return {"count": len(data), "candles": data}
+    except Exception as e:
+        if "access_token" in str(e):
+            raise HTTPException(401, "Kite token invalid. Use /kite/force_refresh")
+        raise
+
+@app.get("/kite/debug")
+async def kite_debug():
+    return {
+        "has_token": kite_manager.has_token(),
+        "token_preview": kite_manager._access_token[:20] + "..." if kite_manager._access_token else None,
+        "api_key": os.getenv("KITE_API_KEY"),
+        "api_secret_length": len(os.getenv("KITE_API_SECRET", "")),
+        "api_secret_preview": os.getenv("KITE_API_SECRET", "")[:8] + "..." if os.getenv("KITE_API_SECRET") else None,
+        "env_token_set": bool(os.getenv("KITE_ACCESS_TOKEN", "").strip())
+    }
+
+@app.post("/kite/force_refresh")
+async def force_kite_refresh():
+    # Don't wipe with empty string — just clear the variable safely
+    with kite_manager._lock:
+        kite_manager._access_token = None
+        kite_manager._kite.set_access_token(None)  # This is allowed
+    logger.warning("Kite token cleared from memory. Ready for fresh login.")
+    return {
+        "status": "token_cleared",
+        "message": "Old token removed. Use the login_url below to authenticate again.",
+        "login_url": kite_manager.login_url()
+    }
 
 # =====================================================
 # CRON: Exactly one worker runs this daily at 9:50 AM IST
@@ -413,5 +489,4 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
-
 
