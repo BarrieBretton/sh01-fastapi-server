@@ -104,11 +104,17 @@ DEFAULT_WORKFLOWS = [
 
 ]
 
+COOKIE_PATH = "youtube_cookies.txt"
+
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
     if name == "vlvt.ave":
         return oauth_vlvt, T_VL_BID, "VLVT_AVE"
     return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
+
+# Run once when server starts
+write_cookie_file_once()
+
 
 # =====================================================
 # KITE MANAGER
@@ -247,23 +253,39 @@ def get_youtube_stream_url(video_url: str) -> str:
         cmd = [
             "yt-dlp",
             "--force-ipv4",
-            "--cookies", "youtube_cookies.txt",   # <–– add your exported cookies file
-            "--extractor-args", "youtube:player_client=default",
-            "-g", video_url
+
+            # Use cookie file created from env var
+            "--cookies", COOKIE_PATH,
+
+            # Android client is most stable for YouTube streaming
+            "--extractor-args", "youtube:player_client=android",
+
+            # -g = print direct media URL only
+            "-g",
+            video_url
         ]
 
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
-            check=True
+            text=True
         )
 
-        return result.stdout.strip()
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip())
 
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e.stderr.strip()}")
+        stream_url = result.stdout.strip()
 
+        if not stream_url:
+            raise Exception("yt-dlp returned empty output")
+
+        return stream_url
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to fetch stream URL: {str(e)}"
+        )
 
 # =====================================================
 # ENDPOINTS
@@ -280,10 +302,13 @@ async def square_endpoint(x: float = -12):
 @app.get("/get_streamable")
 def streamable(video_url: str = Query(..., description="YouTube video URL")):
     """
-    Returns the direct streamable URL of a YouTube video.
+    Returns the direct streamable URL of a YouTube video using yt-dlp + secure cookies.
     """
     stream_url = get_youtube_stream_url(video_url)
-    return {"video_url": video_url, "stream_url": stream_url}
+    return {
+        "video_url": video_url,
+        "stream_url": stream_url
+    }
 
 @app.post("/n8n/local/deactivate_all")
 async def deactivate_all():
