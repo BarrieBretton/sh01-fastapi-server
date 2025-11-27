@@ -23,7 +23,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # =====================================================
-# ENV & LOGGING SETUP
+# ENV & LOGGING SETUP   
 # =====================================================
 
 load_dotenv(".env")
@@ -101,16 +101,18 @@ DEFAULT_WORKFLOWS = [
     "__backup",
     "readiness-probe",
     "report-render-cloud-stats",
-
+    "ai-image-model-cyootstuff",
 ]
 
 COOKIE_PATH = "youtube_cookies.txt"
 
-def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
     if name == "vlvt.ave":
         return oauth_vlvt, T_VL_BID, "VLVT_AVE"
-    return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
+    if name == "erika.devereux":
+        return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
+    if name == "cyootstuff":
+        return oauth_erika, T_EK_BID, "CYOOTSTUFF"
 
 # =====================================================
 # KITE MANAGER
@@ -542,4 +544,3 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
-
