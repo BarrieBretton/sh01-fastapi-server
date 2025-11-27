@@ -112,10 +112,6 @@ def pick_tumblr_account(name: str):
         return oauth_vlvt, T_VL_BID, "VLVT_AVE"
     return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
 
-# Run once when server starts
-write_cookie_file_once()
-
-
 # =====================================================
 # KITE MANAGER
 # =====================================================
@@ -509,6 +505,28 @@ def start_cron_scheduler():
     logger.info("APScheduler started — this worker will run daily cron at 9:50 AM IST")
 
 # =====================================================
+# writing cookie file for youtube connection
+# =====================================================
+
+def write_cookie_file_once():
+    """
+    Creates youtube_cookies.txt from the YT_COOKIES environment variable.
+    This runs only once on server startup.
+    """
+    cookie_env = os.environ.get("YT_COOKIES")
+
+    if not cookie_env:
+        raise RuntimeError("YT_COOKIES env var missing — upload cookies first.")
+
+    # Write file only if missing or empty
+    if not os.path.exists(COOKIE_PATH) or os.path.getsize(COOKIE_PATH) == 0:
+        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+            f.write(cookie_env)
+
+# Run once when server starts
+write_cookie_file_once()
+
+# =====================================================
 # Worker startup hook (runs in every uvicorn worker)
 # =====================================================
 
@@ -524,3 +542,4 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
+
