@@ -82,6 +82,14 @@ oauth_vlvt = OAuth1(
 )
 T_VL_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_VLVT_AVE")
 
+oauth_cyootstuff = OAuth1(
+    os.getenv("TUMBLR_CONSUMER_KEY_CYOOTSTUFF_AVE"),
+    os.getenv("TUMBLR_CONSUMER_SECRET_CYOOTSTUFF_AVE"),
+    os.getenv("TUMBLR_TOKEN_CYOOTSTUFF_AVE"),
+    os.getenv("TUMBLR_TOKEN_SECRET_CYOOTSTUFF_AVE"),
+)
+T_CY_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_CYOOTSTUFF_AVE")
+
 # n8n
 N8N_API_KEY = os.getenv("N8N_API_KEY")
 N8N_BASE_URL = os.getenv("N8N_BASE_URL", "").rstrip("/") + "/api/v1"
@@ -106,13 +114,14 @@ DEFAULT_WORKFLOWS = [
 
 COOKIE_PATH = "youtube_cookies.txt"
 
+def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
     if name == "vlvt.ave":
         return oauth_vlvt, T_VL_BID, "VLVT_AVE"
     if name == "erika.devereux":
         return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
     if name == "cyootstuff":
-        return oauth_erika, T_EK_BID, "CYOOTSTUFF"
+        return oauth_cyootstuff, T_CY_BID, "CYOOTSTUFF"
 
 # =====================================================
 # KITE MANAGER
@@ -544,3 +553,4 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
+
