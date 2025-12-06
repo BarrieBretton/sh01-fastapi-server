@@ -237,7 +237,7 @@ def get_all_workflows():
     url = f"{N8N_BASE_URL}/workflows"
     headers = {"X-N8N-API-KEY": N8N_API_KEY}
     logger.debug("Fetching all n8n workflows from %s", url)
-    r = requests.get(url, headers=headers, timeout=10)
+    r = requests.get(url, headers=headers, timeout=60)
     data = safe_json(r)
     if not data:
         raise RuntimeError("n8n API returned non-JSON. Check N8N_BASE_URL and API key.")
@@ -247,13 +247,13 @@ def deactivate_workflow(wf):
     url = f"{N8N_BASE_URL}/workflows/{wf['id']}/deactivate"
     headers = {"X-N8N-API-KEY": N8N_API_KEY}
     logger.info("Deactivating workflow: %s (%s)", wf["name"], wf["id"])
-    return requests.post(url, headers=headers, timeout=10)
+    return requests.post(url, headers=headers, timeout=60)
 
 def activate_workflow(wf):
     url = f"{N8N_BASE_URL}/workflows/{wf['id']}/activate"
     headers = {"X-N8N-API-KEY": N8N_API_KEY}
     logger.info("Activating workflow: %s (%s)", wf["name"], wf["id"])
-    return requests.post(url, headers=headers, timeout=10)
+    return requests.post(url, headers=headers, timeout=60)
 
 def get_youtube_stream_url(video_url: str) -> str:
     try:
@@ -360,7 +360,7 @@ async def post_tumblr_image(body: TumblrPostRequest):
             f"https://api.tumblr.com/v2/blog/{blog_id}/post",
             data={"type": "photo", "source": body.image_url, "caption": body.caption or ""},
             auth=oauth,
-            timeout=20,
+            timeout=120,
         )
         resp.raise_for_status()
         logger.info("Posted to Tumblr (%s)", account)
@@ -372,7 +372,7 @@ async def post_tumblr_image(body: TumblrPostRequest):
 @app.post("/post_image")
 async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
     try:
-        img_resp = requests.get(image_url, stream=True, timeout=15)
+        img_resp = requests.get(image_url, stream=True, timeout=90)
         img_resp.raise_for_status()
 
         files = {"media": ("image.jpg", img_resp.raw, img_resp.headers.get("Content-Type", "image/jpeg"))}
@@ -381,7 +381,7 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
             auth=oauth_x,
             files=files,
             data={"media_category": "tweet_image"},
-            timeout=30,
+            timeout=180,
         )
         upload.raise_for_status()
         media_id = upload.json()["media_id_string"]
@@ -390,7 +390,7 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
             "https://api.x.com/2/tweets",
             auth=oauth_x,
             json={"text": text, "media": {"media_ids": [media_id]}},
-            timeout=30,
+            timeout=180,
         )
         tweet.raise_for_status()
         logger.info("Posted to X successfully")
@@ -489,7 +489,7 @@ async def run_daily_activation():
     url = "http://localhost:5000/n8n/local/activate"
     logger.info("Executing daily 9:50 AM n8n workflow activation...")
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             r = await client.post(url)
             if r.status_code == 200:
                 logger.info("Daily n8n activation succeeded")
@@ -553,4 +553,3 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
-
