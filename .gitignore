@@ -159,3 +159,5 @@ secrets.*
 
 **.session*
 
+token.json
+test.py

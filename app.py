@@ -13,6 +13,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
 
+# Add this import at the top with other imports
+from sheets_helper import (
+    get_sheets_service,
+    list_sheet_names,
+    read_sheet_by_name,
+    filter_status_rows,
+    update_cell,
+    get_column_letter,
+    SPREADSHEET_ID
+)
+
 # Basic HTTP Requests
 import httpx
 import redis
@@ -40,6 +51,11 @@ from apscheduler.triggers.cron import CronTrigger
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 from telethon.errors import FloodWaitError
+
+# Google OAuth
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 
 # =====================================================
 # SANITY CHECKS   
@@ -911,7 +927,7 @@ async def upload_via_mtproto(video_path: Path, chat_id: int = TELEGRAM_CHAT_ID) 
 
 @app.get("/")
 async def home():
-    return {"message": "Python server is up!", "time": datetime.utcnow().isoformat()}
+    return {"message": "Python server is up!", "time": datetime.now().isoformat()}
 
 @app.get("/test/square")
 async def square_endpoint(x: float = -12):
@@ -1150,6 +1166,99 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
     except Exception as e:
         logger.exception("X post failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Google Sheets Endpoints
+# Add this endpoint to app.py (anywhere with the other endpoints)
+@app.post("/sheets/process_streamables")
+async def process_streamables_endpoint(
+    acc_name: str = Query("erika.devereux", description="Account name to filter"),
+    sheet_name: str = Query("streamables", description="Sheet name to process")
+):
+    """
+    Process streamables from Google Sheets:
+    1. Filter rows by status and account
+    2. Download each video and upload to Cloudinary
+    3. Update sheet with status and URL
+    
+    This is a long-running operation - may take several minutes.
+    """
+    try:
+        service = get_sheets_service()
+        
+        # Read sheet
+        rows = read_sheet_by_name(service, sheet_name)
+        if not rows:
+            return {"success": False, "message": "No data found in sheet"}
+        
+        header = rows[0]
+        
+        # Filter rows
+        filtered = filter_status_rows(rows)
+        account_filtered = [row for row in filtered if row.get("account") == acc_name]
+        
+        logger.info(f"Processing {len(account_filtered)} rows for account '{acc_name}'")
+        
+        # Get column letters
+        status_col = get_column_letter(header, "status")
+        url_col = get_column_letter(header, "url")
+        
+        results = []
+        
+        for row_data in account_filtered:
+            row_number = row_data["row_number"]
+            yt_link = row_data.get("yt_link", "")
+            
+            if not yt_link:
+                continue
+            
+            try:
+                # Use existing get_streamable logic
+                mp4_path = await asyncio.get_running_loop().run_in_executor(
+                    None, get_streamable_mp4, yt_link
+                )
+                
+                cloudinary_data = await asyncio.get_running_loop().run_in_executor(
+                    None, upload_to_cloudinary, mp4_path
+                )
+                
+                cloudinary_url = cloudinary_data["secure_url"]
+                
+                # Update sheet
+                update_cell(service, sheet_name, row_number, status_col, "staged-to-cloudinary")
+                update_cell(service, sheet_name, row_number, url_col, cloudinary_url)
+                
+                results.append({
+                    "row_number": row_number,
+                    "status": "success",
+                    "url": cloudinary_url
+                })
+                
+                # Cleanup
+                cleanup_video_file(mp4_path)
+                
+            except Exception as e:
+                logger.exception(f"Failed to process row {row_number}")
+                results.append({
+                    "row_number": row_number,
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        success_count = sum(1 for r in results if r["status"] == "success")
+        
+        return {
+            "success": True,
+            "total_processed": len(results),
+            "successful": success_count,
+            "failed": len(results) - success_count,
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.exception("Error processing streamables")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Kite Endpoints
 
 @app.get("/kite/login_url")
 async def kite_login_url():
