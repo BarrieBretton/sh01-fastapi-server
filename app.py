@@ -132,6 +132,18 @@ FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
 if not FB_PAGE_ID or not FB_PAGE_ACCESS_TOKEN:
     logger.warning("FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN missing – /video-to-fb will be disabled")
 
+def create_oauth1(consumer_key, consumer_secret, token, token_secret, name):
+    missing = []
+    if not consumer_key: missing.append("consumer_key")
+    if not consumer_secret: missing.append("consumer_secret")
+    if not token: missing.append("oauth_token")
+    if not token_secret: missing.append("oauth_token_secret")
+
+    if missing:
+        logger.error(f"Tumblr OAuth misconfigured for {name}: missing {', '.join(missing)}")
+        return None
+    return OAuth1(consumer_key, consumer_secret, token, token_secret)
+
 # X/Twitter OAuth1
 oauth_x = OAuth1(
     os.getenv("API_KEY"),
@@ -141,29 +153,43 @@ oauth_x = OAuth1(
 )
 
 # Tumblr accounts
-oauth_erika = OAuth1(
+oauth_erika = create_oauth1(
     os.getenv("TUMBLR_CONSUMER_KEY_ERIKA_DEVEREUX"),
     os.getenv("TUMBLR_CONSUMER_SECRET_ERIKA_DEVEREUX"),
     os.getenv("TUMBLR_TOKEN_ERIKA_DEVEREUX"),
     os.getenv("TUMBLR_TOKEN_SECRET_ERIKA_DEVEREUX"),
+    "erika.devereux"
 )
 T_EK_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_ERIKA_DEVEREUX")
 
-oauth_vlvt = OAuth1(
+oauth_vlvt = create_oauth1(
     os.getenv("TUMBLR_CONSUMER_KEY_VLVT_AVE"),
     os.getenv("TUMBLR_CONSUMER_SECRET_VLVT_AVE"),
     os.getenv("TUMBLR_TOKEN_VLVT_AVE"),
     os.getenv("TUMBLR_TOKEN_SECRET_VLVT_AVE"),
+    "vlvt.ave"
 )
 T_VL_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_VLVT_AVE")
 
-oauth_cyootstuff = OAuth1(
-    os.getenv("TUMBLR_CONSUMER_KEY_CYOOTSTUFF_AVE"),
-    os.getenv("TUMBLR_CONSUMER_SECRET_CYOOTSTUFF_AVE"),
-    os.getenv("TUMBLR_TOKEN_CYOOTSTUFF_AVE"),
-    os.getenv("TUMBLR_TOKEN_SECRET_CYOOTSTUFF_AVE"),
+oauth_cyootstuff = create_oauth1(
+    os.getenv("TUMBLR_CONSUMER_KEY_CYOOTSTUFF"),
+    os.getenv("TUMBLR_CONSUMER_SECRET_CYOOTSTUFF"),
+    os.getenv("TUMBLR_TOKEN_CYOOTSTUFF"),
+    os.getenv("TUMBLR_TOKEN_SECRET_CYOOTSTUFF"),
+    "cyootstuff"
 )
-T_CY_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_CYOOTSTUFF_AVE")
+T_CY_BID = os.getenv("TUMBLR_BLOG_IDENTIFIER_CYOOTSTUFF")
+
+# After loading env
+required_blog_ids = {
+    "T_EK_BID": T_EK_BID,
+    "T_VL_BID": T_VL_BID,
+    "T_CY_BID": T_CY_BID,
+}
+
+for var, val in required_blog_ids.items():
+    if not val:
+        logger.error(f"{var} is missing in .env")
 
 # n8n
 N8N_API_KEY = os.getenv("N8N_API_KEY")
@@ -213,11 +239,19 @@ app = FastAPI(title="Python Server - X/Tumblr/Kite/n8n/Telegram", version="2.1")
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
     if name == "vlvt.ave":
+        if oauth_vlvt is None:
+            raise HTTPException(status_code=500, detail="Tumblr account 'vlvt.ave' not configured")
         return oauth_vlvt, T_VL_BID, "VLVT_AVE"
     if name == "erika.devereux":
+        if oauth_erika is None:
+            raise HTTPException(status_code=500, detail="Tumblr account 'erika.devereux' not configured")
         return oauth_erika, T_EK_BID, "ERIKA_DEVEREUX"
     if name == "cyootstuff":
+        if oauth_cyootstuff is None:
+            raise HTTPException(status_code=500, detail="Tumblr account 'cyootstuff' not configured")
         return oauth_cyootstuff, T_CY_BID, "CYOOTSTUFF"
+
+    raise HTTPException(status_code=400, detail=f"Unknown tumblr_account: {name}")
 
 # Global client
 tg_client = None
@@ -1123,10 +1157,16 @@ async def activate_selected(workflows: str = Query(None)):
 @app.post("/post_tumblr")
 async def post_tumblr_image(body: TumblrPostRequest):
     oauth, blog_id, account = pick_tumblr_account(body.tumblr_account)
+    caption = (body.caption or "").strip()
     try:
+        logger.info("Using blog_id=%s, image_url=%s, caption=%s", blog_id, body.image_url, body.caption)
         resp = requests.post(
             f"https://api.tumblr.com/v2/blog/{blog_id}/post",
-            data={"type": "photo", "source": body.image_url, "caption": body.caption or ""},
+            data = {
+                "type": "photo",
+                "source": body.image_url,
+                "caption": caption
+            },
             auth=oauth,
             timeout=120,
         )
