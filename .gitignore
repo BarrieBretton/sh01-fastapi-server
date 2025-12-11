@@ -157,6 +157,8 @@ docker-compose.override.yml
 config.local.*
 secrets.*
 credentials.json
+service_account.json
+
 
 **.session*
 
