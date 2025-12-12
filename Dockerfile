@@ -16,7 +16,6 @@ RUN apt-get update && \
 
 RUN pip install --upgrade pip setuptools wheel
 
-COPY service_account.json .
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -129,9 +129,9 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
 # Telegram Bot
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MAX_CHUNK_SIZE = 19 * 1024 * 1024          # 19 MiB  (Telegram bot limit = 50 MiB)
-METADATA_SHEET = "streamables_metadata"   # your blank sheet
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "-5071573945"))
+MAX_CHUNK_SIZE = 19 * 1024 * 1024          # ~25.3 MiB  (Telegram bot limit = ???)
+METADATA_SHEET = "streamables_metadata"   # streamables metadata sheet
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "-5071573945")) # Streamables group chat ID
 
 
 if not TELEGRAM_BOT_TOKEN:
@@ -385,20 +385,28 @@ def _search_metadata(service, streamable_id: str) -> Optional[dict]:
 # CLOUDINARY HELPER
 # =====================================================
 
-def _upload_chunks_to_telegram_sync(video_path: Path, yt_link: str, service) -> dict:
+def _upload_chunks_to_telegram_sync(video_path: Path, yt_link: str, service, single_file: bool = False) -> dict:
     file_size = video_path.stat().st_size
     streamable_id = str(uuid.uuid4())
     uploaded_at = datetime.utcnow().isoformat()
 
     chunk_paths = []
-    with open(video_path, "rb") as f:
-        while True:
-            data = f.read(MAX_CHUNK_SIZE)
-            if not data:
-                break
-            tmp = DOWNLOADS_DIR / f"{streamable_id}_part{len(chunk_paths)}.bin"
-            tmp.write_bytes(data)
-            chunk_paths.append(tmp)
+
+    if single_file:
+        # --- Single chunk mode: whole file as 1 chunk ---
+        tmp = DOWNLOADS_DIR / f"{streamable_id}_part0.bin"
+        tmp.write_bytes(video_path.read_bytes())
+        chunk_paths.append(tmp)
+    else:
+        # --- Normal chunking (19 MiB) ---
+        with open(video_path, "rb") as f:
+            while True:
+                data = f.read(MAX_CHUNK_SIZE)
+                if not data:
+                    break
+                tmp = DOWNLOADS_DIR / f"{streamable_id}_part{len(chunk_paths)}.bin"
+                tmp.write_bytes(data)
+                chunk_paths.append(tmp)
 
     total_chunks = len(chunk_paths)
     chunk_msg_ids = []
@@ -435,13 +443,13 @@ uploaded_at: {uploaded_at}
     logger.info("Chunked upload finished – streamable_id=%s (%d chunks)", streamable_id, total_chunks)
     return {
         "public_id": streamable_id,
-        # "secure_url": f"t.me/c/{str(TELEGRAM_CHAT_ID)[1:]}/{chunk_msg_ids[0]}",
         "secure_url": f"https://t.me/c/{str(TELEGRAM_CHAT_ID)[1:]}/{chunk_msg_ids[0]}",
         "duration": None,
         "format": "mp4",
         "bytes": file_size,
         "created_at": uploaded_at
     }
+
 
 # =====================================================
 # FB HELPER
@@ -1183,7 +1191,8 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
 @app.post("/sheets/process_streamables")
 async def process_streamables_endpoint(
     acc_name: str = Query("dave.commercial7"),
-    sheet_name: str = Query("streamables")
+    sheet_name: str = Query("streamables"),
+    single_file: bool = Query(False, description="If true, uploads entire video as a single chunk")
 ):
     service = get_sheets_service()
     _ensure_metadata_header(service)
@@ -1193,7 +1202,6 @@ async def process_streamables_endpoint(
         return {"success": False, "message": "No data"}
 
     header = rows[0]
-    # FIXED: correct status name
     filtered = filter_status_rows(rows, ['staged-to-telegram', 'uploaded'], exclude_status=True)
     filtered = [r for r in filtered if r.get("account") == acc_name]
 
@@ -1201,7 +1209,6 @@ async def process_streamables_endpoint(
     url_col = get_column_letter(header, "url")
     results = []
 
-    # Use a fresh variable name — never use "loop" for anything else
     event_loop = asyncio.get_running_loop()
 
     for row in filtered:
@@ -1213,13 +1220,11 @@ async def process_streamables_endpoint(
 
         try:
             # 1. Download + re-encode
-            mp4_path = await event_loop.run_in_executor(
-                None, get_streamable_mp4, yt_link
-            )
+            mp4_path = await event_loop.run_in_executor(None, get_streamable_mp4, yt_link)
 
-            # 2. Upload chunks → Telegram → metadata
+            # 2. Upload chunks → Telegram → metadata (respect single_file param)
             meta = await event_loop.run_in_executor(
-                None, _upload_chunks_to_telegram_sync, mp4_path, yt_link, service
+                None, _upload_chunks_to_telegram_sync, mp4_path, yt_link, service, single_file
             )
 
             # 3. Update sheet

@@ -41,7 +41,7 @@ from dotenv import load_dotenv
 from google.oauth2 import service_account
 
 from google.auth.transport.requests import Request
-# from google.oauth2.credentials import Credentials
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -113,16 +113,65 @@ def detect_client_type(credentials_path: Path) -> str:
         return 'installed'
 
 
-def get_credentials() -> service_account.Credentials:
-    """Use Service Account - no browser, no code, auto-refresh forever."""
-    scopes = ['https://www.googleapis.com/auth/spreadsheets']
-    creds = service_account.Credentials.from_service_account_file(
-        "service_account.json", scopes=scopes
-    )
-    # Optional: delegate if you want to impersonate a user (not needed for most cases)
-    # creds = creds.with_subject("your-user@domain.com")
-    return creds
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. CREDENTIALS – Service Account OR OAuth2 (user token (both supported)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_credentials():
+    """
+    Returns authenticated Google credentials.
+    Priority order (highest first):
+      1. GOOGLE_SERVICE_ACCOUNT  → service account (recommended for servers)
+      2. GOOGLE_TOKEN_JSON            → OAuth2 user token (with refresh (for personal sheets)
+      3. service_account.json file    → fallback for local dev only
+      4. token.json file              → fallback for local dev only
+    """
 
+    # 1. Service Account from env var (most secure & recommended)
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT")
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception as e:
+            raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT: {e}")
+
+    # 2. OAuth2 user token with refresh from env var
+    token_json = os.getenv("GOOGLE_TOKEN_JSON")
+    if token_json:
+        try:
+            creds_info = json.loads(token_json)
+            creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
+            # Refresh if expired
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                logger.info("Refreshed expired Google OAuth2 token from GOOGLE_TOKEN_JSON")
+            return creds
+        except Exception as e:
+            raise RuntimeError(f"Invalid GOOGLE_TOKEN_JSON: {e}")
+
+    # 3. Fallback: service_account.json file (local dev only)
+    if os.path.exists("service_account.json"):
+        logger.warning("Using local service_account.json (only for development)")
+        return service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+
+    # 4. Fallback: token.json file (local dev only)
+    if os.path.exists("token.json"):
+        logger.warning("Using local token.json (only for development)")
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save refreshed token back to file for next local run
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
+        return creds
+
+    raise RuntimeError(
+        "No Google credentials found!\n"
+        "Set either:\n"
+        "  • GOOGLE_SERVICE_ACCOUNT (recommended), or\n"
+        "  • GOOGLE_TOKEN_JSON\n"
+        "or place service_account.json / token.json in project root for local dev."
+    )
 
 def get_sheets_service():
     """
