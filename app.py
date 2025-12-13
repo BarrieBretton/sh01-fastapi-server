@@ -26,6 +26,9 @@ from sheets_helper import (
     SPREADSHEET_ID
 )
 
+# B2 imports (replacing ImageKit)
+from b2_helper import get_b2_manager, upload_to_b2
+
 # Basic HTTP Requests
 import httpx
 import redis
@@ -39,20 +42,10 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Cloudinary
-# import cloudinary
-# import cloudinary.uploader
-# import cloudinary.api
-
 # Kite Zerodha Connectivity
 from kiteconnect import KiteConnect, KiteTicker
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-
-# Telegram Client (Supports larger video file handling)
-from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
-from telethon.errors import FloodWaitError
 
 # Google OAuth
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -62,7 +55,6 @@ from google.oauth2.credentials import Credentials
 import base64
 import uuid
 import json
-# from telethon.tl.functions.messages import GetMessagesRequest
 
 # =====================================================
 # SANITY CHECKS   
@@ -100,6 +92,16 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"DOWNLOADS_DIR: {DOWNLOADS_DIR}")
 
+# B2 Configuration
+BACKBLAZE_KEY_ID = os.getenv("BACKBLAZE_KEY_ID")
+BACKBLAZE_APPLICATION_KEY = os.getenv("BACKBLAZE_APPLICATION_KEY")
+BACKBLAZE_BUCKET_NAME = os.getenv("BACKBLAZE_BUCKET_NAME")
+
+if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY:
+    logger.warning("BACKBLAZE_KEY_ID or BACKBLAZE_APPLICATION_KEY not set - B2 uploads will fail")
+if not BACKBLAZE_BUCKET_NAME:
+    logger.warning("BACKBLAZE_BUCKET_NAME not set - bucket name must be provided per upload")
+
 # Console handler
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
@@ -114,28 +116,6 @@ logger.info("Application starting up...")
 # =====================================================
 # CONFIG & AUTH
 # =====================================================
-
-# Telegram Client's User Session
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-# TELEGRAM_SESSION = "tg_mtproto_session"          # file name
-
-# if TELEGRAM_API_ID and TELEGRAM_API_HASH:
-#     tg_client = TelegramClient(TELEGRAM_SESSION, int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
-#     tg_client.start()                     # will ask for phone/code only the first run
-# else:
-#     tg_client = None
-#     logger.warning("TELEGRAM_API_ID/HASH missing – MTProto upload disabled")
-
-# Telegram Bot
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MAX_CHUNK_SIZE = 19 * 1024 * 1024          # ~25.3 MiB  (Telegram bot limit = ???)
-METADATA_SHEET = "streamables_metadata"   # streamables metadata sheet
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "-5071573945")) # Streamables group chat ID
-
-
-if not TELEGRAM_BOT_TOKEN:
-    logger.warning("TELEGRAM_BOT_TOKEN not set in .env - Telegram features will not work")
 
 # FB Page Connectivity
 FB_PAGE_ID = os.getenv("FB_PAGE_ID")
@@ -227,28 +207,9 @@ DEFAULT_WORKFLOWS = [
     "streamables-to-dave.commercial7",
 ]
 
-# Cloudinary Setup
-# CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
-# CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
-# CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
-# CLOUDINARY_UPLOAD_PRESET = os.getenv("CLOUDINARY_UPLOAD_PRESET")  # Optional
-# 
-# if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
-#     cloudinary.config(
-#         cloud_name=CLOUDINARY_CLOUD_NAME,
-#         api_key=CLOUDINARY_API_KEY,
-#         api_secret=CLOUDINARY_API_SECRET,
-#         secure=True
-#     )
-#     logger.info("Cloudinary configured successfully")
-#     if CLOUDINARY_UPLOAD_PRESET:
-#         logger.info("Upload preset configured: %s", CLOUDINARY_UPLOAD_PRESET)
-# else:
-#     logger.warning("Cloudinary credentials not set - Cloudinary features disabled")
-
 # Start
 
-app = FastAPI(title="Python Server - X/Tumblr/Kite/n8n/Telegram", version="2.1")
+app = FastAPI(title="Python Server - SideHustle-01", version="2.2")
 
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
@@ -266,189 +227,6 @@ def pick_tumblr_account(name: str):
         return oauth_cyootstuff, T_CY_BID, "CYOOTSTUFF"
 
     raise HTTPException(status_code=400, detail=f"Unknown tumblr_account: {name}")
-
-# Global client
-tg_client = None
-
-# async def init_telegram_client():
-#     global tg_client
-#     if TELEGRAM_API_ID and TELEGRAM_API_HASH:
-#         tg_client = TelegramClient(TELEGRAM_SESSION, int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
-#         await tg_client.start()  # ← Now properly awaited
-#         logger.info("Telegram MTProto client started and authenticated")
-#     else:
-#         tg_client = None
-#         logger.warning("TELEGRAM_API_ID/HASH missing – MTProto upload disabled")
-
-@app.on_event("startup")
-async def startup_bot_client():
-    global tg_client
-
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_API_ID and TELEGRAM_API_HASH):
-        logger.warning("Telegram credentials missing — skipping client")
-        return
-
-    # Each worker gets its own session + aggressive lock avoidance
-    session_name = f"bot_worker_{os.getpid()}.session"
-
-    tg_client = TelegramClient(
-        session_name,
-        api_id=int(TELEGRAM_API_ID),
-        api_hash=TELEGRAM_API_HASH,
-        # These 3 lines are the nuclear option — NO MORE LOCKS
-        sequential_updates=True,      # ← Critical
-        flood_sleep_threshold=86400,  # ← Never sleep on flood
-        request_retries=10,
-        connection_retries=None,
-        retry_delay=3,
-        auto_reconnect=True,
-        # update_workers=0,  # ← disables background update loop
-    )
-
-    # Super safe start with jitter + retry
-    for attempt in range(10):
-        try:
-            await asyncio.sleep(random.uniform(0.5, 2.0))  # Spread workers
-            await tg_client.start(bot_token=TELEGRAM_BOT_TOKEN)
-            me = await tg_client.get_me()
-            logger.info(f"Telegram worker {os.getpid()} READY: @{me.username}")
-            return
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e):
-                logger.warning(f"Worker {os.getpid()} DB locked, retry {attempt+1}/10...")
-                await asyncio.sleep(3)
-                continue
-            raise
-        except Exception as e:
-            logger.error(f"Worker {os.getpid()} fatal Telegram error: {e}")
-            raise
-
-@app.on_event("startup")
-async def startup_event():
-    await startup_bot_client()
-    cleanup_old_bin_files()
-
-
-# ----------------------------------------------------------------------
-# GOOGLE SHEETS HELPERS (metadata sheet)
-# ----------------------------------------------------------------------
-def _ensure_metadata_header(service):
-    """Create header row if the sheet is empty."""
-    rows = read_sheet_by_name(service, METADATA_SHEET)
-    if not rows:
-        header = [
-            "streamable_id",      # unique identifier for the whole video
-            "yt_link",            # original YouTube URL
-            "total_chunks",
-            "chunk_msg_ids",      # JSON list of Telegram message ids (one per chunk)
-            "uploaded_at",
-            "status"              # e.g. "uploaded", "partial", "failed"
-        ]
-        service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{METADATA_SHEET}!A1",
-            valueInputOption="RAW",
-            body={"values": [header]}
-        ).execute()
-        logger.info("Created metadata header in %s", METADATA_SHEET)
-
-def _write_metadata_row(service, data: dict):
-    """Append a row to the metadata sheet."""
-    row = [
-        data["streamable_id"],
-        data["yt_link"],
-        data["total_chunks"],
-        json.dumps(data["chunk_msg_ids"]),
-        data["uploaded_at"],
-        data["status"]
-    ]
-    service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{METADATA_SHEET}!A1",
-        valueInputOption="RAW",
-        body={"values": [row]}
-    ).execute()
-
-def _search_metadata(service, streamable_id: str) -> Optional[dict]:
-    """Return the row dict for a given streamable_id (or None)."""
-    rows = read_sheet_by_name(service, METADATA_SHEET)
-    if len(rows) <= 1:               # only header
-        return None
-    header = rows[0]
-    id_idx = header.index("streamable_id")
-    for r in rows[1:]:
-        if len(r) > id_idx and r[id_idx] == streamable_id:
-            return dict(zip(header, r))
-    return None
-
-# =====================================================
-# CLOUDINARY HELPER
-# =====================================================
-
-def _upload_chunks_to_telegram_sync(video_path: Path, yt_link: str, service, single_file: bool = False) -> dict:
-    file_size = video_path.stat().st_size
-    streamable_id = str(uuid.uuid4())
-    uploaded_at = datetime.utcnow().isoformat()
-
-    chunk_paths = []
-
-    if single_file:
-        # --- Single chunk mode: whole file as 1 chunk ---
-        tmp = DOWNLOADS_DIR / f"{streamable_id}_part0.bin"
-        tmp.write_bytes(video_path.read_bytes())
-        chunk_paths.append(tmp)
-    else:
-        # --- Normal chunking (19 MiB) ---
-        with open(video_path, "rb") as f:
-            while True:
-                data = f.read(MAX_CHUNK_SIZE)
-                if not data:
-                    break
-                tmp = DOWNLOADS_DIR / f"{streamable_id}_part{len(chunk_paths)}.bin"
-                tmp.write_bytes(data)
-                chunk_paths.append(tmp)
-
-    total_chunks = len(chunk_paths)
-    chunk_msg_ids = []
-
-    for idx, chunk_path in enumerate(chunk_paths, start=1):
-        b64 = base64.b64encode(chunk_path.read_bytes()).decode()
-        caption = f"""\
-=== CHUNK {idx}/{total_chunks} ===
-streamable_id: {streamable_id}
-yt_link: {yt_link}
-part: {idx}
-size_bytes: {chunk_path.stat().st_size}
-uploaded_at: {uploaded_at}
---- (human readable only) ---
-"""
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        files = {"document": (f"{streamable_id}_part{idx}.txt", b64.encode(), "text/plain")}
-        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-        resp = requests.post(url, data=data, files=files, timeout=120)
-        resp.raise_for_status()
-        msg = resp.json()["result"]
-        chunk_msg_ids.append(msg["message_id"])
-        chunk_path.unlink(missing_ok=True)
-
-    _write_metadata_row(service, {
-        "streamable_id": streamable_id,
-        "yt_link": yt_link,
-        "total_chunks": total_chunks,
-        "chunk_msg_ids": chunk_msg_ids,
-        "uploaded_at": uploaded_at,
-        "status": "staged-to-telegram"
-    })
-
-    logger.info("Chunked upload finished – streamable_id=%s (%d chunks)", streamable_id, total_chunks)
-    return {
-        "public_id": streamable_id,
-        "secure_url": f"https://t.me/c/{str(TELEGRAM_CHAT_ID)[1:]}/{chunk_msg_ids[0]}",
-        "duration": None,
-        "format": "mp4",
-        "bytes": file_size,
-        "created_at": uploaded_at
-    }
 
 
 # =====================================================
@@ -508,9 +286,8 @@ def upload_to_facebook(video_path: Path, description: str = "") -> Dict[str, str
     return {"video_id": video_id, "url": fb_url}
 
 # =====================================================
-# TELEGRAM HELPER
+# CLEANUP HELPER
 # =====================================================
-
 
 def cleanup_video_file(video_path: Path) -> None:
     """
@@ -531,11 +308,11 @@ def cleanup_video_file(video_path: Path) -> None:
         logger.warning("Failed to clean up file %s: %s", video_path, e)
 
 # =====================================================
-# CLOUDINARY MODEL
+# B2 MODELS (replacing Cloudinary)
 # =====================================================
-class CloudinaryDeleteRequest(BaseModel):
-    public_id: str
-    resource_type: str = "video"  # Default to video, can be "image", "raw", etc.
+class B2DeleteRequest(BaseModel):
+    file_name: str
+    bucket_name: str = None
 
 # =====================================================
 # KITE MANAGER
@@ -636,16 +413,6 @@ class KiteLTPRequest(BaseModel):
 # =====================================================
 # HELPERS
 # =====================================================
-
-def cleanup_old_bin_files():
-    cutoff = time.time() - 3600
-    for f in DOWNLOADS_DIR.glob("*.bin"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-                logger.info("Cleaned old chunk: %s", f.name)
-        except:
-            pass
 
 def safe_json(response):
     try:
@@ -803,63 +570,6 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
     logger.error("All yt-dlp download attempts failed for URL: %s", video_url)
     raise HTTPException(status_code=500, detail=f"Failed to download video: {last_exception}")
 
-async def upload_via_mtproto(video_path: Path, chat_id: int = TELEGRAM_CHAT_ID) -> str:
-    """
-    Uploads a file via MTProto (Telethon) and returns a public t.me link.
-    Works for any size (up to 2 GB for normal accounts, 4 GB for premium).
-    """
-    if not tg_client:
-        raise RuntimeError("MTProto client not configured")
-
-    file_name = video_path.name
-    file_size = video_path.stat().st_size
-
-    logger.info("Uploading via MTProto: %s (%.2f MB)", file_name, file_size / 1_048_576)
-
-    is_video = file_name.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))
-    try:
-        if is_video:
-            ffprobe_cmd = [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)
-            ]
-            duration = float(subprocess.check_output(ffprobe_cmd).decode().strip() or 0)
-
-            entity = await tg_client.send_file(
-                chat_id,
-                str(video_path),
-                video_note=False,
-                supports_streaming=True,
-                attributes=[
-                    DocumentAttributeFilename(file_name=file_name),
-                    DocumentAttributeVideo(
-                        duration=int(duration),
-                        w=1280, h=720,
-                        supports_streaming=True
-                    )
-                ]
-            )
-        else:
-            entity = await tg_client.send_file(
-                chat_id,
-                str(video_path),
-                caption="",
-                attributes=[DocumentAttributeFilename(file_name=file_name)]
-            )
-
-        link_chat_id = str(chat_id).replace("-", "")
-        public_url = f"https://t.me/c/{link_chat_id}/{entity.id}"
-
-        logger.info("MTProto upload finished → %s", public_url)
-        return public_url
-
-    except FloodWaitError as e:
-        logger.error("Flood wait %s seconds", e.seconds)
-        raise HTTPException(status_code=429, detail=f"Telegram flood wait {e.seconds}s")
-    except Exception as e:
-        logger.exception("MTProto upload failed")
-        raise
-
 # =====================================================
 # ENDPOINTS
 # =====================================================
@@ -872,158 +582,22 @@ async def home():
 async def square_endpoint(x: float = -12):
     return {"x": x, "square": x * x}
 
-@app.get("/streamable/fetch")
-async def fetch_streamable(streamable_id: str):
+@app.get("/b2/signed-url")
+async def get_b2_signed_url(filename: str = "yt_video.mp4"):
     """
-    Re-assemble a video from Telegram chunks and stream it back.
+    Generate a signed upload URL for B2 (placeholder - B2 uses direct auth).
+    For B2, you typically upload directly with credentials.
+    This endpoint is kept for API compatibility but returns info message.
     """
-    if not tg_client:
-        raise HTTPException(500, "Telegram client not initialized")
+    if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY:
+        raise HTTPException(500, "B2 not configured")
     
-    service = get_sheets_service()
-    meta = _search_metadata(service, streamable_id)
-    if not meta:
-        raise HTTPException(404, f"streamable_id {streamable_id} not found")
-
-    msg_ids = json.loads(meta["chunk_msg_ids"])
-    
-    # ------------------------------------------------------------------
-    # 1. Download every base64 text file
-    # ------------------------------------------------------------------
-    raw_chunks = []
-    for idx, mid in enumerate(msg_ids):
-        try:
-            # Get messages returns a list when ids is a list, single when ids is int
-            entity = await tg_client.get_messages(TELEGRAM_CHAT_ID, ids=mid)
-            
-            # Check if entity is None or doesn't have document
-            if entity is None:
-                raise HTTPException(500, f"Chunk {idx+1}/{len(msg_ids)} (message_id={mid}) not found in Telegram")
-            
-            if not hasattr(entity, 'document') or not entity.document:
-                raise HTTPException(500, f"Chunk {idx+1}/{len(msg_ids)} (message_id={mid}) is not a document")
-            
-            # Download the document
-            logger.info(f"Downloading chunk {idx+1}/{len(msg_ids)} (message_id={mid})")
-            file_bytes = await tg_client.download_media(entity, bytes)
-            
-            if not file_bytes:
-                raise HTTPException(500, f"Failed to download chunk {idx+1}/{len(msg_ids)} (message_id={mid})")
-            
-            # Decode base64
-            try:
-                decoded = base64.b64decode(file_bytes)
-                raw_chunks.append(decoded)
-                logger.info(f"Chunk {idx+1}/{len(msg_ids)} decoded: {len(decoded)} bytes")
-            except Exception as e:
-                raise HTTPException(500, f"Failed to decode chunk {idx+1}/{len(msg_ids)}: {e}")
-                
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception(f"Error processing chunk {idx+1}/{len(msg_ids)} (message_id={mid})")
-            raise HTTPException(500, f"Error processing chunk {idx+1}/{len(msg_ids)}: {e}")
-
-    # ------------------------------------------------------------------
-    # 2. Write temporary chunk files
-    # ------------------------------------------------------------------
-    temp_dir = DOWNLOADS_DIR / f"reassemble_{streamable_id}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        chunk_files = []
-        for i, data in enumerate(raw_chunks):
-            p = temp_dir / f"part{i}.bin"
-            p.write_bytes(data)
-            chunk_files.append(str(p))
-            logger.info(f"Wrote chunk file: {p.name} ({len(data)} bytes)")
-
-        # ------------------------------------------------------------------
-        # 3. Concatenate with ffmpeg (no re-encode)
-        # ------------------------------------------------------------------
-        concat_file = temp_dir / "concat.txt"
-        concat_file.write_text("\n".join(f"file '{p}'" for p in chunk_files))
-
-        final_path = temp_dir / "final.mp4"
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_file), "-c", "copy", str(final_path)
-        ]
-        
-        logger.info("Running ffmpeg concat: %s", " ".join(ffmpeg_cmd))
-        proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        
-        if proc.returncode != 0:
-            logger.error("ffmpeg concat failed:\nstdout: %s\nstderr: %s", proc.stdout, proc.stderr)
-            raise HTTPException(500, f"Failed to merge chunks: {proc.stderr}")
-        
-        if not final_path.exists() or final_path.stat().st_size == 0:
-            raise HTTPException(500, "FFmpeg produced empty output file")
-
-        logger.info(f"Successfully merged video: {final_path} ({final_path.stat().st_size} bytes)")
-
-        # ------------------------------------------------------------------
-        # 4. Stream back + cleanup
-        # ------------------------------------------------------------------
-        def iterfile():
-            try:
-                with open(final_path, "rb") as f:
-                    chunk = f.read(8192)
-                    while chunk:
-                        yield chunk
-                        chunk = f.read(8192)
-            finally:
-                # Cleanup after streaming
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                    logger.info(f"Cleaned up temp directory: {temp_dir}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup temp directory: {e}")
-
-        return StreamingResponse(
-            iterfile(),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{streamable_id}.mp4"',
-                "Content-Length": str(final_path.stat().st_size)
-            }
-        )
-    
-    except HTTPException:
-        # Clean up on error
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
-    except Exception as e:
-        # Clean up on error
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.exception("Unexpected error in fetch_streamable")
-        raise HTTPException(500, f"Unexpected error: {e}")
-
-@app.get("/get_streamable")
-async def streamable(video_url: str):
-    mp4_path = None
-    try:
-        loop = asyncio.get_running_loop()
-        mp4_path = await loop.run_in_executor(None, get_streamable_mp4, video_url)
-
-        service = get_sheets_service()
-        _ensure_metadata_header(service)
-
-        cloudinary_data = await loop.run_in_executor(
-            None, lambda: asyncio.run(_upload_chunks_to_telegram_sync(mp4_path, video_url, service))
-        )
-        return {
-            "success": True,
-            "public_id": cloudinary_data["public_id"],
-            "url": cloudinary_data["secure_url"],
-            "file_size_mb": round(mp4_path.stat().st_size / (1024*1024), 2),
-            "duration": cloudinary_data.get("duration"),
-            "format": cloudinary_data.get("format"),
-            "message": "Video chunk-uploaded to Telegram (metadata in Google Sheet)"
-        }
-    finally:
-        if mp4_path:
-            cleanup_video_file(mp4_path)
+    return {
+        "message": "B2 uses direct authentication. Use /sheets/process_streamables endpoint.",
+        "bucket": BACKBLAZE_BUCKET_NAME,
+        "filename": filename,
+        "note": "B2 SDK handles authentication automatically with BACKBLAZE_KEY_ID and BACKBLAZE_APPLICATION_KEY"
+    }
 
 @app.get("/video-to-fb")
 async def video_to_fb(video_url: str = Query(...), fb_description: str = Query("")):
@@ -1045,60 +619,71 @@ async def video_to_fb(video_url: str = Query(...), fb_description: str = Query("
         if mp4_path:
             cleanup_video_file(mp4_path)
 
-@app.post("/cloudinary/delete")
-async def delete_cloudinary_resource(body: CloudinaryDeleteRequest):
+@app.post("/b2/delete")
+async def delete_b2_resource(body: B2DeleteRequest):
     """
-    Delete a resource from Cloudinary by public_id.
+    Delete a file from Backblaze B2 by filename.
     
     Request body:
     {
-        "public_id": "telegram_videos/xyz123",
-        "resource_type": "video"  // optional, defaults to "video"
+        "file_name": "videos/123456_video.mp4",
+        "bucket_name": "my-bucket"  // optional if BACKBLAZE_BUCKET_NAME is set
     }
     """
     try:
-        # Run blocking Cloudinary operation in thread pool
         loop = asyncio.get_running_loop()
+        manager = get_b2_manager()
+        
         result = await loop.run_in_executor(
-            None, 
-            delete_from_cloudinary, 
-            body.public_id, 
-            body.resource_type
+            None,
+            manager.delete_file,
+            body.file_name,
+            body.bucket_name
         )
         
-        return result
+        return {
+            "success": result,
+            "file_name": body.file_name,
+            "message": "File deleted successfully" if result else "File not found"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Unexpected error in /cloudinary/delete")
+        logger.exception("Unexpected error in /b2/delete")
         raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
 
-@app.get("/cloudinary/delete")
-async def delete_cloudinary_resource_get(
-    public_id: str = Query(..., description="Cloudinary public_id to delete"),
-    resource_type: str = Query("video", description="Resource type (video, image, raw)")
+@app.get("/b2/delete")
+async def delete_b2_resource_get(
+    file_name: str = Query(..., description="B2 file name to delete"),
+    bucket_name: str = Query(None, description="Bucket name (optional if env var set)")
 ):
     """
-    Delete a resource from Cloudinary by public_id (GET method for convenience).
+    Delete a file from B2 (GET method for convenience).
     
-    Example: /cloudinary/delete?public_id=telegram_videos/xyz123&resource_type=video
+    Example: /b2/delete?file_name=videos/123456_video.mp4
     """
     try:
         loop = asyncio.get_running_loop()
+        manager = get_b2_manager()
+        
         result = await loop.run_in_executor(
-            None, 
-            delete_from_cloudinary, 
-            public_id, 
-            resource_type
+            None,
+            manager.delete_file,
+            file_name,
+            bucket_name
         )
         
-        return result
+        return {
+            "success": result,
+            "file_name": file_name,
+            "message": "File deleted successfully" if result else "File not found"
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Unexpected error in /cloudinary/delete")
+        logger.exception("Unexpected error in /b2/delete")
         raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
 
 @app.post("/n8n/local/deactivate_all")
@@ -1192,58 +777,41 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
 async def process_streamables_endpoint(
     acc_name: str = Query("dave.commercial7"),
     sheet_name: str = Query("streamables"),
-    single_file: bool = Query(False, description="If true, uploads entire video as a single chunk")
 ):
     service = get_sheets_service()
-    _ensure_metadata_header(service)
-
     rows = read_sheet_by_name(service, sheet_name)
     if not rows:
         return {"success": False, "message": "No data"}
-
     header = rows[0]
-    filtered = filter_status_rows(rows, ['staged-to-telegram', 'uploaded'], exclude_status=True)
+    filtered = filter_status_rows(rows, ['staged', 'uploaded'], exclude_status=True)
     filtered = [r for r in filtered if r.get("account") == acc_name]
-
     status_col = get_column_letter(header, "status")
     url_col = get_column_letter(header, "url")
     results = []
-
     event_loop = asyncio.get_running_loop()
-
     for row in filtered:
         row_num = row["row_number"]
         yt_link = row.get("yt_link", "").strip()
         if not yt_link:
             results.append({"row_number": row_num, "status": "error", "error": "No yt_link"})
             continue
-
         try:
             # 1. Download + re-encode
             mp4_path = await event_loop.run_in_executor(None, get_streamable_mp4, yt_link)
-
-            # 2. Upload chunks → Telegram → metadata (respect single_file param)
-            meta = await event_loop.run_in_executor(
-                None, _upload_chunks_to_telegram_sync, mp4_path, yt_link, service, single_file
-            )
-
+            # 2. Upload to B2
+            b2_url = await event_loop.run_in_executor(None, upload_to_b2, mp4_path, yt_link)
             # 3. Update sheet
-            update_cell(service, sheet_name, row_num, status_col, "staged-to-telegram")
-            update_cell(service, sheet_name, row_num, url_col, meta["public_id"])
-
+            update_cell(service, sheet_name, row_num, status_col, "staged")
+            update_cell(service, sheet_name, row_num, url_col, b2_url)
             results.append({
                 "row_number": row_num,
                 "status": "success",
-                "streamable_id": meta["public_id"],
-                "telegram_link": meta["secure_url"]
+                "url": b2_url
             })
-
             cleanup_video_file(mp4_path)
-
         except Exception as e:
             logger.exception(f"Failed on row {row_num}")
             results.append({"row_number": row_num, "status": "error", "error": str(e)})
-
     return {
         "success": True,
         "total_processed": len(results),
@@ -1380,5 +948,3 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
-
-

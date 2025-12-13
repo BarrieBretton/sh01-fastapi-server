@@ -9,8 +9,7 @@ APScheduler==3.10.4
 redis==5.0.8
 httpx==0.27.2
 yt-dlp
-telethon
-cloudinary>=1.40.0
+b2sdk>=2.0.0
 
 # google
 google-auth==2.34.0
@@ -18,4 +17,3 @@ google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 google-api-python-client==2.152.0
 python-dotenv==1.0.1
-
