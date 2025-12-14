@@ -204,7 +204,7 @@ DEFAULT_WORKFLOWS = [
     "report-render-cloud-stats",
     "ai-image-model-cyootstuff",
     "streamables-to-lilnubbns",
-    "streamables-to-dave.commercial7",
+    "streamables-to-dave.commercial7 2",
 ]
 
 # Start
