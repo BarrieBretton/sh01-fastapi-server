@@ -445,23 +445,11 @@ def activate_workflow(wf):
 
 def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
     """
-    Downloads a YouTube video using yt-dlp and ensures the MP4 is IG/FB-compatible.
-    NO COOKIES USED.
-    
-    Steps:
-        1. Download best video+audio.
-        2. Probe codecs with ffprobe.
-        3. Re-encode to H.264 + AAC + yuv420p if needed.
-    
-    Args:
-        video_url: URL of the YouTube video
-        retries: Number of retry attempts on failure
-
-    Returns:
-        Path object of the final MP4 file ready for IG/FB upload
+    Downloads a YouTube video using yt-dlp.
+    NO re-encoding, NO compatibility checks — just download the best mp4.
     """
     output_file = DOWNLOADS_DIR / f"video_{int(datetime.utcnow().timestamp())}.mp4"
-    
+   
     # yt-dlp command templates (NO COOKIES)
     cmd_templates = [
         ["yt-dlp", "--force-ipv4", "--no-check-certificate",
@@ -469,16 +457,16 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
          "--merge-output-format", "mp4",
          "--socket-timeout", "30",
          "-o", str(output_file)],
-        
+       
         ["yt-dlp", "--force-ipv4", "--no-check-certificate",
          "-f", "best",
          "--merge-output-format", "mp4",
          "--socket-timeout", "30",
          "-o", str(output_file)]
     ]
-    
+   
     last_exception = None
-    
+   
     for attempt in range(retries):
         for cmd in cmd_templates:
             try:
@@ -486,13 +474,11 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
                 result = subprocess.run(cmd + [video_url], capture_output=True, text=True)
                 logger.debug("yt-dlp stdout:\n%s", result.stdout)
                 logger.debug("yt-dlp stderr:\n%s", result.stderr)
-
                 if result.returncode != 0:
                     raise RuntimeError(f"yt-dlp exited with code {result.returncode}")
-
                 if not output_file.exists() or output_file.stat().st_size == 0:
                     raise RuntimeError("MP4 file not created or empty")
-
+                
                 # Verify playable duration
                 ffprobe_cmd = [
                     "ffprobe", "-v", "error", "-show_entries",
@@ -504,60 +490,14 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
                 duration = float(duration_str) if duration_str else 0.0
                 if duration <= 0:
                     raise RuntimeError("Downloaded file has 0 playback length")
-
+                
                 logger.info("Downloaded successfully: %s (%d bytes, duration %.2f s)",
                             output_file, output_file.stat().st_size, duration)
-
-                # --- Check IG/FB compatibility ---
-                def is_ig_fb_compatible(path: Path) -> bool:
-                    try:
-                        ffprobe_cmd = [
-                            "ffprobe", "-v", "error",
-                            "-select_streams", "v:0",
-                            "-show_entries", "stream=codec_name,pix_fmt",
-                            "-of", "default=noprint_wrappers=1:nokey=1",
-                            str(path)
-                        ]
-                        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True)
-                        if result.returncode != 0:
-                            return False
-                        lines = result.stdout.strip().splitlines()
-                        if len(lines) < 2:
-                            return False
-                        codec, pix_fmt = lines
-                        return codec == "h264" and pix_fmt == "yuv420p"
-                    except Exception:
-                        return False
-
-                if not is_ig_fb_compatible(output_file):
-                    logger.info("Video not IG/FB compatible, re-encoding...")
-                    safe_file = output_file.with_name(output_file.stem + "_igfb.mp4")
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-i", str(output_file),
-                        "-c:v", "libx264",
-                        "-preset", "medium",
-                        "-crf", "23",
-                        "-pix_fmt", "yuv420p",
-                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                        "-c:a", "aac",
-                        "-b:a", "128k",
-                        "-movflags", "+faststart",   # REQUIRED FOR FB DIRECT UPLOAD
-                        "-f", "mp4",
-                        str(safe_file)
-                    ]
-                    ff_result = subprocess.run(cmd, capture_output=True, text=True)
-                    if ff_result.returncode != 0:
-                        logger.error("FFmpeg re-encode failed:\nstdout: %s\nstderr: %s", ff_result.stdout, ff_result.stderr)
-                        raise RuntimeError(f"FFmpeg re-encode failed with code {ff_result.returncode}")
-                    try:
-                        output_file.unlink()
-                    except Exception:
-                        pass
-                    return safe_file
-
+                
+                # === RE-ENCODING COMPLETELY SKIPPED ===
+                # We no longer check codec/pixel format or re-encode
                 return output_file
-
+                
             except Exception as e:
                 last_exception = e
                 logger.warning("yt-dlp attempt failed: %s", e)
@@ -566,7 +506,6 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
                         output_file.unlink()
                     except Exception:
                         pass
-
     logger.error("All yt-dlp download attempts failed for URL: %s", video_url)
     raise HTTPException(status_code=500, detail=f"Failed to download video: {last_exception}")
 
