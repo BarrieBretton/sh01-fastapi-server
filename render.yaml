@@ -1,0 +1,12 @@
+version: "1"
+projects:
+- name: main
+  environments:
+  - name: Production
+    services:
+    - type: keyvalue
+      name: n8n-redis
+      plan: free
+      region: oregon
+      maxmemoryPolicy: allkeys-lru
+      ipAllowList: []
