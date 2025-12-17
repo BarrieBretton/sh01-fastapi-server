@@ -1,12 +1,107 @@
+# Exported from Render on 2025-12-17T08:46:42Z
 version: "1"
 projects:
 - name: main
   environments:
   - name: Production
     services:
-    - type: keyvalue
-      name: n8n-redis
+    - type: web
+      name: sh01
+      runtime: docker
+      repo: https://github.com/BarrieBretton/sh01-fastapi-server
       plan: free
+      envVars:
+      - key: BACKBLAZE_BUCKET_NAME
+        sync: false
+      - key: BACKBLAZE_APPLICATION_KEY
+        sync: false
+      - key: BACKBLAZE_KEY_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT
+        sync: false
+      - key: SHEETS_AUTH_CODE
+        sync: false
+      - key: SHEETS_HEADLESS
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: FB_PAGE_ACCESS_TOKEN
+        sync: false
+      - key: FB_PAGE_ID
+        sync: false
+      - key: CLOUDINARY_UPLOAD_PRESET
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: TELEGRAM_PHONE
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TUMBLR_BLOG_IDENTIFIER_CYOOTSTUFF
+        sync: false
+      - key: TUMBLR_TOKEN_SECRET_CYOOTSTUFF
+        sync: false
+      - key: TUMBLR_TOKEN_CYOOTSTUFF
+        sync: false
+      - key: TUMBLR_CONSUMER_SECRET_CYOOTSTUFF
+        sync: false
+      - key: TUMBLR_CONSUMER_KEY_CYOOTSTUFF
+        sync: false
+      - key: N8N_API_KEY
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: ACCESS_TOKEN
+        sync: false
+      - key: N8N_BASE_URL
+        sync: false
+      - key: KITE_REDIRECT_URI
+        sync: false
+      - key: KITE_API_SECRET
+        sync: false
+      - key: KITE_API_KEY
+        sync: false
+      - key: TUMBLR_BLOG_IDENTIFIER_VLVT_AVE
+        sync: false
+      - key: TUMBLR_TOKEN_SECRET_VLVT_AVE
+        sync: false
+      - key: TUMBLR_TOKEN_VLVT_AVE
+        sync: false
+      - key: TUMBLR_CONSUMER_SECRET_VLVT_AVE
+        sync: false
+      - key: TUMBLR_CONSUMER_KEY_VLVT_AVE
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: TUMBLR_BLOG_IDENTIFIER_ERIKA_DEVEREUX
+        sync: false
+      - key: TUMBLR_TOKEN_SECRET_ERIKA_DEVEREUX
+        sync: false
+      - key: TUMBLR_TOKEN_ERIKA_DEVEREUX
+        sync: false
+      - key: TUMBLR_CONSUMER_SECRET_ERIKA_DEVEREUX
+        sync: false
+      - key: TUMBLR_CONSUMER_KEY_ERIKA_DEVEREUX
+        sync: false
+      - key: ACCESS_TOKEN_SECRET
+        sync: false
+      - key: API_KEY_SECRET
+        sync: false
+      - key: X_OAUTH_BEARER_TOKEN
+        sync: false
       region: oregon
-      maxmemoryPolicy: allkeys-lru
-      ipAllowList: []
+      dockerContext: .
+      dockerfilePath: ./Dockerfile
+      autoDeployTrigger: commit
