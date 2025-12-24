@@ -37,20 +37,30 @@ class YouTubeHandler:
         self.api_key = api_key
         self.base_url = "https://www.googleapis.com/youtube/v3"
 
-    async def _fetch_channel_id(self, handle: str) -> Optional[str]:
-        url = f"{self.base_url}/search"
+    async def _fetch_channel_id(self, handle: str) -> str:
+        # Accept handle with or without @, normalize to without @
+        if handle.startswith("@"):
+            handle = handle[1:]
+
+        url = f"{self.base_url}/channels"
         params = {
-            "part": "snippet",
-            "q": handle,
-            "type": "channel",
+            "part": "id",                # 'id' is enough; use "snippet,id" if you want title too
+            "forHandle": handle,         # Works with or without @ — Google accepts both
             "key": self.api_key,
         }
-        async with httpx.AsyncClient(verify=certifi.where()) as client:  # TODO: REMOVE IN PROD: [Disable SSL verification]
+
+        async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
             response = await client.get(url, params=params)
+            response.raise_for_status()  # Will raise on 4xx/5xx
+
             data = response.json()
-            if "items" in data and data["items"]:
-                return data["items"][0]["snippet"]["channelId"]
-            return None
+
+            if not data.get("items"):
+                raise ValueError(f"Channel not found for handle: @{handle}")
+
+            channel_id = data["items"][0]["id"]
+            logger.info(f"Successfully resolved @{handle} → Channel ID: {channel_id}")
+            return channel_id
 
     async def _fetch_channel_videos(self, channel_id: str, max_results: int = 50) -> List[Dict]:
         """Fetch all videos for a channel, sorted by newest first."""
