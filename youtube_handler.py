@@ -25,7 +25,7 @@ class YouTubeVideo(BaseModel):
     published_at: datetime
     view_count: int
     like_count: int
-    dislike_count: int
+    dislike_count: int = 0
     comment_count: int
     thumbnail_url: str
     channel_title: str
@@ -55,6 +55,10 @@ class YouTubeHandler:
 
             data = response.json()
 
+            logger.error(f"YouTube API error: {data}")  # Log full error body
+            if response.status_code == 401:
+                raise ValueError("Invalid or unauthorized API key (401)")
+
             if not data.get("items"):
                 raise ValueError(f"Channel not found for handle: @{handle}")
 
@@ -77,17 +81,27 @@ class YouTubeHandler:
             response = await client.get(url, params=params)
             return response.json().get("items", [])
 
-    async def _fetch_video_stats(self, video_id: str) -> Dict:
-        """Fetch detailed stats for a video (views, likes, dislikes, etc.)."""
+    async def _fetch_video_stats(self, video_ids: List[str]) -> Dict[str, Dict]:
+        """Fetch stats + snippet for multiple video IDs in one call (quota-efficient)."""
         url = f"{self.base_url}/videos"
         params = {
-            "part": "statistics,snippet",
-            "id": video_id,
+            "part": "snippet,statistics",   # Critical: include snippet for channelTitle & thumbnails
+            "id": ",".join(video_ids),
             "key": self.api_key,
         }
         async with httpx.AsyncClient(verify=certifi.where()) as client:
             response = await client.get(url, params=params)
-            return response.json().get("items", [{}])[0]
+            response.raise_for_status()
+            data = response.json()
+
+        stats_by_id = {}
+        for item in data.get("items", []):
+            vid = item["id"]
+            stats_by_id[vid] = {
+                "statistics": item.get("statistics", {}),
+                "snippet": item.get("snippet", {}),
+            }
+        return stats_by_id
 
     def _calculate_relevance_score(self, video: Dict) -> float:
         """Calculate a relevance score based on engagement metrics."""
@@ -116,47 +130,68 @@ class YouTubeHandler:
         sort_by: str = "newest",
         max_results: int = 50,
     ) -> List[YouTubeVideo]:
-        """
-        Fetch videos for a YouTube handle and sort them.
-
-        Args:
-            handle: YouTube handle (e.g., "@username").
-            sort_by: "newest", "relevance", or "engagement".
-            max_results: Maximum number of videos to return.
-
-        Returns:
-            List of YouTubeVideo objects, sorted by the specified criteria.
-        """
         channel_id = await self._fetch_channel_id(handle)
         if not channel_id:
             raise ValueError(f"Channel not found for handle: {handle}")
 
-        videos = await self._fetch_channel_videos(channel_id, max_results)
+        # Fetch recent videos
+        url = f"{self.base_url}/search"
+        params = {
+            "part": "snippet",
+            "channelId": channel_id,
+            "maxResults": min(max_results, 50),  # API limit per call
+            "order": "date",
+            "type": "video",
+            "key": self.api_key,
+        }
+        async with httpx.AsyncClient(verify=certifi.where()) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            search_data = response.json()
+
+        items = search_data.get("items", [])
+        if not items:
+            return []
+
+        # Collect video IDs (batch fetch stats)
+        video_ids = [item["id"]["videoId"] for item in items]
+        stats_by_id = await self._fetch_video_stats(video_ids)
+
         video_details = []
-        for video in videos:
-            video_id = video["id"]["videoId"]
-            stats = await self._fetch_video_stats(video_id)
-            if not stats:
-                continue
+        for item in items:
+            video_id = item["id"]["videoId"]
+            snippet = item["snippet"]
+            stats_dict = stats_by_id.get(video_id, {})
+            video_snippet = stats_dict.get("snippet", snippet)  # fallback to search snippet
+            video_stats = stats_dict.get("statistics", {})
+
             video_data = {
-                **video["snippet"],
-                **stats["statistics"],
-                "published_at": video["snippet"]["publishedAt"],
                 "video_id": video_id,
+                "title": snippet["title"],
+                "published_at": snippet["publishedAt"],
+                "channel_title": video_snippet.get("channelTitle", snippet.get("channelTitle", "")),
+                "thumbnail_url": snippet["thumbnails"]["high"]["url"],  # or "default" / "maxres"
+                "view_count": int(video_stats.get("viewCount", 0)),
+                "like_count": int(video_stats.get("likeCount", 0)),
+                "dislike_count": 0,  # Public API no longer returns dislikes
+                "comment_count": int(video_stats.get("commentCount", 0)),
+                "relevance_score": 0.0,  # will recalculate
+                "engagement_score": 0.0,
             }
+
+            # Calculate scores
             video_data["relevance_score"] = self._calculate_relevance_score(video_data)
             video_data["engagement_score"] = self._calculate_engagement_score(video_data)
+
             video_details.append(YouTubeVideo(**video_data))
 
-        # Sort videos
+        # Sort after scoring
         if sort_by == "newest":
             video_details.sort(key=lambda x: x.published_at, reverse=True)
         elif sort_by == "relevance":
             video_details.sort(key=lambda x: x.relevance_score, reverse=True)
         elif sort_by == "engagement":
             video_details.sort(key=lambda x: x.engagement_score, reverse=True)
-        else:
-            raise ValueError(f"Invalid sort_by: {sort_by}")
 
         return video_details[:max_results]
 
