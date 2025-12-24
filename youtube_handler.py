@@ -22,7 +22,7 @@ if not YOUTUBE_API_KEY:
 class YouTubeVideo(BaseModel):
     video_id: str
     title: str
-    published_at: datetime
+    published_at: str
     view_count: int
     like_count: int
     dislike_count: int = 0
