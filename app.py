@@ -2,32 +2,48 @@
 
 # General
 import os
-import random
-import sqlite3
 import socket
 import threading
 import logging
 import subprocess
 import time
+import shutil
+import sys
+
+import ssl
+import certifi
+# Set the SSL context to use certifi's certificates
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+# import random
+# import sqlite3
+# import base64
+# import uuid
+# import json
 
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Any
+from dotenv import load_dotenv
 
 # Add this import at the top with other imports
 from sheets_helper import (
     get_sheets_service,
-    list_sheet_names,
     read_sheet_by_name,
     filter_status_rows,
     update_cell,
     get_column_letter,
-    SPREADSHEET_ID
+    # list_sheet_names,
+    # SPREADSHEET_ID
 )
 
-# B2 imports (replacing ImageKit)
+# B2 imports
 from b2_helper import get_b2_manager, upload_to_b2
+
+# YT Handler Module
+from youtube_handler import YouTubeHandler
 
 # Basic HTTP Requests
 import httpx
@@ -40,38 +56,36 @@ from requests_oauthlib import OAuth1
 from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
 
 # Kite Zerodha Connectivity
 from kiteconnect import KiteConnect, KiteTicker
+
+# Crons + Scheduling
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # Google OAuth
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-
-import base64
-import uuid
-import json
+# from google_auth_oauthlib.flow import InstalledAppFlow
+# from googleapiclient.discovery import build
+# from google.oauth2.credentials import Credentials
 
 # =====================================================
 # SANITY CHECKS   
 # =====================================================
 
-import shutil
-import sys
-
-if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-    print("ERROR: FFmpeg or FFprobe not found! Exiting.")
-    sys.exit(1)
+# if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+#     print("ERROR: FFmpeg or FFprobe not found! Exiting.")
+#     sys.exit(1)
 
 # =====================================================
 # ENV & LOGGING SETUP   
 # =====================================================
 
 load_dotenv(".env")
+
+# temp
+ffmpeg_bin_path = r"C:\Users\Vivan.Jaiswal\Documents\ffmpeg-2025-12-18-git-78c75d546a-essentials_build\bin"
+os.environ["PATH"] += os.pathsep + ffmpeg_bin_path
 
 # Create logs dir
 os.makedirs("logs", exist_ok=True)
@@ -205,7 +219,29 @@ DEFAULT_WORKFLOWS = [
     "ai-image-model-cyootstuff",
     "streamables-to-lilnubbns",
     "streamables-to-dave.commercial7 2",
+    "media-distribution-center 2",
 ]
+
+# Models
+
+class YouTubeVideoResponse(BaseModel):
+    video_id: str
+    title: str
+    published_at: str
+    view_count: int
+    like_count: int
+    dislike_count: int
+    comment_count: int
+    thumbnail_url: str
+    channel_title: str
+    relevance_score: float
+    engagement_score: float
+
+class VideoToFBResponse(BaseModel):
+    success: bool
+    facebook: dict[str, str | Any] # Adjust later based on EXACTLY what `upload_to_facebook` actually returns
+    local_file: str
+    size_mb: float
 
 # Start
 
@@ -284,6 +320,15 @@ def upload_to_facebook(video_path: Path, description: str = "") -> Dict[str, str
     fb_url = f"https://www.facebook.com/{FB_PAGE_ID}/videos/{video_id}"
     logger.info("Facebook upload SUCCESS: video_id=%s", video_id)
     return {"video_id": video_id, "url": fb_url}
+
+# =====================================================
+# YT HELPER
+# =====================================================
+async def fetch_videos():
+    handler = YouTubeHandler()
+    videos = await handler.get_videos_by_handle("@username", sort_by="engagement")
+    for video in videos:
+        print(video.title, video.engagement_score)
 
 # =====================================================
 # CLEANUP HELPER
@@ -457,7 +502,7 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
          "--merge-output-format", "mp4",
          "--socket-timeout", "30",
          "-o", str(output_file)],
-       
+
         ["yt-dlp", "--force-ipv4", "--no-check-certificate",
          "-f", "best",
          "--merge-output-format", "mp4",
@@ -521,16 +566,36 @@ async def home():
 async def square_endpoint(x: float = -12):
     return {"x": x, "square": x * x}
 
+@app.get("/yt/videos", response_model=List[YouTubeVideoResponse])
+async def get_youtube_videos(
+    handle: str = Query(..., description="YouTube handle (e.g., '@username')"),
+    sort_by: str = Query("newest", description="Sort by 'newest', 'relevance', or 'engagement'"),
+    max_results: int = Query(50, description="Maximum number of videos to return"),
+):
+    """
+    Fetch videos for a YouTube handle and sort them by relevance, engagement, or newest uploads.
+    """
+    try:
+        handler = YouTubeHandler()
+        videos = await handler.get_videos_by_handle(handle, sort_by, max_results)
+        return videos
+    except ValueError as e:
+        logger.error(f"Error fetching YouTube videos: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error fetching YouTube videos")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch videos: {e}")
+
 @app.get("/b2/signed-url")
-async def get_b2_signed_url(filename: str = "yt_video.mp4"):
+async def get_b2_signed_url(filename: str = "yt_video.mp4") -> Dict[str, str]:
     """
     Generate a signed upload URL for B2 (placeholder - B2 uses direct auth).
     For B2, you typically upload directly with credentials.
     This endpoint is kept for API compatibility but returns info message.
     """
-    if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY:
-        raise HTTPException(500, "B2 not configured")
-    
+    if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY or not BACKBLAZE_BUCKET_NAME:
+            raise HTTPException(500, "B2 not configured")
+
     return {
         "message": "B2 uses direct authentication. Use /sheets/process_streamables endpoint.",
         "bucket": BACKBLAZE_BUCKET_NAME,
@@ -538,24 +603,31 @@ async def get_b2_signed_url(filename: str = "yt_video.mp4"):
         "note": "B2 SDK handles authentication automatically with BACKBLAZE_KEY_ID and BACKBLAZE_APPLICATION_KEY"
     }
 
-@app.get("/video-to-fb")
-async def video_to_fb(video_url: str = Query(...), fb_description: str = Query("")):
-    mp4_path = None
+@app.get("/video-to-fb", response_model=VideoToFBResponse)
+async def video_to_fb(
+    video_url: str = Query(...),
+    fb_description: str = Query("")
+) -> Dict[str, Any]:  # FastAPI will convert to the response_model anyway
+    mp4_path: Path | None = None
     try:
         loop = asyncio.get_running_loop()
         mp4_path = await loop.run_in_executor(None, get_streamable_mp4, video_url)
 
+        # At this point, mp4_path is guaranteed to be Path (not None)
+        # because get_streamable_mp4 either returns a Path or raises an exception
+
         fb_result = await loop.run_in_executor(
             None, upload_to_facebook, mp4_path, fb_description
         )
+
         return {
             "success": True,
             "facebook": fb_result,
             "local_file": str(mp4_path),
-            "size_mb": round(mp4_path.stat().st_size / (1024*1024), 2),
+            "size_mb": round(mp4_path.stat().st_size / (1024 * 1024), 2),
         }
     finally:
-        if mp4_path:
+        if mp4_path and mp4_path.exists():
             cleanup_video_file(mp4_path)
 
 @app.post("/b2/delete")

@@ -38,6 +38,12 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
+import ssl
+import certifi
+# Set the SSL context to use certifi's certificates
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+
 from google.oauth2 import service_account
 
 from google.auth.transport.requests import Request
@@ -121,7 +127,7 @@ def get_credentials():
     Returns authenticated Google credentials.
     Priority order (highest first):
       1. GOOGLE_SERVICE_ACCOUNT  → service account (recommended for servers)
-      2. GOOGLE_TOKEN_JSON            → OAuth2 user token (with refresh (for personal sheets)
+      2. GOOGLE_TOKEN_JSON            → OAuth2 user token (with refresh (for personal sheets))
       3. service_account.json file    → fallback for local dev only
       4. token.json file              → fallback for local dev only
     """
