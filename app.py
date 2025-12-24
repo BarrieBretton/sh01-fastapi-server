@@ -219,6 +219,7 @@ DEFAULT_WORKFLOWS = [
     "ai-image-model-cyootstuff",
     "streamables-to-lilnubbns",
     "streamables-to-dave.commercial7 2",
+    "streamables-to-aand.cut",
     "media-distribution-center 2",
 ]
 
