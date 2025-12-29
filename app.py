@@ -53,7 +53,7 @@ import asyncio
 
 # FastApi Server
 from requests_oauthlib import OAuth1
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -110,6 +110,7 @@ print(f"DOWNLOADS_DIR: {DOWNLOADS_DIR}")
 BACKBLAZE_KEY_ID = os.getenv("BACKBLAZE_KEY_ID")
 BACKBLAZE_APPLICATION_KEY = os.getenv("BACKBLAZE_APPLICATION_KEY")
 BACKBLAZE_BUCKET_NAME = os.getenv("BACKBLAZE_BUCKET_NAME")
+B2_REFRESH_API_KEY = os.getenv("B2_REFRESH_API_KEY", "").strip()
 
 if not BACKBLAZE_KEY_ID or not BACKBLAZE_APPLICATION_KEY:
     logger.warning("BACKBLAZE_KEY_ID or BACKBLAZE_APPLICATION_KEY not set - B2 uploads will fail")
@@ -210,7 +211,7 @@ LOCK_TTL = 24 * 60 * 60  # 24 hours
 
 # Default workflows to activate daily
 DEFAULT_WORKFLOWS = [
-    "ai-image-model-4",
+    "ai-image-model-5 dev",
     "ig-sidehustle PINTEREST 3",
     "office-hours",
     "__backup",
@@ -457,6 +458,19 @@ class KiteLTPRequest(BaseModel):
     symbols: list[str] | str
 
 # =====================================================
+# B2 HELPERS
+# =====================================================
+
+def require_refresh_key(x_api_key: str | None):
+    if not B2_REFRESH_API_KEY:
+        # If you really want it open, leave env var empty.
+        # But strongly recommended to set a key.
+        return
+    if not x_api_key or x_api_key != B2_REFRESH_API_KEY:
+        raise HTTPException(status_code=401, detail="Missing/invalid X-API-KEY")
+
+
+# =====================================================
 # HELPERS
 # =====================================================
 
@@ -566,6 +580,37 @@ async def home():
 @app.get("/test/square")
 async def square_endpoint(x: float = -12):
     return {"x": x, "square": x * x}
+
+@app.get("/b2/refresh-auth")
+async def b2_refresh_auth(
+    file_name: str = Query(..., description="Exact B2 file name, e.g. videos/123_x.mp4"),
+    bucket_name: str = Query(None, description="Optional; defaults to BACKBLAZE_BUCKET_NAME"),
+    valid_seconds: int = Query(604800, ge=1, le=604800),
+    x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
+):
+    require_refresh_key(x_api_key)
+
+    manager = get_b2_manager()
+    loop = asyncio.get_running_loop()
+
+    # mint token
+    token = await loop.run_in_executor(
+        None,
+        manager.get_download_authorization_token,
+        file_name,
+        bucket_name,
+        valid_seconds,
+    )
+
+    bucket = bucket_name or manager.default_bucket_name
+    url = manager.build_authorized_url(bucket, file_name, token)
+    return {
+        "bucket": bucket,
+        "file_name": file_name,
+        "valid_seconds": valid_seconds,
+        "token": token,
+        "url": url,
+    }
 
 @app.get("/yt/videos", response_model=List[YouTubeVideoResponse])
 async def get_youtube_videos(
