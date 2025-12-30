@@ -170,6 +170,15 @@ class B2Manager:
         safe_bucket = quote(bucket_name)
         return f"{self._download_url}/file/{safe_bucket}/{safe_file}?Authorization={token}"
 
+    def soft_delete_file(self, file_name: str, bucket_name: str = None) -> bool:
+        bucket = self.get_bucket(bucket_name=bucket_name)
+
+        def _do_hide():
+            bucket.hide_file(file_name)  # creates a hidden version ("tombstone")
+            return True
+
+        return self._with_reauth_retry(_do_hide)
+
     def delete_file(self, file_name: str, bucket_name: str = None) -> bool:
         """
         Delete all versions of a file.

@@ -726,7 +726,8 @@ async def delete_b2_resource_get(
         
         result = await loop.run_in_executor(
             None,
-            manager.delete_file,
+            # manager.delete_file,
+            manager.soft_delete_file,
             file_name,
             bucket_name
         )
