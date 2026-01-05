@@ -905,7 +905,7 @@ async def process_streamables_endpoint(
                 b2_url = await event_loop.run_in_executor(None, upload_to_b2, mp4_path, yt_link)
 
                 # 3) Sheet updates
-                if caption_col is not None::
+                if caption_col is not None:
                     update_cell(service, sheet_name, row_num, caption_col, title)
 
                 update_cell(service, sheet_name, row_num, status_col, "staged")
