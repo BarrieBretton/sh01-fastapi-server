@@ -716,7 +716,17 @@ async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
 async def process_streamables_endpoint(
     acc_name: str = Query("dave.commercial7"),
     sheet_name: str = Query("streamables"),
+    k: int = Query(10, ge=1, le=100, description="Max rows to process"),
+    max_concurrency: int = Query(2, ge=1, le=5, description="Parallel jobs limit"),
+    dry_run: bool = Query(False, description="If true, no download/upload/sheet update"),
 ):
+
+    # concurrency helper
+    semaphore = asyncio.Semaphore(max_concurrency)
+    event_loop = asyncio.get_running_loop()
+    results = []
+
+
     service = get_sheets_service()
     rows = read_sheet_by_name(service, sheet_name)
     if not rows:
@@ -724,36 +734,90 @@ async def process_streamables_endpoint(
     header = rows[0]
     filtered = filter_status_rows(rows, ['staged', 'uploaded'], exclude_status=True)
     filtered = [r for r in filtered if r.get("account") == acc_name]
+
+    total_candidates = len(filtered)
+    filtered = filtered[:k]   # 🔥 hard limit BEFORE any download/upload
+
     status_col = get_column_letter(header, "status")
     url_col = get_column_letter(header, "url")
-    results = []
-    event_loop = asyncio.get_running_loop()
-    for row in filtered:
-        row_num = row["row_number"]
-        yt_link = row.get("yt_link", "").strip()
-        if not yt_link:
-            results.append({"row_number": row_num, "status": "error", "error": "No yt_link"})
-            continue
-        try:
-            # 1. Download + re-encode
-            mp4_path = await event_loop.run_in_executor(None, get_streamable_mp4, yt_link)
-            # 2. Upload to B2
-            b2_url = await event_loop.run_in_executor(None, upload_to_b2, mp4_path, yt_link)
-            # 3. Update sheet
-            update_cell(service, sheet_name, row_num, status_col, "staged")
-            update_cell(service, sheet_name, row_num, url_col, b2_url)
-            results.append({
-                "row_number": row_num,
-                "status": "success",
-                "url": b2_url
-            })
-            cleanup_video_file(mp4_path)
-        except Exception as e:
-            logger.exception(f"Failed on row {row_num}")
-            results.append({"row_number": row_num, "status": "error", "error": str(e)})
+
+    # semaphorification
+    async def process_row(row):
+        async with semaphore:
+            row_num = row["row_number"]
+            yt_link = row.get("yt_link", "").strip()
+
+            if not yt_link:
+                return {"row_number": row_num, "status": "error", "error": "No yt_link"}
+
+            if dry_run:
+                return {
+                    "row_number": row_num,
+                    "status": "dry_run",
+                    "yt_link": yt_link
+                }
+
+            mp4_path = None
+            try:
+                mp4_path = await event_loop.run_in_executor(None, get_streamable_mp4, yt_link)
+                b2_url = await event_loop.run_in_executor(None, upload_to_b2, mp4_path, yt_link)
+
+                update_cell(service, sheet_name, row_num, status_col, "staged")
+                update_cell(service, sheet_name, row_num, url_col, b2_url)
+
+                return {
+                    "row_number": row_num,
+                    "status": "success",
+                    "url": b2_url
+                }
+
+            except Exception as e:
+                logger.exception("Failed on row %s", row_num)
+                return {
+                    "row_number": row_num,
+                    "status": "error",
+                    "error": str(e)
+                }
+
+            finally:
+                if mp4_path:
+                    cleanup_video_file(mp4_path)
+
+
+    # for row in filtered:
+    #     row_num = row["row_number"]
+    #     yt_link = row.get("yt_link", "").strip()
+    #     if not yt_link:
+    #         results.append({"row_number": row_num, "status": "error", "error": "No yt_link"})
+    #         continue
+    #     try:
+    #         # 1. Download + re-encode
+    #         mp4_path = await event_loop.run_in_executor(None, get_streamable_mp4, yt_link)
+    #         # 2. Upload to B2
+    #         b2_url = await event_loop.run_in_executor(None, upload_to_b2, mp4_path, yt_link)
+    #         # 3. Update sheet
+    #         update_cell(service, sheet_name, row_num, status_col, "staged")
+    #         update_cell(service, sheet_name, row_num, url_col, b2_url)
+    #         results.append({
+    #             "row_number": row_num,
+    #             "status": "success",
+    #             "url": b2_url
+    #         })
+    #         cleanup_video_file(mp4_path)
+    #     except Exception as e:
+    #         logger.exception(f"Failed on row {row_num}")
+    #         results.append({"row_number": row_num, "status": "error", "error": str(e)})
+
+    tasks = [process_row(row) for row in filtered]
+    results = await asyncio.gather(*tasks)
+
     return {
         "success": True,
-        "total_processed": len(results),
+        "dry_run": dry_run,
+        "requested_k": k,
+        "max_concurrency": max_concurrency,
+        "total_candidates": total_candidates,
+        "processed": len(results),
         "successful": sum(1 for r in results if r["status"] == "success"),
         "results": results
     }
