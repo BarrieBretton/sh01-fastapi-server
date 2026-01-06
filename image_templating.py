@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 router = APIRouter(tags=["image-templating"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_FONT_REL = "assets/FunnelSans-VariableFont_wght.ttf"
+DEFAULT_FONT_REL = "assets/Inconsolata-VariableFont_wdth,wght.ttf"
 
 def _resolve_font_path(p: str) -> str:
     if not p:
@@ -39,7 +39,11 @@ def _resolve_font_path(p: str) -> str:
 class TemplateConfig:
     width: int = int(os.getenv("TEMPLATE_W", "1080"))
     height: int = int(os.getenv("TEMPLATE_H", "1920"))
-    font_weight: int = int(os.getenv("FONT_WGHT", "800"))  # default 800 now
+    font_weight: int = int(os.getenv("FONT_WGHT", "400"))  # default 400 now
+
+    font_wdth: int = int(os.getenv("FONT_WDTH", "75"))  # <100 = condensed
+    dial_radius_ratio: float = float(os.getenv("DIAL_RADIUS_RATIO", "0.1666667"))  # 1/6
+    flourish_scale: float = float(os.getenv("FLOURISH_SCALE", "2.4"))  # 240%
 
     # Typography tweaks
     font_start_size: int = int(os.getenv("FONT_START_SIZE", "84"))      # was ~96
@@ -83,7 +87,8 @@ class RenderTemplateRequest(BaseModel):
     flourish_url_2: Optional[str] = None
     text: str = Field(..., description="Caption text")
     uppercase: bool = Field(True, description="If true, force ALL CAPS. If false, keep input casing.")
-    font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (100..900).")
+    font_width: Optional[int] = Field(None, description="Overrides FONT_WDTH (50..200).")
+    font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (200..900).")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -229,34 +234,32 @@ def _add_bottom_fade_overlay(base: Image.Image) -> None:
     base.alpha_composite(overlay, (0, h - overlay_h))
 
 
-def _load_font(size: int, *, weight: Optional[int] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] = None):
+    fp = _resolve_font_path(CFG.font_path)
+    if not (fp and Path(fp).exists()):
+        return ImageFont.load_default()
+
+    font = ImageFont.truetype(fp, size=size)
+
     try:
-        fp = _resolve_font_path(CFG.font_path)
-        if fp and Path(fp).exists():
-            font = ImageFont.truetype(fp, size=size)
+        axes = font.get_variation_axes()
+        values = [ax.default for ax in axes]
 
-            # ---- variable font axis control (wght) ----
-            try:
-                axes = font.get_variation_axes()  # raises if not variable font
-                values = [ax.default for ax in axes]
+        w_req = float(weight if weight is not None else CFG.font_weight)
+        wd_req = float(width if width is not None else CFG.font_wdth)
 
-                for i, ax in enumerate(axes):
-                    if getattr(ax, "tag", None) == "wght":
-                        w_req = float(weight if weight is not None else CFG.font_weight)
-                        w = max(float(ax.minimum), min(float(ax.maximum), w_req))
-                        values[i] = w
-                        break
+        for i, ax in enumerate(axes):
+            tag = getattr(ax, "tag", None)
+            if tag == "wght":
+                values[i] = max(float(ax.minimum), min(float(ax.maximum), w_req))
+            elif tag == "wdth":
+                values[i] = max(float(ax.minimum), min(float(ax.maximum), wd_req))
 
-                font.set_variation_by_axes(values)
-            except Exception:
-                pass
-
-            return font
+        font.set_variation_by_axes(values)
     except Exception:
         pass
 
-    return ImageFont.load_default()
-
+    return font
 
 
 def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
@@ -308,6 +311,29 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, 
 
     return lines
 
+def _draw_dial(base: Image.Image, *, label="PGP", width: Optional[int] = None, weight: Optional[int] = None):
+    draw = ImageDraw.Draw(base)
+    w, h = base.size
+    r = int(CFG.width * CFG.dial_radius_ratio)  # 1/6 width
+
+    # Quarter circle: bounding box whose center is bottom-right corner
+    bbox = (w - 2*r, h - 2*r, w, h)
+
+    # Fill dial (slightly transparent black)
+    draw.pieslice(bbox, start=180, end=270, fill=(0, 0, 0, 170))
+
+    # Small "PGP" text inside dial
+    font = _load_font(26, weight=weight, width=width)
+    tx, ty = w - int(r * 0.78), h - int(r * 0.55)
+    draw.text((tx, ty), label, font=font, fill=(255, 255, 255, 220))
+
+    # Simple thin arrow under PGP (line + small arrowhead)
+    ax1, ay = tx, ty + 34
+    ax2 = ax1 + 48
+    draw.line((ax1, ay, ax2, ay), fill=(255, 255, 255, 220), width=2)
+    draw.line((ax2, ay, ax2 - 10, ay - 6), fill=(255, 255, 255, 220), width=2)
+    draw.line((ax2, ay, ax2 - 10, ay + 6), fill=(255, 255, 255, 220), width=2)
+
 
 def _fit_font_for_wrapped_text(
     draw: ImageDraw.ImageDraw,
@@ -317,14 +343,15 @@ def _fit_font_for_wrapped_text(
     start_size: int = CFG.font_start_size,
     min_size: int = CFG.font_min_size,
     line_spacing_ratio: float = CFG.line_spacing_ratio,
-    weight: Optional[int] = None
+    weight: Optional[int] = None,
+    width: Optional[int] = None,
 ) -> tuple[ImageFont.ImageFont, list[str], int, int, int]:
     """
     Finds the largest font size where wrapped text fits within max_width.
     Returns (font, lines, block_w, block_h, line_h).
     """
     for size in range(start_size, min_size - 1, -1):
-        font = _load_font(size, weight=weight)
+        font = _load_font(size, weight=weight, width=width)
         lines = _wrap_text(draw, text, font, max_width)
 
         # line height from font metrics
@@ -339,7 +366,7 @@ def _fit_font_for_wrapped_text(
             return font, lines, block_w, block_h, line_h
 
     # fallback
-    font = _load_font(min_size)
+    font = _load_font(min_size, weight=weight, width=width)
     lines = _wrap_text(draw, text, font, max_width)
     ascent, descent = font.getmetrics()
     line_h = int((ascent + descent) * line_spacing_ratio)
@@ -366,13 +393,14 @@ def _draw_text_with_shadow_bottom_anchored(
     *,
     bottom_padding: int = 30,
     tracking_px: int = 0,
-    weight: Optional[int] = None,
+    weight: Optional[int]=None,
+    width: Optional[int]=None
 ) -> None:
     draw = ImageDraw.Draw(base)
     max_text_w = CFG.width - (CFG.text_side_margin * 2)
 
     font, lines, block_w, block_h, line_h = _fit_font_for_wrapped_text(
-        draw, text, max_text_w, weight=weight
+        draw, text, max_text_w, weight=weight, width=width
     )
 
     # Bottom-anchored: last pixel row of block is exactly bottom_padding above bottom edge
@@ -384,8 +412,10 @@ def _draw_text_with_shadow_bottom_anchored(
 
     y = y0
     for ln in lines:
-        tw, _ = _measure_text(draw, ln, font)
-        x = (CFG.width - tw) // 2
+        # tw, _ = _measure_text(draw, ln, font)
+        tracked_w = sum(draw.textlength(ch, font=font) for ch in ln) + tracking_px * (len(ln) - 1)
+        x = (CFG.width - int(tracked_w)) // 2
+        # x = (CFG.width - tw) // 2
 
         # shadow then main
         _draw_text_tracked(draw, x + sx, y + sy, ln, font, shadow, tracking_px)
@@ -412,7 +442,8 @@ def _place_flourishes(
 
     def place_one(fimg: Image.Image):
         size = int(rng.uniform(CFG.flourish_size_min_ratio, CFG.flourish_size_max_ratio) * w)
-        size = max(32, min(size, w // 3))
+        size = int(size * CFG.flourish_scale)  # 2.4x
+        size = max(32, min(size, w))
         blob = _circle_crop(fimg, size)
 
         x = rng.randint(0, max(0, w - size))
@@ -454,14 +485,20 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
     # 5) Bottom overlay gradient
     _add_bottom_fade_overlay(canvas)
 
+    # dial goes BEFORE main text so it stays behind if overlapping
+    weight = None if req.font_weight is None else max(200, min(900, int(req.font_weight)))
+    width  = None if req.font_width is None else max(50,  min(200, int(req.font_width)))
+
+    _draw_dial(canvas, label="PGP", width=width, weight=(weight or CFG.font_weight))
+
     # 6) Bottom-anchored wrapped text
-    weight = None if req.font_weight is None else max(100, min(900, int(req.font_weight)))
     _draw_text_with_shadow_bottom_anchored(
         canvas,
         caption,
-        bottom_padding=30,
+        bottom_padding=60,
         tracking_px=CFG.tracking_px,
         weight=weight,
+        width=width,
     )
 
     # 7) Encode
