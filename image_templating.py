@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -521,18 +521,13 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
 # FastAPI endpoint
 # ----------------------------
 
-@router.post(
-    "/render",
-    response_class=StreamingResponse,
-    summary="Render 9:16 template from background + 2 flourishes + text",
-)
+@router.post("/render", summary="Render 9:16 template from background + 2 flourishes + text")
 async def render_endpoint(body: RenderTemplateRequest):
     img_bytes, mime = await render_template(body)
 
     if body.upload_to_imagekit:
         try:
             uploaded = _imagekit_upload(img_bytes, body.upload_file_name)
-            # Return JSON instead of image
             return RenderTemplateUploadResponse(
                 uploaded=True,
                 url=uploaded.get("url"),
