@@ -39,7 +39,13 @@ def _resolve_font_path(p: str) -> str:
 class TemplateConfig:
     width: int = int(os.getenv("TEMPLATE_W", "1080"))
     height: int = int(os.getenv("TEMPLATE_H", "1920"))
-    font_weight: int = int(os.getenv("FONT_WGHT", "600"))  # 100..900 typically
+    font_weight: int = int(os.getenv("FONT_WGHT", "800"))  # default 800 now
+
+    # Typography tweaks
+    font_start_size: int = int(os.getenv("FONT_START_SIZE", "84"))      # was ~96
+    font_min_size: int = int(os.getenv("FONT_MIN_SIZE", "18"))
+    line_spacing_ratio: float = float(os.getenv("LINE_SPACING_RATIO", "1.02"))  # tighter (was 1.12)
+    tracking_px: int = int(os.getenv("TRACKING_PX", "-2"))              # negative = tighter tracking
 
     # Flourishes sizing relative to width
     flourish_size_min_ratio: float = float(os.getenv("FLOURISH_MIN_RATIO", "0.10"))  # 10% of width
@@ -77,6 +83,7 @@ class RenderTemplateRequest(BaseModel):
     flourish_url_2: Optional[str] = None
     text: str = Field(..., description="Caption text")
     uppercase: bool = Field(True, description="If true, force ALL CAPS. If false, keep input casing.")
+    font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (100..900).")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -222,7 +229,7 @@ def _add_bottom_fade_overlay(base: Image.Image) -> None:
     base.alpha_composite(overlay, (0, h - overlay_h))
 
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _load_font(size: int, *, weight: Optional[int] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     try:
         fp = _resolve_font_path(CFG.font_path)
         if fp and Path(fp).exists():
@@ -235,8 +242,8 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
                 for i, ax in enumerate(axes):
                     if getattr(ax, "tag", None) == "wght":
-                        w = float(CFG.font_weight)
-                        w = max(float(ax.minimum), min(float(ax.maximum), w))
+                        w_req = float(weight if weight is not None else CFG.font_weight)
+                        w = max(float(ax.minimum), min(float(ax.maximum), w_req))
                         values[i] = w
                         break
 
@@ -307,16 +314,17 @@ def _fit_font_for_wrapped_text(
     text: str,
     max_width: int,
     *,
-    start_size: int = 96,
-    min_size: int = 18,
-    line_spacing_ratio: float = 1.12,
+    start_size: int = CFG.font_start_size,
+    min_size: int = CFG.font_min_size,
+    line_spacing_ratio: float = CFG.line_spacing_ratio,
+    weight: Optional[int] = None
 ) -> tuple[ImageFont.ImageFont, list[str], int, int, int]:
     """
     Finds the largest font size where wrapped text fits within max_width.
     Returns (font, lines, block_w, block_h, line_h).
     """
     for size in range(start_size, min_size - 1, -1):
-        font = _load_font(size)
+        font = _load_font(size, weight=weight)
         lines = _wrap_text(draw, text, font, max_width)
 
         # line height from font metrics
@@ -340,17 +348,32 @@ def _fit_font_for_wrapped_text(
     block_h = (len(lines) * line_h) if lines else line_h
     return font, lines, block_w, block_h, line_h
 
+def _draw_text_tracked(draw, x, y, text, font, fill, tracking_px: int):
+    if tracking_px == 0:
+        draw.text((x, y), text, font=font, fill=fill)
+        return
+
+    cx = x
+    for ch in text:
+        draw.text((cx, y), ch, font=font, fill=fill)
+        cw = draw.textlength(ch, font=font)
+        cx += int(cw) + tracking_px
+
 
 def _draw_text_with_shadow_bottom_anchored(
     base: Image.Image,
     text: str,
     *,
-    bottom_padding: int = 30,  # distance from bottom edge
+    bottom_padding: int = 30,
+    tracking_px: int = 0,
+    weight: Optional[int] = None,
 ) -> None:
     draw = ImageDraw.Draw(base)
     max_text_w = CFG.width - (CFG.text_side_margin * 2)
 
-    font, lines, block_w, block_h, line_h = _fit_font_for_wrapped_text(draw, text, max_text_w)
+    font, lines, block_w, block_h, line_h = _fit_font_for_wrapped_text(
+        draw, text, max_text_w, weight=weight
+    )
 
     # Bottom-anchored: last pixel row of block is exactly bottom_padding above bottom edge
     y0 = CFG.height - bottom_padding - block_h
@@ -365,8 +388,8 @@ def _draw_text_with_shadow_bottom_anchored(
         x = (CFG.width - tw) // 2
 
         # shadow then main
-        draw.text((x + sx, y + sy), ln, font=font, fill=shadow)
-        draw.text((x, y), ln, font=font, fill=(255, 255, 255, 255))
+        _draw_text_tracked(draw, x + sx, y + sy, ln, font, shadow, tracking_px)
+        _draw_text_tracked(draw, x, y, ln, font, (255, 255, 255, 255), tracking_px)
 
         y += line_h
 
@@ -432,7 +455,14 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
     _add_bottom_fade_overlay(canvas)
 
     # 6) Bottom-anchored wrapped text
-    _draw_text_with_shadow_bottom_anchored(canvas, caption, bottom_padding=30)
+    weight = None if req.font_weight is None else max(100, min(900, int(req.font_weight)))
+    _draw_text_with_shadow_bottom_anchored(
+        canvas,
+        caption,
+        bottom_padding=30,
+        tracking_px=CFG.tracking_px,
+        weight=weight,
+    )
 
     # 7) Encode
     out = io.BytesIO()
