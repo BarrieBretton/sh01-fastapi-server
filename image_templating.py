@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import io
 import os
-import math
 import httpx
 import random
 
@@ -48,11 +47,11 @@ class TemplateConfig:
 
     # Text margins
     text_side_margin: int = int(os.getenv("TEXT_SIDE_MARGIN", "40"))
-    text_overlay_gap: int = int(os.getenv("TEXT_OVERLAY_GAP", "20"))  # above overlay top
 
     # Overlay
-    overlay_height_ratio: float = float(os.getenv("OVERLAY_HEIGHT_RATIO", "0.3333333"))  # 1/3
+    overlay_height_ratio: float = float(os.getenv("OVERLAY_HEIGHT_RATIO", "0.6"))  # 3/5
     overlay_max_alpha: int = int(os.getenv("OVERLAY_MAX_ALPHA", "220"))  # slightly less than 255 looks nicer
+    overlay_curve_gamma: float = float(os.getenv("OVERLAY_CURVE_GAMMA", "0.45"))
 
     # Font
     # Put a real condensed serif font file path here. Examples:
@@ -74,9 +73,10 @@ CFG = TemplateConfig()
 
 class RenderTemplateRequest(BaseModel):
     background_url: str = Field(..., description="BG image URL (can be ImageKit URL)")
-    flourish_url_1: str = Field(..., description="Flourish image URL #1")
-    flourish_url_2: str = Field(..., description="Flourish image URL #2")
+    flourish_url_1: Optional[str] = None
+    flourish_url_2: Optional[str] = None
     text: str = Field(..., description="Caption text")
+    uppercase: bool = Field(True, description="If true, force ALL CAPS. If false, keep input casing.")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -156,7 +156,9 @@ async def _fetch_image(url: str) -> Image.Image:
             if "image" not in content_type and not url.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 # still allow if server doesn't set content-type properly, but attempt open
                 pass
-            return Image.open(io.BytesIO(r.content)).convert("RGBA")
+            img = Image.open(io.BytesIO(r.content))
+            img.load()
+            return img.convert("RGBA")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch image: {url} ({e})")
 
@@ -195,22 +197,27 @@ def _circle_crop(img: Image.Image, size: int) -> Image.Image:
 
 def _add_bottom_fade_overlay(base: Image.Image) -> None:
     """
-    Adds black overlay from bottom to 1/3rd height, fading to transparent at overlay top.
-    Mutates base in-place.
+    Adds black overlay from bottom up to overlay_height_ratio of image height,
+    fading to transparent at overlay top. Uses a non-linear curve so it stays
+    darker higher up (more "eccentric" toward black).
     """
     w, h = base.size
     overlay_h = int(h * CFG.overlay_height_ratio)
+    overlay_h = max(1, min(h, overlay_h))
 
     overlay = Image.new("RGBA", (w, overlay_h), (0, 0, 0, 0))
     px = overlay.load()
 
-    # y=overlay_h-1 is bottom, y=0 is top
+    gamma = getattr(CFG, "overlay_curve_gamma", 0.45)  # < 1 => darker earlier/higher
+
+    # y=0 top of overlay, y=overlay_h-1 bottom
     for y in range(overlay_h):
-        # alpha: 0 at top -> max at bottom
+        # t: 0 at top, 1 at bottom
         t = y / max(1, overlay_h - 1)
-        alpha = int(CFG.overlay_max_alpha * t)
+        # non-linear curve: keeps it darker higher up
+        a = int(CFG.overlay_max_alpha * (t ** gamma))
         for x in range(w):
-            px[x, y] = (0, 0, 0, alpha)
+            px[x, y] = (0, 0, 0, a)
 
     base.alpha_composite(overlay, (0, h - overlay_h))
 
@@ -252,65 +259,116 @@ def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFon
     h = bbox[3] - bbox[1]
     return w, h
 
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    """
+    Greedy word-wrap that fits text within max_width.
+    """
+    text = (text or "").strip()
+    if not text:
+        return [""]
 
-def _fit_font_size_for_width(
+    words = text.split()
+    lines: list[str] = []
+    cur = ""
+
+    for w in words:
+        candidate = w if not cur else (cur + " " + w)
+        tw, _ = _measure_text(draw, candidate, font)
+        if tw <= max_width:
+            cur = candidate
+        else:
+            if cur:
+                lines.append(cur)
+            # If a single word is too long, hard-break it
+            cur = w
+            tw2, _ = _measure_text(draw, cur, font)
+            if tw2 > max_width:
+                # hard break long word
+                chunk = ""
+                for ch in w:
+                    cand2 = chunk + ch
+                    t3, _ = _measure_text(draw, cand2, font)
+                    if t3 <= max_width:
+                        chunk = cand2
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = ch
+                cur = chunk
+
+    if cur:
+        lines.append(cur)
+
+    return lines
+
+
+def _fit_font_for_wrapped_text(
     draw: ImageDraw.ImageDraw,
     text: str,
     max_width: int,
     *,
     start_size: int = 96,
     min_size: int = 18,
-) -> Tuple[ImageFont.ImageFont, int, int]:
+    line_spacing_ratio: float = 1.12,
+) -> tuple[ImageFont.ImageFont, list[str], int, int, int]:
     """
-    Binary search font size so text fits within max_width.
-    Returns (font, text_w, text_h).
+    Finds the largest font size where wrapped text fits within max_width.
+    Returns (font, lines, block_w, block_h, line_h).
     """
-    lo, hi = min_size, start_size
-    best = None
+    for size in range(start_size, min_size - 1, -1):
+        font = _load_font(size)
+        lines = _wrap_text(draw, text, font, max_width)
 
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        font = _load_font(mid)
-        tw, th = _measure_text(draw, text, font)
-        if tw <= max_width:
-            best = (font, tw, th)
-            lo = mid + 1
-        else:
-            hi = mid - 1
+        # line height from font metrics
+        ascent, descent = font.getmetrics()
+        line_h = int((ascent + descent) * line_spacing_ratio)
 
-    if best is None:
-        # Force min size even if it overflows
-        font = _load_font(min_size)
-        tw, th = _measure_text(draw, text, font)
-        return font, tw, th
+        widths = [_measure_text(draw, ln, font)[0] for ln in lines] if lines else [0]
+        block_w = max(widths) if widths else 0
+        block_h = (len(lines) * line_h) if lines else line_h
 
-    return best
+        if block_w <= max_width:
+            return font, lines, block_w, block_h, line_h
+
+    # fallback
+    font = _load_font(min_size)
+    lines = _wrap_text(draw, text, font, max_width)
+    ascent, descent = font.getmetrics()
+    line_h = int((ascent + descent) * line_spacing_ratio)
+    widths = [_measure_text(draw, ln, font)[0] for ln in lines] if lines else [0]
+    block_w = max(widths) if widths else 0
+    block_h = (len(lines) * line_h) if lines else line_h
+    return font, lines, block_w, block_h, line_h
 
 
-def _draw_text_with_shadow(
+def _draw_text_with_shadow_bottom_anchored(
     base: Image.Image,
     text: str,
     *,
-    y: int,
+    bottom_padding: int = 30,  # distance from bottom edge
 ) -> None:
-    """
-    Centered text, white with slight black shadow.
-    """
     draw = ImageDraw.Draw(base)
     max_text_w = CFG.width - (CFG.text_side_margin * 2)
 
-    font, tw, th = _fit_font_size_for_width(draw, text, max_text_w)
+    font, lines, block_w, block_h, line_h = _fit_font_for_wrapped_text(draw, text, max_text_w)
 
-    x = (CFG.width - tw) // 2
+    # Bottom-anchored: last pixel row of block is exactly bottom_padding above bottom edge
+    y0 = CFG.height - bottom_padding - block_h
+    y0 = max(0, y0)
 
-    # Shadow
     sx, sy = CFG.shadow_offset
     shadow = (0, 0, 0, CFG.shadow_alpha)
-    draw.text((x + sx, y + sy), text, font=font, fill=shadow)
 
-    # Main
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+    y = y0
+    for ln in lines:
+        tw, _ = _measure_text(draw, ln, font)
+        x = (CFG.width - tw) // 2
 
+        # shadow then main
+        draw.text((x + sx, y + sy), ln, font=font, fill=shadow)
+        draw.text((x, y), ln, font=font, fill=(255, 255, 255, 255))
+
+        y += line_h
 
 def _place_flourishes(
     base: Image.Image,
@@ -319,76 +377,70 @@ def _place_flourishes(
     *,
     rng: random.Random,
 ) -> None:
-    """
-    Random positions over background; keeps them out of bottom overlay area (top 2/3 region).
-    """
     w, h = base.size
+
+    # Keep blobs out of the bottom overlay/text region:
+    # with overlay at 0.6h, overlay starts at 0.4h, so allow blobs only above ~0.4h
     overlay_h = int(h * CFG.overlay_height_ratio)
-    safe_bottom = h - overlay_h  # overlay starts here
-    max_y = max(0, safe_bottom - int(0.10 * h))  # keep a bit above overlay start
+    overlay_top = h - overlay_h
+
+    # give a little extra safety margin above overlay start
+    max_y = max(0, overlay_top - int(0.06 * h))
 
     def place_one(fimg: Image.Image):
         size = int(rng.uniform(CFG.flourish_size_min_ratio, CFG.flourish_size_max_ratio) * w)
         size = max(32, min(size, w // 3))
         blob = _circle_crop(fimg, size)
 
-        # random position
         x = rng.randint(0, max(0, w - size))
         y = rng.randint(0, max(0, max_y - size))
-
         base.alpha_composite(blob, (x, y))
 
     place_one(f1)
     place_one(f2)
-
 
 # ----------------------------
 # Main render function
 # ----------------------------
 
 async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
+    caption = req.text or ""
+    if req.uppercase:
+        caption = caption.upper()
+
     rng = random.Random(req.seed)
 
+    # 1) Fetch background
     bg = await _fetch_image(req.background_url)
-    fl1 = await _fetch_image(req.flourish_url_1)
-    fl2 = await _fetch_image(req.flourish_url_2)
 
-    # 1) Background to 9:16
+    # 2) Make canvas first (must exist before compositing)
     canvas = _fit_or_fill_background(bg, keep_subject_in_frame=req.keep_subject_in_frame)
 
-    # 2) Flourishes
-    _place_flourishes(canvas, fl1, fl2, rng=rng)
+    # 3) Fetch flourishes (optional)
+    fl1 = await _fetch_image(req.flourish_url_1) if req.flourish_url_1 else None
+    fl2 = await _fetch_image(req.flourish_url_2) if req.flourish_url_2 else None
 
-    # 3) Bottom overlay gradient
+    # 4) Place flourishes only if provided
+    if fl1 and fl2:
+        _place_flourishes(canvas, fl1, fl2, rng=rng)
+    elif fl1:
+        _place_flourishes(canvas, fl1, fl1, rng=rng)
+    elif fl2:
+        _place_flourishes(canvas, fl2, fl2, rng=rng)
+
+    # 5) Bottom overlay gradient
     _add_bottom_fade_overlay(canvas)
 
-    # 4) Text position: overlay top is (h - overlay_h)
-    overlay_h = int(CFG.height * CFG.overlay_height_ratio)
-    overlay_top_y = CFG.height - overlay_h
+    # 6) Bottom-anchored wrapped text
+    _draw_text_with_shadow_bottom_anchored(canvas, caption, bottom_padding=30)
 
-    # "just above the black overlay with margin 20px from top edge of overlay"
-    # => place text baseline at (overlay_top_y - 20px - text_height).
-    # We'll compute y after measuring at chosen font size by letting the fitter return th.
-    draw = ImageDraw.Draw(canvas)
-    max_text_w = CFG.width - (CFG.text_side_margin * 2)
-    font, tw, th = _fit_font_size_for_width(draw, req.text, max_text_w)
-
-    text_y = overlay_top_y - CFG.text_overlay_gap - th
-    text_y = max(20, text_y)  # keep on-canvas
-
-    # redraw with same fitted font size:
-    # easiest: temporarily override loader by drawing directly
-    # We'll just call _draw_text_with_shadow which refits; acceptable since deterministic for same text.
-    _draw_text_with_shadow(canvas, req.text, y=text_y)
-
-    # Encode
+    # 7) Encode
     out = io.BytesIO()
     fmt = (req.fmt or "png").lower().strip()
     if fmt not in ("png", "jpeg", "jpg"):
         raise HTTPException(status_code=400, detail="fmt must be png or jpeg")
 
     if fmt in ("jpeg", "jpg"):
-        # JPEG doesn't support alpha
         rgb = canvas.convert("RGB")
         rgb.save(out, format="JPEG", quality=req.jpeg_quality, optimize=True)
         mime = "image/jpeg"
@@ -397,7 +449,6 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
         mime = "image/png"
 
     return out.getvalue(), mime
-
 
 # ----------------------------
 # FastAPI endpoint
