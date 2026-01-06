@@ -89,6 +89,7 @@ class RenderTemplateRequest(BaseModel):
     uppercase: bool = Field(True, description="If true, force ALL CAPS. If false, keep input casing.")
     font_width: Optional[int] = Field(None, description="Overrides FONT_WDTH (50..200).")
     font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (200..900).")
+    debug: bool = Field(False, description="If true, return JSON debug info instead of rendering/uploading image.")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -250,6 +251,8 @@ def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] 
 
         for i, ax in enumerate(axes):
             tag = getattr(ax, "tag", None)
+            if isinstance(tag, (bytes, bytearray)):
+                tag = tag.decode("ascii", errors="ignore")
             if tag == "wght":
                 values[i] = max(float(ax.minimum), min(float(ax.maximum), w_req))
             elif tag == "wdth":
@@ -517,12 +520,49 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
 
     return out.getvalue(), mime
 
+def _font_debug_info(weight, width):
+    fp = _resolve_font_path(CFG.font_path)
+    info = {"resolved_font_path": fp, "exists": Path(fp).exists(), "requested": {"wght": weight, "wdth": width}}
+    if not info["exists"]:
+        info["used_default_font"] = True
+        return info
+
+    w_req = float(weight if weight is not None else CFG.font_weight)
+    wd_req = float(width if width is not None else CFG.font_wdth)
+
+    info["config_defaults"] = {"wght": CFG.font_weight, "wdth": CFG.font_wdth}
+    info["effective_requested"] = {"wght": w_req, "wdth": wd_req}
+    info["can_set_variations"] = hasattr(f, "set_variation_by_axes")
+
+
+    try:
+        f = ImageFont.truetype(fp, size=40)
+        axes = f.get_variation_axes()
+        tags = []
+        for a in axes:
+            tag = getattr(a, "tag", None)
+            if isinstance(tag, (bytes, bytearray)):
+                tag = tag.decode("ascii", errors="ignore")
+            tags.append(tag)
+        info["axes_present"] = tags
+    except Exception as e:
+        info["axes_error"] = str(e)
+    return info
+
+
 # ----------------------------
 # FastAPI endpoint
 # ----------------------------
 
 @router.post("/render", summary="Render 9:16 template from background + 2 flourishes + text")
 async def render_endpoint(body: RenderTemplateRequest):
+    # Guard clause
+    if body.debug:
+        # return the debug JSON (include the clamped values you computed)
+        weight = None if body.font_weight is None else max(200, min(900, int(body.font_weight)))
+        width  = None if body.font_width  is None else max(50,  min(200, int(body.font_width)))
+        return JSONResponse(_font_debug_info(weight, width))
+
     img_bytes, mime = await render_template(body)
 
     if body.upload_to_imagekit:
@@ -544,3 +584,22 @@ def debug_font():
     from pathlib import Path
     fp = _resolve_font_path(CFG.font_path)
     return {"configured": CFG.font_path, "resolved": fp, "exists": Path(fp).exists()}
+
+@router.get("/debug/font_axes")
+def debug_font_axes():
+    fp = _resolve_font_path(CFG.font_path)
+    if not Path(fp).exists():
+        return {"error": "font file not found", "resolved": fp}
+
+    try:
+        font = ImageFont.truetype(fp, size=40)
+        axes = font.get_variation_axes()
+        out = []
+        for a in axes:
+            tag = getattr(a, "tag", None)
+            if isinstance(tag, (bytes, bytearray)):
+                tag = tag.decode("ascii", errors="ignore")
+            out.append({"tag": tag, "min": a.minimum, "max": a.maximum, "default": a.default})
+        return {"resolved": fp, "axes": out}
+    except Exception as e:
+        return {"resolved": fp, "axes": None, "error": str(e)}
