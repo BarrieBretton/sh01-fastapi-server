@@ -234,7 +234,6 @@ def _add_bottom_fade_overlay(base: Image.Image) -> None:
 
     base.alpha_composite(overlay, (0, h - overlay_h))
 
-
 def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] = None):
     fp = _resolve_font_path(CFG.font_path)
     if not (fp and Path(fp).exists()):
@@ -244,26 +243,55 @@ def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] 
 
     try:
         axes = font.get_variation_axes()
-        values = [ax.default for ax in axes]
 
-        w_req = float(weight if weight is not None else CFG.font_weight)
-        wd_req = float(width if width is not None else CFG.font_wdth)
+        # axes can be dicts or objects depending on Pillow build/font backend
+        def ax_tag(ax):
+            t = ax.get("tag") if isinstance(ax, dict) else getattr(ax, "tag", None)
+            if isinstance(t, (bytes, bytearray)):
+                t = t.decode("ascii", errors="ignore")
+            return t
 
+        def ax_min(ax):
+            return float(ax["minimum"] if isinstance(ax, dict) else ax.minimum)
+
+        def ax_max(ax):
+            return float(ax["maximum"] if isinstance(ax, dict) else ax.maximum)
+
+        def ax_def(ax):
+            return float(ax["default"] if isinstance(ax, dict) else ax.default)
+
+        values = [ax_def(ax) for ax in axes]
+
+        w_req  = float(weight if weight is not None else CFG.font_weight)
+        wd_req = float(width  if width  is not None else CFG.font_wdth)
+
+        # First try tag-based (if tags exist)
+        tag_map = {}
         for i, ax in enumerate(axes):
-            tag = getattr(ax, "tag", None)
-            if isinstance(tag, (bytes, bytearray)):
-                tag = tag.decode("ascii", errors="ignore")
-            if tag == "wght":
-                values[i] = max(float(ax.minimum), min(float(ax.maximum), w_req))
-            elif tag == "wdth":
-                values[i] = max(float(ax.minimum), min(float(ax.maximum), wd_req))
+            t = ax_tag(ax)
+            if t:
+                tag_map[t] = i
+
+        if "wght" in tag_map:
+            i = tag_map["wght"]
+            values[i] = max(ax_min(axes[i]), min(ax_max(axes[i]), w_req))
+        if "wdth" in tag_map:
+            i = tag_map["wdth"]
+            values[i] = max(ax_min(axes[i]), min(ax_max(axes[i]), wd_req))
+
+        # Fallback: tags are None -> assume [0]=wght, [1]=wdth
+        if not tag_map:
+            if len(axes) >= 1:
+                values[0] = max(ax_min(axes[0]), min(ax_max(axes[0]), w_req))
+            if len(axes) >= 2:
+                values[1] = max(ax_min(axes[1]), min(ax_max(axes[1]), wd_req))
 
         font.set_variation_by_axes(values)
     except Exception:
         pass
 
-    return font
 
+    return font
 
 def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
     # Pillow-compatible bbox measurement
@@ -456,28 +484,123 @@ def _place_flourishes(
     place_one(f1)
     place_one(f2)
 
+def _font_debug_info(eff_wght: int, eff_wdth: int):
+    fp = _resolve_font_path(CFG.font_path)
+    info = {
+        "resolved": fp,
+        "exists": Path(fp).exists(),
+        "config_defaults": {"wght": CFG.font_weight, "wdth": CFG.font_wdth},
+        "effective": {"wght": eff_wght, "wdth": eff_wdth},
+    }
+    if not info["exists"]:
+        info["used_default_font"] = True
+        return info
+
+    try:
+        f = ImageFont.truetype(fp, size=40)
+        axes = f.get_variation_axes() or []
+        metas = [_axis_meta(a) for a in axes]
+        info["axes"] = metas
+
+        # try applying
+        g = _load_font(40, weight=eff_wght, width=eff_wdth)
+        # if no exception, we consider it applicable
+        info["can_set_variations"] = True
+    except Exception as e:
+        info["can_set_variations"] = False
+        info["error"] = str(e)
+
+    return info
+
+
+def _clamp(v: Optional[int], lo: int, hi: int, default: int) -> int:
+    if v is None:
+        return default
+    try:
+        v = int(v)
+    except Exception:
+        return default
+    return max(lo, min(hi, v))
+
+
+def _axis_meta(ax):
+    # Pillow may return dicts OR objects depending on version/build.
+    if isinstance(ax, dict):
+        return {
+            "tag": ax.get("tag"),
+            "min": ax.get("minValue") or ax.get("minimum") or ax.get("min"),
+            "max": ax.get("maxValue") or ax.get("maximum") or ax.get("max"),
+            "default": ax.get("defaultValue") or ax.get("default"),
+        }
+    # object-like
+    return {
+        "tag": getattr(ax, "tag", None),
+        "min": getattr(ax, "minimum", None),
+        "max": getattr(ax, "maximum", None),
+        "default": getattr(ax, "default", None),
+    }
+
+
+def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] = None):
+    fp = _resolve_font_path(CFG.font_path)
+    if not (fp and Path(fp).exists()):
+        return ImageFont.load_default()
+
+    font = ImageFont.truetype(fp, size=size)
+
+    # Decide requested values (use CFG defaults if not provided)
+    w_req = float(weight if weight is not None else CFG.font_weight)
+    wd_req = float(width if width is not None else CFG.font_wdth)
+
+    try:
+        axes = font.get_variation_axes() or []
+        if not axes:
+            return font
+
+        metas = [_axis_meta(a) for a in axes]
+        values = [m["default"] for m in metas]
+
+        # If tags exist, use them; otherwise infer by ranges (your axes have tag=None)
+        for i, m in enumerate(metas):
+            tag = m["tag"]
+            if isinstance(tag, (bytes, bytearray)):
+                tag = tag.decode("ascii", errors="ignore")
+
+            mn, mx = float(m["min"]), float(m["max"])
+
+            if tag == "wght" or (tag is None and mn <= 200 <= mx and mn <= 900 <= mx):
+                values[i] = max(mn, min(mx, w_req))
+            elif tag == "wdth" or (tag is None and mn <= 50 <= mx and mn <= 200 <= mx):
+                values[i] = max(mn, min(mx, wd_req))
+
+        font.set_variation_by_axes(values)
+    except Exception:
+        # If variation fails, you still get the base font
+        pass
+
+    return font
+
 # ----------------------------
 # Main render function
 # ----------------------------
 
 async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
-    caption = req.text or ""
+    caption = (req.text or "")
     if req.uppercase:
         caption = caption.upper()
 
     rng = random.Random(req.seed)
 
-    # 1) Fetch background
-    bg = await _fetch_image(req.background_url)
+    # Compute effective (clamped) variation values ONCE
+    eff_wght = _clamp(req.font_weight, 200, 900, CFG.font_weight)
+    eff_wdth = _clamp(req.font_width, 50, 200, CFG.font_wdth)
 
-    # 2) Make canvas first (must exist before compositing)
+    bg = await _fetch_image(req.background_url)
     canvas = _fit_or_fill_background(bg, keep_subject_in_frame=req.keep_subject_in_frame)
 
-    # 3) Fetch flourishes (optional)
     fl1 = await _fetch_image(req.flourish_url_1) if req.flourish_url_1 else None
     fl2 = await _fetch_image(req.flourish_url_2) if req.flourish_url_2 else None
 
-    # 4) Place flourishes only if provided
     if fl1 and fl2:
         _place_flourishes(canvas, fl1, fl2, rng=rng)
     elif fl1:
@@ -485,34 +608,27 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
     elif fl2:
         _place_flourishes(canvas, fl2, fl2, rng=rng)
 
-    # 5) Bottom overlay gradient
     _add_bottom_fade_overlay(canvas)
 
-    # dial goes BEFORE main text so it stays behind if overlapping
-    weight = None if req.font_weight is None else max(200, min(900, int(req.font_weight)))
-    width  = None if req.font_width is None else max(50,  min(200, int(req.font_width)))
+    # Use SAME effective values for dial + text
+    _draw_dial(canvas, label="PGP", width=eff_wdth, weight=eff_wght)
 
-    _draw_dial(canvas, label="PGP", width=width, weight=(weight or CFG.font_weight))
-
-    # 6) Bottom-anchored wrapped text
     _draw_text_with_shadow_bottom_anchored(
         canvas,
         caption,
         bottom_padding=60,
         tracking_px=CFG.tracking_px,
-        weight=weight,
-        width=width,
+        weight=eff_wght,
+        width=eff_wdth,
     )
 
-    # 7) Encode
     out = io.BytesIO()
     fmt = (req.fmt or "png").lower().strip()
     if fmt not in ("png", "jpeg", "jpg"):
         raise HTTPException(status_code=400, detail="fmt must be png or jpeg")
 
     if fmt in ("jpeg", "jpg"):
-        rgb = canvas.convert("RGB")
-        rgb.save(out, format="JPEG", quality=req.jpeg_quality, optimize=True)
+        canvas.convert("RGB").save(out, format="JPEG", quality=req.jpeg_quality, optimize=True)
         mime = "image/jpeg"
     else:
         canvas.save(out, format="PNG", optimize=True)
@@ -520,64 +636,48 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
 
     return out.getvalue(), mime
 
-def _font_debug_info(weight, width):
-    fp = _resolve_font_path(CFG.font_path)
-    info = {"resolved_font_path": fp, "exists": Path(fp).exists(), "requested": {"wght": weight, "wdth": width}}
-    if not info["exists"]:
-        info["used_default_font"] = True
-        return info
-
-    w_req = float(weight if weight is not None else CFG.font_weight)
-    wd_req = float(width if width is not None else CFG.font_wdth)
-
-    info["config_defaults"] = {"wght": CFG.font_weight, "wdth": CFG.font_wdth}
-    info["effective_requested"] = {"wght": w_req, "wdth": wd_req}
-    info["can_set_variations"] = hasattr(f, "set_variation_by_axes")
-
-
-    try:
-        f = ImageFont.truetype(fp, size=40)
-        axes = f.get_variation_axes()
-        tags = []
-        for a in axes:
-            tag = getattr(a, "tag", None)
-            if isinstance(tag, (bytes, bytearray)):
-                tag = tag.decode("ascii", errors="ignore")
-            tags.append(tag)
-        info["axes_present"] = tags
-    except Exception as e:
-        info["axes_error"] = str(e)
-    return info
-
-
 # ----------------------------
 # FastAPI endpoint
 # ----------------------------
 
 @router.post("/render", summary="Render 9:16 template from background + 2 flourishes + text")
 async def render_endpoint(body: RenderTemplateRequest):
-    # Guard clause
+    # Debug mode: return JSON ONLY (no render/upload)
     if body.debug:
-        # return the debug JSON (include the clamped values you computed)
-        weight = None if body.font_weight is None else max(200, min(900, int(body.font_weight)))
-        width  = None if body.font_width  is None else max(50,  min(200, int(body.font_width)))
-        return JSONResponse(_font_debug_info(weight, width))
+        eff_wght = _clamp(body.font_weight, 200, 900, CFG.font_weight)
+        eff_wdth = _clamp(body.font_width, 50, 200, CFG.font_wdth)
+        return JSONResponse(_font_debug_info(eff_wght, eff_wdth))
 
     img_bytes, mime = await render_template(body)
 
     if body.upload_to_imagekit:
         try:
             uploaded = _imagekit_upload(img_bytes, body.upload_file_name)
-            return RenderTemplateUploadResponse(
-                uploaded=True,
-                url=uploaded.get("url"),
-                fileId=uploaded.get("fileId"),
-                name=uploaded.get("name"),
-            )
+            return {
+                "uploaded": True,
+                "url": uploaded.get("url"),
+                "fileId": uploaded.get("fileId"),
+                "name": uploaded.get("name"),
+            }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Rendered, but upload failed: {e}")
 
     return StreamingResponse(io.BytesIO(img_bytes), media_type=mime)
+
+@router.get("/debug/font_render")
+def debug_font_render(wght: int = 900, wdth: int = 50):
+    fp = _resolve_font_path(CFG.font_path)
+    img = Image.new("RGBA", (1400, 300), (255, 255, 255, 255))
+    d = ImageDraw.Draw(img)
+
+    f = _load_font(140, weight=wght, width=wdth)
+    d.text((20, 40), f"W:{wght} D:{wdth} Inconsolata", font=f, fill=(0, 0, 0, 255))
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return StreamingResponse(out, media_type="image/png")
+
 
 @router.get("/debug/font")
 def debug_font():
@@ -594,12 +694,27 @@ def debug_font_axes():
     try:
         font = ImageFont.truetype(fp, size=40)
         axes = font.get_variation_axes()
+
         out = []
         for a in axes:
-            tag = getattr(a, "tag", None)
+            # Pillow may return dicts OR objects depending on version/build
+            if isinstance(a, dict):
+                tag = a.get("tag")
+                mn = a.get("minimum")
+                mx = a.get("maximum")
+                d  = a.get("default")
+            else:
+                tag = getattr(a, "tag", None)
+                mn = getattr(a, "minimum", None)
+                mx = getattr(a, "maximum", None)
+                d  = getattr(a, "default", None)
+
             if isinstance(tag, (bytes, bytearray)):
                 tag = tag.decode("ascii", errors="ignore")
-            out.append({"tag": tag, "min": a.minimum, "max": a.maximum, "default": a.default})
-        return {"resolved": fp, "axes": out}
+
+            out.append({"tag": tag, "min": mn, "max": mx, "default": d})
+
+        return {"resolved": fp, "axes": out, "can_set_variations": hasattr(font, "set_variation_by_axes")}
     except Exception as e:
         return {"resolved": fp, "axes": None, "error": str(e)}
+
