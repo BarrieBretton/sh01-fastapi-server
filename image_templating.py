@@ -20,8 +20,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 router = APIRouter(tags=["image-templating"])
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_FONT_REL = "assets/Inconsolata-VariableFont_wdth,wght.ttf"
-
+DEFAULT_FONT_REL = "assets/Fira_Sans/FiraSans-Medium.ttf"
 NAMED_COLORS = {
     "white": (255, 255, 255, 255),
     "black": (0, 0, 0, 255),
