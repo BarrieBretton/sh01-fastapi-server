@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 import os
 import httpx
 import random
@@ -21,6 +22,25 @@ router = APIRouter(tags=["image-templating"])
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_FONT_REL = "assets/Inconsolata-VariableFont_wdth,wght.ttf"
 
+NAMED_COLORS = {
+    "white": (255, 255, 255, 255),
+    "black": (0, 0, 0, 255),
+    "yellow": (255, 235, 59, 255),
+    "red": (244, 67, 54, 255),
+    "orange": (255, 152, 0, 255),
+    "green": (76, 175, 80, 255),
+    "pink": (233, 30, 99, 255),
+    "fuchsia": (255, 0, 255, 255),
+    "magenta": (255, 0, 255, 255),
+    "purple": (156, 39, 176, 255),
+    "blue": (33, 150, 243, 255),
+    "cyan": (0, 188, 212, 255),
+    "gray": (158, 158, 158, 255),
+    "grey": (158, 158, 158, 255),
+}
+
+HEX_RE = re.compile(r"^#([0-9a-fA-F]{6})$")
+
 def _resolve_font_path(p: str) -> str:
     if not p:
         return ""
@@ -30,6 +50,207 @@ def _resolve_font_path(p: str) -> str:
         return str(path)
     # resolve relative to the module/app directory
     return str((PROJECT_ROOT / path).resolve())
+
+def _parse_color_token(tok: str) -> Optional[Tuple[int, int, int, int]]:
+    if not tok:
+        return None
+    t = tok.strip().lower()
+
+    if t in NAMED_COLORS:
+        return NAMED_COLORS[t]
+
+    m = HEX_RE.match(t)
+    if m:
+        hexv = m.group(1)
+        r = int(hexv[0:2], 16)
+        g = int(hexv[2:4], 16)
+        b = int(hexv[4:6], 16)
+        return (r, g, b, 255)
+
+    return None
+
+
+# Returns list of spans: [(text, rgba), ...]
+def _parse_highlight_spans(text: str, *, default_rgba=(255, 255, 255, 255)) -> list[tuple[str, Tuple[int, int, int, int]]]:
+    # Supports: [yellow]...[/yellow] and [#FFAA00]...[/#FFAA00]
+    # Non-nested, simple, forgiving.
+    spans: list[tuple[str, Tuple[int, int, int, int]]] = []
+    i = 0
+    cur_color = default_rgba
+
+    tag_open = re.compile(r"\[([#a-zA-Z0-9]+)\]")
+    tag_close = re.compile(r"\[/([#a-zA-Z0-9]+)\]")
+
+    while i < len(text):
+        m_open = tag_open.search(text, i)
+        m_close = tag_close.search(text, i)
+
+        # pick earliest tag
+        m = None
+        is_open = False
+        if m_open and m_close:
+            if m_open.start() < m_close.start():
+                m = m_open
+                is_open = True
+            else:
+                m = m_close
+                is_open = False
+        elif m_open:
+            m = m_open
+            is_open = True
+        elif m_close:
+            m = m_close
+            is_open = False
+
+        if not m:
+            # no more tags
+            if i < len(text):
+                spans.append((text[i:], cur_color))
+            break
+
+        # emit text before tag
+        if m.start() > i:
+            spans.append((text[i:m.start()], cur_color))
+
+        tok = m.group(1)
+
+        if is_open:
+            newc = _parse_color_token(tok)
+            if newc is not None:
+                cur_color = newc
+            else:
+                # unknown tag: keep it as literal text
+                spans.append((m.group(0), cur_color))
+        else:
+            # closing tag: if it matches any known color/hex, just reset to default
+            # (we’re not doing nested stack here)
+            closec = _parse_color_token(tok)
+            if closec is not None:
+                cur_color = default_rgba
+            else:
+                spans.append((m.group(0), cur_color))
+
+        i = m.end()
+
+    # merge adjacent spans of same color
+    merged: list[tuple[str, Tuple[int, int, int, int]]] = []
+    for t, c in spans:
+        if not t:
+            continue
+        if merged and merged[-1][1] == c:
+            merged[-1] = (merged[-1][0] + t, c)
+        else:
+            merged.append((t, c))
+
+    return merged
+
+def _wrap_spans(draw: ImageDraw.ImageDraw, spans, font, max_width: int):
+    """
+    Wrap colored spans into lines, respecting HARD line breaks on '\n'.
+    Returns: list[list[(text, rgba)]]
+    """
+    lines = []
+    cur_line = []
+    cur_w = 0.0
+
+    def flush_line():
+        nonlocal cur_line, cur_w
+        # clean leading whitespace token
+        while cur_line and cur_line[0][0].isspace():
+            cur_line.pop(0)
+        if cur_line:
+            t0, c0 = cur_line[0]
+            cur_line[0] = (t0.lstrip(), c0)
+        lines.append(cur_line)
+        cur_line = []
+        cur_w = 0.0
+
+    def push_token(tok: str, color):
+        nonlocal cur_line, cur_w
+        if tok == "":
+            return
+        pw = draw.textlength(tok, font=font)
+        if cur_w + pw <= max_width or not cur_line:
+            cur_line.append((tok, color))
+            cur_w += pw
+        else:
+            flush_line()
+            cur_line.append((tok.lstrip(), color))
+            cur_w = draw.textlength(cur_line[0][0], font=font)
+
+    for text, color in spans:
+        if not text:
+            continue
+
+        # split by newline but keep the newline markers
+        parts = re.split(r"(\n)", text)
+
+        for part in parts:
+            if part == "":
+                continue
+
+            if part == "\n":
+                # hard break
+                flush_line()
+                continue
+
+            # normal wrapping within this part
+            tokens = re.split(r"(\s+)", part)
+            for tok in tokens:
+                if tok == "":
+                    continue
+                push_token(tok, color)
+
+    if cur_line:
+        flush_line()
+
+    # Merge adjacent spans of same color within each line
+    merged_lines = []
+    for ln in lines:
+        merged = []
+        for t, c in ln:
+            if not t:
+                continue
+            if merged and merged[-1][1] == c:
+                merged[-1] = (merged[-1][0] + t, c)
+            else:
+                merged.append((t, c))
+        merged_lines.append(merged)
+
+    # Remove any empty lines produced by consecutive flushes (optional)
+    # If you WANT blank lines, keep them (return empty lists).
+    return merged_lines
+
+def _line_width_spans(draw: ImageDraw.ImageDraw, line_spans, font, tracking_px: int) -> int:
+    # width of a line of spans, char-tracking aware
+    w = 0.0
+    for seg_text, _seg_color in line_spans:
+        if not seg_text:
+            continue
+        for idx, ch in enumerate(seg_text):
+            w += draw.textlength(ch, font=font)
+            if idx != len(seg_text) - 1:
+                w += tracking_px
+        # tracking between segments should also count if next segment exists and last char exists
+        if seg_text and line_spans is not None:
+            pass
+    # add tracking between segments where appropriate:
+    # easiest: rebuild full string and compute char-tracked width once
+    full = "".join(t for t, _ in line_spans)
+    if not full:
+        return 0
+    return int(sum(draw.textlength(ch, font=font) for ch in full) + tracking_px * (len(full) - 1))
+
+def _draw_spans_tracked(draw, x, y, spans, font, tracking_px: int, shadow_rgba=None):
+    cx = x
+    for seg_text, seg_color in spans:
+        for ch in seg_text:
+            if shadow_rgba is not None:
+                draw.text((cx, y), ch, font=font, fill=shadow_rgba)
+            draw.text((cx, y), ch, font=font, fill=seg_color)
+            cw = draw.textlength(ch, font=font)
+            cx += int(cw) + tracking_px
+
 
 # ----------------------------
 # Config
@@ -90,6 +311,7 @@ class RenderTemplateRequest(BaseModel):
     font_width: Optional[int] = Field(None, description="Overrides FONT_WDTH (50..200).")
     font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (200..900).")
     debug: bool = Field(False, description="If true, return JSON debug info instead of rendering/uploading image.")
+    enable_highlights: bool = Field(False, description="Enable inline color tags like [yellow]...[/yellow] or [#FF5733]...[ /#FF5733 ]")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -116,6 +338,12 @@ class RenderTemplateUploadResponse(BaseModel):
     fileId: Optional[str] = None
     name: Optional[str] = None
 
+class DeleteImageRequest(BaseModel):
+    fileId: str = Field(..., description="ImageKit fileId to delete")
+
+class DeleteImageResponse(BaseModel):
+    deleted: bool
+    fileId: str
 
 # ----------------------------
 # ImageKit upload (optional)
@@ -302,45 +530,59 @@ def _measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFon
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
     """
-    Greedy word-wrap that fits text within max_width.
+    Greedy wrap with HARD line breaks on '\n'.
     """
-    text = (text or "").strip()
-    if not text:
+    text = (text or "")
+    if text == "":
         return [""]
 
-    words = text.split()
-    lines: list[str] = []
-    cur = ""
+    out_lines: list[str] = []
 
-    for w in words:
-        candidate = w if not cur else (cur + " " + w)
-        tw, _ = _measure_text(draw, candidate, font)
-        if tw <= max_width:
-            cur = candidate
-        else:
-            if cur:
-                lines.append(cur)
-            # If a single word is too long, hard-break it
-            cur = w
-            tw2, _ = _measure_text(draw, cur, font)
-            if tw2 > max_width:
-                # hard break long word
-                chunk = ""
-                for ch in w:
-                    cand2 = chunk + ch
-                    t3, _ = _measure_text(draw, cand2, font)
-                    if t3 <= max_width:
-                        chunk = cand2
-                    else:
-                        if chunk:
-                            lines.append(chunk)
-                        chunk = ch
-                cur = chunk
+    # Split into paragraphs by explicit newlines
+    paragraphs = text.split("\n")
 
-    if cur:
-        lines.append(cur)
+    for p_i, para in enumerate(paragraphs):
+        para = para.strip()
+        if not para:
+            # keep blank line
+            out_lines.append("")
+            continue
 
-    return lines
+        words = para.split()  # spaces within the paragraph
+        cur = ""
+
+        for w in words:
+            candidate = w if not cur else (cur + " " + w)
+            tw, _ = _measure_text(draw, candidate, font)
+            if tw <= max_width:
+                cur = candidate
+            else:
+                if cur:
+                    out_lines.append(cur)
+                cur = w
+
+                # hard-break long single words
+                tw2, _ = _measure_text(draw, cur, font)
+                if tw2 > max_width:
+                    chunk = ""
+                    for ch in w:
+                        cand2 = chunk + ch
+                        t3, _ = _measure_text(draw, cand2, font)
+                        if t3 <= max_width:
+                            chunk = cand2
+                        else:
+                            if chunk:
+                                out_lines.append(chunk)
+                            chunk = ch
+                    cur = chunk
+
+        if cur:
+            out_lines.append(cur)
+
+        # NOTE: don't add extra line here; split("\n") already enforces it
+        # but we DO want to preserve empty lines (handled above).
+
+    return out_lines
 
 def _draw_dial(base: Image.Image, *, label="PGP", width: Optional[int] = None, weight: Optional[int] = None):
     draw = ImageDraw.Draw(base)
@@ -424,33 +666,47 @@ def _draw_text_with_shadow_bottom_anchored(
     *,
     bottom_padding: int = 30,
     tracking_px: int = 0,
-    weight: Optional[int]=None,
-    width: Optional[int]=None
+    weight: Optional[int] = None,
+    width: Optional[int] = None,
+    enable_highlights: bool = False,
 ) -> None:
     draw = ImageDraw.Draw(base)
     max_text_w = CFG.width - (CFG.text_side_margin * 2)
 
-    font, lines, block_w, block_h, line_h = _fit_font_for_wrapped_text(
-        draw, text, max_text_w, weight=weight, width=width
+    # choose font size using plain text (strip tags) so sizing is stable
+    plain = re.sub(r"\[/?[#a-zA-Z0-9]+\]", "", text) if enable_highlights else text
+
+    font, _lines_plain, _bw, block_h, line_h = _fit_font_for_wrapped_text(
+        draw, plain, max_text_w, weight=weight, width=width
     )
 
-    # Bottom-anchored: last pixel row of block is exactly bottom_padding above bottom edge
+    # build colored lines
+    if enable_highlights:
+        spans = _parse_highlight_spans(text, default_rgba=(255, 255, 255, 255))
+        lines = _wrap_spans(draw, spans, font, max_text_w)  # list of span-lines
+    else:
+        # fallback: single-color spans
+        spans = [(text, (255, 255, 255, 255))]
+        lines = _wrap_spans(draw, spans, font, max_text_w)
+
+    # recompute block height based on actual wrapped lines
+    block_h = (len(lines) * line_h) if lines else line_h
+
     y0 = CFG.height - bottom_padding - block_h
     y0 = max(0, y0)
 
     sx, sy = CFG.shadow_offset
-    shadow = (0, 0, 0, CFG.shadow_alpha)
+    shadow_rgba = (0, 0, 0, CFG.shadow_alpha)
 
     y = y0
-    for ln in lines:
-        # tw, _ = _measure_text(draw, ln, font)
-        tracked_w = sum(draw.textlength(ch, font=font) for ch in ln) + tracking_px * (len(ln) - 1)
-        x = (CFG.width - int(tracked_w)) // 2
-        # x = (CFG.width - tw) // 2
+    for line_spans in lines:
+        tracked_w = _line_width_spans(draw, line_spans, font, tracking_px)
+        x = (CFG.width - tracked_w) // 2
 
-        # shadow then main
-        _draw_text_tracked(draw, x + sx, y + sy, ln, font, shadow, tracking_px)
-        _draw_text_tracked(draw, x, y, ln, font, (255, 255, 255, 255), tracking_px)
+        # shadow
+        _draw_spans_tracked(draw, x + sx, y + sy, line_spans, font, tracking_px, shadow_rgba=shadow_rgba)
+        # main
+        _draw_spans_tracked(draw, x, y, line_spans, font, tracking_px, shadow_rgba=None)
 
         y += line_h
 
@@ -580,6 +836,25 @@ def _load_font(size: int, *, weight: Optional[int] = None, width: Optional[int] 
 
     return font
 
+def _imagekit_delete(file_id: str) -> dict:
+    private_key = os.getenv("IMAGEKIT_PRIVATE_KEY", "").strip()
+    if not private_key:
+        raise RuntimeError("IMAGEKIT_PRIVATE_KEY not set")
+
+    import requests
+
+    url = f"https://api.imagekit.io/v1/files/{file_id}"
+    resp = requests.delete(url, auth=(private_key, ""), timeout=30)
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"ImageKit delete failed: {resp.status_code} {resp.text[:400]}")
+
+    # ImageKit typically returns JSON or empty; normalize
+    try:
+        return resp.json()
+    except Exception:
+        return {"deleted": True, "fileId": file_id}
+
 # ----------------------------
 # Main render function
 # ----------------------------
@@ -620,6 +895,7 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
         tracking_px=CFG.tracking_px,
         weight=eff_wght,
         width=eff_wdth,
+        enable_highlights=req.enable_highlights,
     )
 
     out = io.BytesIO()
@@ -663,6 +939,14 @@ async def render_endpoint(body: RenderTemplateRequest):
             raise HTTPException(status_code=500, detail=f"Rendered, but upload failed: {e}")
 
     return StreamingResponse(io.BytesIO(img_bytes), media_type=mime)
+
+@router.post("/delete", summary="Delete an uploaded image from ImageKit by fileId")
+def delete_endpoint(body: DeleteImageRequest):
+    try:
+        _imagekit_delete(body.fileId)
+        return DeleteImageResponse(deleted=True, fileId=body.fileId)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/debug/font_render")
 def debug_font_render(wght: int = 900, wdth: int = 50):
