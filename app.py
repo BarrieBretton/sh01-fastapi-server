@@ -515,13 +515,13 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
    
     # yt-dlp command templates (NO COOKIES)
     cmd_templates = [
-        ["yt-dlp", "--force-ipv4", "--no-check-certificate",
+        [sys.executable, "-m", "yt_dlp", "--force-ipv4", "--no-check-certificate",
          "-f", "bestvideo+bestaudio/best",
          "--merge-output-format", "mp4",
          "--socket-timeout", "30",
          "-o", str(output_file)],
-
-        ["yt-dlp", "--force-ipv4", "--no-check-certificate",
+    
+        [sys.executable, "-m", "yt_dlp", "--force-ipv4", "--no-check-certificate",
          "-f", "best",
          "--merge-output-format", "mp4",
          "--socket-timeout", "30",
