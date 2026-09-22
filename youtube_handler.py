@@ -4,21 +4,23 @@ import logging
 import re
 from urllib.parse import urlparse, parse_qs
 from typing import List, Dict
+
 from dotenv import load_dotenv
 import httpx
 from pydantic import BaseModel
 
-# Load environment variables
 load_dotenv(".env")
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("youtube_handler")
 
-# YouTube Data API v3
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 if not YOUTUBE_API_KEY:
     raise ValueError("YOUTUBE_API_KEY not set in .env")
+
+# Explicit API-side definition used by only_shorts:
+# short-form means a video whose contentDetails.duration is <= 180 seconds.
+SHORT_FORM_MAX_SECONDS = 180
 
 
 class YouTubeVideo(BaseModel):
@@ -40,67 +42,67 @@ class YouTubeHandler:
         self.api_key = api_key
         self.base_url = "https://www.googleapis.com/youtube/v3"
 
-    # ----------------------------
-    # NEW: Extract video ID
-    # ----------------------------
     def extract_video_id(self, url_or_id: str) -> str:
         """
         Accepts:
-          - full youtube URL (watch?v=...), short youtu.be/..., shorts/..., embed/...
-          - bare video id (11 chars)
-        Returns: video_id or "".
+          - full YouTube URL (watch?v=..., youtu.be, shorts, embed)
+          - bare video ID
+        Returns video ID or an empty string.
         """
-        s = (url_or_id or "").strip()
-        if not s:
+        value = (url_or_id or "").strip()
+        if not value:
             return ""
 
-        # If it already looks like a YouTube video id (usually 11 chars)
-        if re.fullmatch(r"[0-9A-Za-z_-]{11}", s):
-            return s
+        if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
+            return value
 
         try:
-            u = urlparse(s)
-            host = (u.netloc or "").lower()
+            parsed_url = urlparse(value)
+            host = (parsed_url.netloc or "").lower()
 
-            # youtu.be/<id>
             if "youtu.be" in host:
-                vid = u.path.strip("/").split("/")[0]
-                vid = vid.split("?", 1)[0].split("#", 1)[0] # (This safely strips ?si=... / fragments if they sneak in.)
-                return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else ""
+                video_id = parsed_url.path.strip("/").split("/")[0]
+                video_id = video_id.split("?", 1)[0].split("#", 1)[0]
+                return (
+                    video_id
+                    if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id or "")
+                    else ""
+                )
 
-            # youtube.com variants
             if "youtube.com" in host or "m.youtube.com" in host:
-                qs = parse_qs(u.query or "")
+                query_params = parse_qs(parsed_url.query or "")
 
-                # youtube.com/watch?v=<id>
-                if "v" in qs and qs["v"]:
-                    vid = qs["v"][0]
-                    return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else ""
+                if "v" in query_params and query_params["v"]:
+                    video_id = query_params["v"][0]
+                    return (
+                        video_id
+                        if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id or "")
+                        else ""
+                    )
 
-                parts = [p for p in u.path.split("/") if p]
+                path_parts = [part for part in parsed_url.path.split("/") if part]
 
-                # youtube.com/shorts/<id>
-                if len(parts) >= 2 and parts[0] == "shorts":
-                    vid = parts[1]
-                    return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else ""
+                if len(path_parts) >= 2 and path_parts[0] == "shorts":
+                    video_id = path_parts[1]
+                    return (
+                        video_id
+                        if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id or "")
+                        else ""
+                    )
 
-                # youtube.com/embed/<id>
-                if len(parts) >= 2 and parts[0] == "embed":
-                    vid = parts[1]
-                    return vid if re.fullmatch(r"[0-9A-Za-z_-]{11}", vid or "") else ""
-
+                if len(path_parts) >= 2 and path_parts[0] == "embed":
+                    video_id = path_parts[1]
+                    return (
+                        video_id
+                        if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id or "")
+                        else ""
+                    )
         except Exception:
             return ""
 
         return ""
 
-    # ----------------------------
-    # NEW: Fetch title from URL/ID
-    # ----------------------------
     async def get_video_title(self, url_or_id: str) -> str:
-        """
-        Returns the video's title using videos.list(part=snippet).
-        """
         video_id = self.extract_video_id(url_or_id)
         if not video_id:
             raise ValueError(f"Could not extract video_id from: {url_or_id}")
@@ -113,57 +115,96 @@ class YouTubeHandler:
         }
 
         async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
 
         items = data.get("items", [])
         if not items:
             raise ValueError(f"Video not found / unavailable for id: {video_id}")
 
-        snippet = items[0].get("snippet", {})
-        title = (snippet.get("title") or "").strip()
-        return title
+        return (items[0].get("snippet", {}).get("title") or "").strip()
 
     async def _fetch_channel_id(self, handle: str) -> str:
-        # Accept handle with or without @, normalize to without @
-        if handle.startswith("@"):
-            handle = handle[1:]
+        normalized_handle = handle.removeprefix("@")
 
         url = f"{self.base_url}/channels"
         params = {
             "part": "id",
-            "forHandle": handle,
+            "forHandle": normalized_handle,
             "key": self.api_key,
         }
 
         async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
-
             data = response.json()
 
-            # FIX: don't log as error on success
-            logger.debug("YouTube channel lookup response: %s", data)
+        logger.debug("YouTube channel lookup response: %s", data)
 
-            if response.status_code == 401:
-                raise ValueError("Invalid or unauthorized API key (401)")
+        if not data.get("items"):
+            raise ValueError(f"Channel not found for handle: @{normalized_handle}")
 
-            if not data.get("items"):
-                raise ValueError(f"Channel not found for handle: @{handle}")
+        channel_id = data["items"][0]["id"]
+        logger.info(
+            "Successfully resolved @%s → Channel ID: %s",
+            normalized_handle,
+            channel_id,
+        )
+        return channel_id
 
-            channel_id = data["items"][0]["id"]
-            logger.info(f"Successfully resolved @{handle} → Channel ID: {channel_id}")
-            return channel_id
+    @staticmethod
+    def _duration_to_seconds(duration: str) -> int | None:
+        """
+        Convert YouTube ISO 8601 durations such as PT59S, PT2M30S,
+        PT1H2M3S, or P1DT2H into seconds.
+        """
+        match = re.fullmatch(
+            r"P(?:(?P<days>\d+)D)?"
+            r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?"
+            r"(?:(?P<seconds>\d+)S)?)?",
+            duration or "",
+        )
+        if not match:
+            logger.warning("Could not parse YouTube duration: %r", duration)
+            return None
+
+        parts = match.groupdict(default="0")
+        return (
+            int(parts["days"]) * 86_400
+            + int(parts["hours"]) * 3_600
+            + int(parts["minutes"]) * 60
+            + int(parts["seconds"])
+        )
+
+    @staticmethod
+    def _matches_short_form_filter(
+        duration_seconds: int | None,
+        only_shorts: bool | None,
+    ) -> bool:
+        if only_shorts is None:
+            return True
+
+        # Never claim a video fits an explicit filter if the API gave no
+        # usable duration to classify it.
+        if duration_seconds is None:
+            return False
+
+        is_short_form = duration_seconds <= SHORT_FORM_MAX_SECONDS
+        return is_short_form if only_shorts else not is_short_form
 
     async def _fetch_video_stats(self, video_ids: List[str]) -> Dict[str, Dict]:
-        """Fetch stats + snippet for multiple video IDs in one call (quota-efficient)."""
+        """Fetch snippets, statistics, and durations in one videos.list call."""
+        if not video_ids:
+            return {}
+
         url = f"{self.base_url}/videos"
         params = {
-            "part": "snippet,statistics",
+            "part": "snippet,statistics,contentDetails",
             "id": ",".join(video_ids),
             "key": self.api_key,
         }
+
         async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
@@ -171,15 +212,16 @@ class YouTubeHandler:
 
         stats_by_id = {}
         for item in data.get("items", []):
-            vid = item["id"]
-            stats_by_id[vid] = {
+            video_id = item["id"]
+            stats_by_id[video_id] = {
                 "statistics": item.get("statistics", {}),
                 "snippet": item.get("snippet", {}),
+                "content_details": item.get("contentDetails", {}),
             }
+
         return stats_by_id
 
     def _calculate_relevance_score(self, video: Dict) -> float:
-        """Calculate a relevance score based on engagement metrics."""
         stats = video.get("statistics", {})
         view_count = int(stats.get("viewCount", 0))
         like_count = int(stats.get("likeCount", 0))
@@ -187,14 +229,17 @@ class YouTubeHandler:
         return (view_count * 0.4) + (like_count * 0.3) + (comment_count * 0.3)
 
     def _calculate_engagement_score(self, video: Dict) -> float:
-        """Calculate an engagement score."""
         stats = video.get("statistics", {})
         view_count = int(stats.get("viewCount", 1))
         like_count = int(stats.get("likeCount", 0))
         dislike_count = int(stats.get("dislikeCount", 0))
         comment_count = int(stats.get("commentCount", 0))
 
-        like_ratio = like_count / (like_count + dislike_count + 1) if (like_count + dislike_count) > 0 else 0
+        like_ratio = (
+            like_count / (like_count + dislike_count + 1)
+            if (like_count + dislike_count) > 0
+            else 0
+        )
         ctr = (like_count + comment_count) / view_count if view_count > 0 else 0
         return (like_ratio * 0.5) + (ctr * 0.5)
 
@@ -203,10 +248,14 @@ class YouTubeHandler:
         handle: str,
         sort_by: str = "newest",
         max_results: int = 50,
+        only_shorts: bool | None = None,
     ) -> List[YouTubeVideo]:
+        if sort_by not in {"newest", "relevance", "engagement"}:
+            raise ValueError(
+                "sort_by must be one of: newest, relevance, engagement"
+            )
+
         channel_id = await self._fetch_channel_id(handle)
-        if not channel_id:
-            raise ValueError(f"Channel not found for handle: {handle}")
 
         url = f"{self.base_url}/search"
         params = {
@@ -217,6 +266,7 @@ class YouTubeHandler:
             "type": "video",
             "key": self.api_key,
         }
+
         async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
@@ -226,41 +276,72 @@ class YouTubeHandler:
         if not items:
             return []
 
-        video_ids = [item["id"]["videoId"] for item in items]
+        video_ids = [
+            item["id"]["videoId"]
+            for item in items
+            if item.get("id", {}).get("videoId")
+        ]
         stats_by_id = await self._fetch_video_stats(video_ids)
 
         video_details = []
         for item in items:
-            video_id = item["id"]["videoId"]
-            snippet = item["snippet"]
+            video_id = item.get("id", {}).get("videoId")
+            if not video_id:
+                continue
+
+            snippet = item.get("snippet", {})
             stats_dict = stats_by_id.get(video_id, {})
             video_snippet = stats_dict.get("snippet", snippet)
             video_stats = stats_dict.get("statistics", {})
+            content_details = stats_dict.get("content_details", {})
+
+            duration_seconds = self._duration_to_seconds(
+                content_details.get("duration", "")
+            )
+            if not self._matches_short_form_filter(
+                duration_seconds,
+                only_shorts,
+            ):
+                continue
+
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail_url = (
+                thumbnails.get("high", {}).get("url")
+                or thumbnails.get("medium", {}).get("url")
+                or thumbnails.get("default", {}).get("url")
+                or ""
+            )
 
             video_data = {
                 "video_id": video_id,
-                "title": snippet["title"],
-                "published_at": snippet["publishedAt"],
-                "channel_title": video_snippet.get("channelTitle", snippet.get("channelTitle", "")),
-                "thumbnail_url": snippet["thumbnails"]["high"]["url"],
+                "title": snippet.get("title", ""),
+                "published_at": snippet.get("publishedAt", ""),
+                "channel_title": video_snippet.get(
+                    "channelTitle",
+                    snippet.get("channelTitle", ""),
+                ),
+                "thumbnail_url": thumbnail_url,
                 "view_count": int(video_stats.get("viewCount", 0)),
                 "like_count": int(video_stats.get("likeCount", 0)),
                 "dislike_count": 0,
                 "comment_count": int(video_stats.get("commentCount", 0)),
-                "relevance_score": 0.0,
-                "engagement_score": 0.0,
+                "relevance_score": self._calculate_relevance_score(stats_dict),
+                "engagement_score": self._calculate_engagement_score(stats_dict),
             }
-
-            video_data["relevance_score"] = self._calculate_relevance_score(video_data)
-            video_data["engagement_score"] = self._calculate_engagement_score(video_data)
 
             video_details.append(YouTubeVideo(**video_data))
 
         if sort_by == "newest":
-            video_details.sort(key=lambda x: x.published_at, reverse=True)
+            video_details.sort(key=lambda video: video.published_at, reverse=True)
         elif sort_by == "relevance":
-            video_details.sort(key=lambda x: x.relevance_score, reverse=True)
-        elif sort_by == "engagement":
-            video_details.sort(key=lambda x: x.engagement_score, reverse=True)
+            video_details.sort(
+                key=lambda video: video.relevance_score,
+                reverse=True,
+            )
+        else:
+            video_details.sort(
+                key=lambda video: video.engagement_score,
+                reverse=True,
+            )
 
         return video_details[:max_results]

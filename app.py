@@ -618,22 +618,46 @@ async def b2_refresh_auth(
 @app.get("/yt/videos", response_model=List[YouTubeVideoResponse])
 async def get_youtube_videos(
     handle: str = Query(..., description="YouTube handle (e.g., '@username')"),
-    sort_by: str = Query("newest", description="Sort by 'newest', 'relevance', or 'engagement'"),
-    max_results: int = Query(50, description="Maximum number of videos to return"),
+    sort_by: str = Query(
+        "newest",
+        description="Sort by 'newest', 'relevance', or 'engagement'",
+    ),
+    max_results: int = Query(
+        50,
+        ge=1,
+        le=50,
+        description="Maximum number of recent candidate videos to inspect",
+    ),
+    only_shorts: Optional[bool] = Query(
+        None,
+        description=(
+            "true: return only videos 180 seconds or shorter; "
+            "false: return only videos longer than 180 seconds; "
+            "omit: return both"
+        ),
+    ),
 ):
     """
-    Fetch videos for a YouTube handle and sort them by relevance, engagement, or newest uploads.
+    Fetch recent videos for a YouTube handle and optionally filter them by
+    duration-based short-form classification.
     """
     try:
         handler = YouTubeHandler()
-        videos = await handler.get_videos_by_handle(handle, sort_by, max_results)
-        return videos
-    except ValueError as e:
-        logger.error(f"Error fetching YouTube videos: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
+        return await handler.get_videos_by_handle(
+            handle=handle,
+            sort_by=sort_by,
+            max_results=max_results,
+            only_shorts=only_shorts,
+        )
+    except ValueError as error:
+        logger.error("Error fetching YouTube videos: %s", error)
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
         logger.exception("Unexpected error fetching YouTube videos")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch videos: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch videos: {error}",
+        )
 
 @app.get("/b2/signed-url")
 async def get_b2_signed_url(filename: str = "yt_video.mp4") -> Dict[str, str]:
