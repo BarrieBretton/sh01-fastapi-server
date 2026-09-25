@@ -617,7 +617,24 @@ async def b2_refresh_auth(
 
 @app.get("/yt/videos", response_model=List[YouTubeVideoResponse])
 async def get_youtube_videos(
-    handle: str = Query(..., description="YouTube handle (e.g., '@username')"),
+    handle: str = Query(
+        ...,
+        description="YouTube handle (e.g. '@username')",
+    ),
+    account: Optional[str] = Query(
+        None,
+        description=(
+            "Target account from streamables. Required when "
+            "exclude_existing=true."
+        ),
+    ),
+    creator: Optional[str] = Query(
+        None,
+        description=(
+            "Creator value used in streamables. "
+            "Defaults to the YouTube handle."
+        ),
+    ),
     sort_by: str = Query(
         "newest",
         description="Sort by 'newest', 'relevance', or 'engagement'",
@@ -626,34 +643,189 @@ async def get_youtube_videos(
         50,
         ge=1,
         le=50,
-        description="Maximum number of recent candidate videos to inspect",
+        description="Maximum number of videos to return",
     ),
     only_shorts: Optional[bool] = Query(
         None,
         description=(
-            "true: return only videos 180 seconds or shorter; "
-            "false: return only videos longer than 180 seconds; "
-            "omit: return both"
+            "true: retrieve actual videos from the channel's Shorts tab; "
+            "false: preserve existing non-short-form (>180 sec) behavior; "
+            "omit: return recent channel videos"
+        ),
+    ),
+    exclude_existing: bool = Query(
+        True,
+        description=(
+            "When true, exclude videos whose YouTube video ID is already "
+            "present in streamables for this exact account + creator pair."
         ),
     ),
 ):
     """
-    Fetch recent videos for a YouTube handle and optionally filter them by
-    duration-based short-form classification.
+    Fetch recent YouTube videos.
+
+    When only_shorts=true, actual membership of the channel's /shorts tab
+    is used rather than inferring Shorts from video duration.
+
+    When exclude_existing=true, videos already represented by yt_link in
+    the streamables sheet for the exact account + creator pair are removed.
     """
+
     try:
         handler = YouTubeHandler()
-        return await handler.get_videos_by_handle(
+
+        normalized_handle = (
+            str(handle or "")
+            .strip()
+            .removeprefix("@")
+            .lower()
+        )
+
+        normalized_creator = (
+            str(creator or normalized_handle)
+            .strip()
+            .removeprefix("@")
+            .lower()
+        )
+
+        normalized_account = (
+            str(account or "")
+            .strip()
+            .removeprefix("@")
+            .lower()
+        )
+
+        if exclude_existing and not normalized_account:
+            raise ValueError(
+                "account is required when exclude_existing=true"
+            )
+
+        #
+        # If we're going to remove existing Shorts, inspect more than the
+        # requested output count so max_results=10 can still return 10 unseen
+        # Shorts even when some of the newest Shorts are already in the sheet.
+        #
+        fetch_count = max_results
+
+        if only_shorts is True and exclude_existing:
+            fetch_count = min(
+                max(max_results * 5, 100),
+                250,
+            )
+
+        videos = await handler.get_videos_by_handle(
             handle=handle,
             sort_by=sort_by,
-            max_results=max_results,
+            max_results=fetch_count,
             only_shorts=only_shorts,
         )
+
+        if not exclude_existing:
+            return videos[:max_results]
+
+        #
+        # Read the shared workbook's streamables tab.
+        #
+        service = get_sheets_service()
+        rows = read_sheet_by_name(
+            service,
+            "streamables",
+        )
+
+        if not rows:
+            return videos[:max_results]
+
+        header = [
+            str(column).strip()
+            for column in rows[0]
+        ]
+
+        required_columns = {
+            "account",
+            "creator",
+            "yt_link",
+        }
+
+        missing_columns = required_columns - set(header)
+
+        if missing_columns:
+            raise ValueError(
+                "streamables sheet is missing required column(s): "
+                + ", ".join(sorted(missing_columns))
+            )
+
+        account_idx = header.index("account")
+        creator_idx = header.index("creator")
+        yt_link_idx = header.index("yt_link")
+
+        existing_video_ids = set()
+
+        for row in rows[1:]:
+            # Safely accommodate short/incomplete sheet rows.
+            row = list(row)
+
+            if len(row) < len(header):
+                row.extend(
+                    [""] * (len(header) - len(row))
+                )
+
+            row_account = (
+                str(row[account_idx] or "")
+                .strip()
+                .removeprefix("@")
+                .lower()
+            )
+
+            row_creator = (
+                str(row[creator_idx] or "")
+                .strip()
+                .removeprefix("@")
+                .lower()
+            )
+
+            #
+            # IMPORTANT:
+            # Only dedupe within this exact logical pair.
+            #
+            if (
+                row_account != normalized_account
+                or row_creator != normalized_creator
+            ):
+                continue
+
+            yt_link = str(
+                row[yt_link_idx] or ""
+            ).strip()
+
+            video_id = handler.extract_video_id(
+                yt_link
+            )
+
+            if video_id:
+                existing_video_ids.add(video_id)
+
+        filtered_videos = [
+            video
+            for video in videos
+            if video.video_id not in existing_video_ids
+        ]
+
+        return filtered_videos[:max_results]
+
     except ValueError as error:
-        logger.error("Error fetching YouTube videos: %s", error)
-        raise HTTPException(status_code=400, detail=str(error))
+        logger.error(
+            "Error fetching YouTube videos: %s",
+            error,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
     except Exception as error:
-        logger.exception("Unexpected error fetching YouTube videos")
+        logger.exception(
+            "Unexpected error fetching YouTube videos"
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch videos: {error}",

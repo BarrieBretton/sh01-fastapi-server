@@ -2,6 +2,10 @@ import os
 import certifi
 import logging
 import re
+import asyncio
+import json
+import sys
+
 from urllib.parse import urlparse, parse_qs
 from typing import List, Dict
 
@@ -153,6 +157,83 @@ class YouTubeHandler:
         )
         return channel_id
 
+    async def _fetch_short_video_ids(
+        self,
+        handle: str,
+        max_results: int = 50,
+    ) -> List[str]:
+        """
+        Fetch actual videos from the channel's YouTube Shorts tab using yt-dlp.
+    
+        This does NOT infer Shorts from duration. It reads:
+            https://www.youtube.com/@<handle>/shorts
+        """
+        normalized_handle = (handle or "").strip().removeprefix("@")
+    
+        if not normalized_handle:
+            raise ValueError("YouTube handle cannot be empty")
+    
+        shorts_url = f"https://www.youtube.com/@{normalized_handle}/shorts"
+    
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--flat-playlist",
+            "--dump-single-json",
+            "--playlist-end",
+            str(max_results),
+            "--no-warnings",
+            "--force-ipv4",
+            "--no-check-certificate",
+            shorts_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError(
+                f"Timed out retrieving Shorts for @{normalized_handle}"
+            )
+    
+        if process.returncode != 0:
+            error_text = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"yt-dlp failed retrieving Shorts for "
+                f"@{normalized_handle}: {error_text}"
+            )
+    
+        try:
+            payload = json.loads(
+                stdout.decode("utf-8", errors="replace")
+            )
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"yt-dlp returned invalid JSON for @{normalized_handle}"
+            ) from exc
+    
+        video_ids = []
+    
+        for entry in payload.get("entries", []):
+            if not entry:
+                continue
+    
+            video_id = str(entry.get("id") or "").strip()
+    
+            if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id):
+                video_ids.append(video_id)
+    
+        # Preserve Shorts-tab order while removing any accidental duplicates.
+        return list(dict.fromkeys(video_ids))
+
+
     @staticmethod
     def _duration_to_seconds(duration: str) -> int | None:
         """
@@ -194,30 +275,43 @@ class YouTubeHandler:
         return is_short_form if only_shorts else not is_short_form
 
     async def _fetch_video_stats(self, video_ids: List[str]) -> Dict[str, Dict]:
-        """Fetch snippets, statistics, and durations in one videos.list call."""
+        """
+        Fetch snippets, statistics, and durations for video IDs.
+
+        YouTube videos.list accepts at most 50 IDs per request, so larger
+        collections are fetched in batches.
+        """
         if not video_ids:
             return {}
 
-        url = f"{self.base_url}/videos"
-        params = {
-            "part": "snippet,statistics,contentDetails",
-            "id": ",".join(video_ids),
-            "key": self.api_key,
-        }
-
-        async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-
         stats_by_id = {}
-        for item in data.get("items", []):
-            video_id = item["id"]
-            stats_by_id[video_id] = {
-                "statistics": item.get("statistics", {}),
-                "snippet": item.get("snippet", {}),
-                "content_details": item.get("contentDetails", {}),
-            }
+
+        async with httpx.AsyncClient(
+            verify=certifi.where(),
+            timeout=30,
+        ) as client:
+            for start in range(0, len(video_ids), 50):
+                batch_ids = video_ids[start:start + 50]
+
+                url = f"{self.base_url}/videos"
+                params = {
+                    "part": "snippet,statistics,contentDetails",
+                    "id": ",".join(batch_ids),
+                    "key": self.api_key,
+                }
+
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+                for item in data.get("items", []):
+                    video_id = item["id"]
+
+                    stats_by_id[video_id] = {
+                        "statistics": item.get("statistics", {}),
+                        "snippet": item.get("snippet", {}),
+                        "content_details": item.get("contentDetails", {}),
+                    }
 
         return stats_by_id
 
@@ -255,6 +349,86 @@ class YouTubeHandler:
                 "sort_by must be one of: newest, relevance, engagement"
             )
 
+        #
+        # IMPORTANT:
+        # only_shorts=True now uses the ACTUAL YouTube Shorts tab.
+        #
+        if only_shorts is True:
+            video_ids = await self._fetch_short_video_ids(
+                handle=handle,
+                max_results=max_results,
+            )
+
+            if not video_ids:
+                return []
+
+            stats_by_id = await self._fetch_video_stats(video_ids)
+
+            video_details = []
+
+            for video_id in video_ids:
+                stats_dict = stats_by_id.get(video_id)
+
+                # A video may disappear/become private between yt-dlp and
+                # videos.list. Simply skip it.
+                if not stats_dict:
+                    continue
+
+                snippet = stats_dict.get("snippet", {})
+                video_stats = stats_dict.get("statistics", {})
+
+                thumbnails = snippet.get("thumbnails", {})
+
+                thumbnail_url = (
+                    thumbnails.get("high", {}).get("url")
+                    or thumbnails.get("medium", {}).get("url")
+                    or thumbnails.get("default", {}).get("url")
+                    or ""
+                )
+
+                video_data = {
+                    "video_id": video_id,
+                    "title": snippet.get("title", ""),
+                    "published_at": snippet.get("publishedAt", ""),
+                    "channel_title": snippet.get("channelTitle", ""),
+                    "thumbnail_url": thumbnail_url,
+                    "view_count": int(video_stats.get("viewCount", 0)),
+                    "like_count": int(video_stats.get("likeCount", 0)),
+                    "dislike_count": 0,
+                    "comment_count": int(video_stats.get("commentCount", 0)),
+                    "relevance_score": self._calculate_relevance_score(
+                        stats_dict
+                    ),
+                    "engagement_score": self._calculate_engagement_score(
+                        stats_dict
+                    ),
+                }
+
+                video_details.append(YouTubeVideo(**video_data))
+
+            if sort_by == "newest":
+                video_details.sort(
+                    key=lambda video: video.published_at,
+                    reverse=True,
+                )
+            elif sort_by == "relevance":
+                video_details.sort(
+                    key=lambda video: video.relevance_score,
+                    reverse=True,
+                )
+            else:
+                video_details.sort(
+                    key=lambda video: video.engagement_score,
+                    reverse=True,
+                )
+
+            return video_details[:max_results]
+
+        #
+        # Existing behaviour for only_shorts=False / omitted.
+        #
+        # Keeping this path essentially unchanged minimizes the blast radius.
+        #
         channel_id = await self._fetch_channel_id(handle)
 
         url = f"{self.base_url}/search"
@@ -267,12 +441,16 @@ class YouTubeHandler:
             "key": self.api_key,
         }
 
-        async with httpx.AsyncClient(verify=certifi.where(), timeout=30) as client:
+        async with httpx.AsyncClient(
+            verify=certifi.where(),
+            timeout=30,
+        ) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
             search_data = response.json()
 
         items = search_data.get("items", [])
+
         if not items:
             return []
 
@@ -281,11 +459,14 @@ class YouTubeHandler:
             for item in items
             if item.get("id", {}).get("videoId")
         ]
+
         stats_by_id = await self._fetch_video_stats(video_ids)
 
         video_details = []
+
         for item in items:
             video_id = item.get("id", {}).get("videoId")
+
             if not video_id:
                 continue
 
@@ -295,16 +476,23 @@ class YouTubeHandler:
             video_stats = stats_dict.get("statistics", {})
             content_details = stats_dict.get("content_details", {})
 
-            duration_seconds = self._duration_to_seconds(
-                content_details.get("duration", "")
-            )
-            if not self._matches_short_form_filter(
-                duration_seconds,
-                only_shorts,
-            ):
-                continue
+            #
+            # Preserve your old only_shorts=False semantics:
+            # false means > 180 seconds.
+            #
+            if only_shorts is False:
+                duration_seconds = self._duration_to_seconds(
+                    content_details.get("duration", "")
+                )
+
+                if duration_seconds is None:
+                    continue
+
+                if duration_seconds <= SHORT_FORM_MAX_SECONDS:
+                    continue
 
             thumbnails = snippet.get("thumbnails", {})
+
             thumbnail_url = (
                 thumbnails.get("high", {}).get("url")
                 or thumbnails.get("medium", {}).get("url")
@@ -325,14 +513,21 @@ class YouTubeHandler:
                 "like_count": int(video_stats.get("likeCount", 0)),
                 "dislike_count": 0,
                 "comment_count": int(video_stats.get("commentCount", 0)),
-                "relevance_score": self._calculate_relevance_score(stats_dict),
-                "engagement_score": self._calculate_engagement_score(stats_dict),
+                "relevance_score": self._calculate_relevance_score(
+                    stats_dict
+                ),
+                "engagement_score": self._calculate_engagement_score(
+                    stats_dict
+                ),
             }
 
             video_details.append(YouTubeVideo(**video_data))
 
         if sort_by == "newest":
-            video_details.sort(key=lambda video: video.published_at, reverse=True)
+            video_details.sort(
+                key=lambda video: video.published_at,
+                reverse=True,
+            )
         elif sort_by == "relevance":
             video_details.sort(
                 key=lambda video: video.relevance_score,
