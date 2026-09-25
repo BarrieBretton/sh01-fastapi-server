@@ -742,7 +742,7 @@ async def get_youtube_videos(
 
         required_columns = {
             "account",
-            "creator",
+            "creator_handle",
             "yt_link",
         }
 
@@ -755,7 +755,7 @@ async def get_youtube_videos(
             )
 
         account_idx = header.index("account")
-        creator_idx = header.index("creator")
+        creator_idx = header.index("creator_handle")
         yt_link_idx = header.index("yt_link")
 
         existing_video_ids = set()

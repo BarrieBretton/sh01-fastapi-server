@@ -3,8 +3,7 @@ import certifi
 import logging
 import re
 import asyncio
-import json
-import sys
+import yt_dlp
 
 from urllib.parse import urlparse, parse_qs
 from typing import List, Dict
@@ -164,75 +163,61 @@ class YouTubeHandler:
     ) -> List[str]:
         """
         Fetch actual videos from the channel's YouTube Shorts tab using yt-dlp.
-    
+
         This does NOT infer Shorts from duration. It reads:
             https://www.youtube.com/@<handle>/shorts
         """
         normalized_handle = (handle or "").strip().removeprefix("@")
-    
+
         if not normalized_handle:
             raise ValueError("YouTube handle cannot be empty")
-    
+
         shorts_url = f"https://www.youtube.com/@{normalized_handle}/shorts"
-    
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "--flat-playlist",
-            "--dump-single-json",
-            "--playlist-end",
-            str(max_results),
-            "--no-warnings",
-            "--force-ipv4",
-            "--no-check-certificate",
-            shorts_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    
+
+        def fetch_with_ytdlp():
+            options = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": "in_playlist",
+                "playlistend": max_results,
+                "force_ipv4": True,
+                "nocheckcertificate": True,
+            }
+
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(
+                    shorts_url,
+                    download=False,
+                )
+
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(fetch_with_ytdlp),
                 timeout=90,
             )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
+        except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Timed out retrieving Shorts for @{normalized_handle}"
-            )
-    
-        if process.returncode != 0:
-            error_text = stderr.decode("utf-8", errors="replace").strip()
+            ) from exc
+        except Exception as exc:
             raise RuntimeError(
                 f"yt-dlp failed retrieving Shorts for "
-                f"@{normalized_handle}: {error_text}"
-            )
-    
-        try:
-            payload = json.loads(
-                stdout.decode("utf-8", errors="replace")
-            )
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"yt-dlp returned invalid JSON for @{normalized_handle}"
+                f"@{normalized_handle}: {exc}"
             ) from exc
-    
+
         video_ids = []
-    
-        for entry in payload.get("entries", []):
+
+        for entry in (payload or {}).get("entries", []):
             if not entry:
                 continue
-    
+
             video_id = str(entry.get("id") or "").strip()
-    
+
             if re.fullmatch(r"[0-9A-Za-z_-]{11}", video_id):
                 video_ids.append(video_id)
-    
-        # Preserve Shorts-tab order while removing any accidental duplicates.
-        return list(dict.fromkeys(video_ids))
 
+        # Preserve Shorts-tab order while removing accidental duplicates.
+        return list(dict.fromkeys(video_ids))
 
     @staticmethod
     def _duration_to_seconds(duration: str) -> int | None:
