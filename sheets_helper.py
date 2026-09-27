@@ -439,6 +439,47 @@ def batch_update_cells(
         logger.error("Batch update failed: %s", e)
         raise
 
+def append_rows(
+    service,
+    sheet_name: str,
+    rows: List[List[Any]],
+    spreadsheet_id: str = None,
+) -> None:
+    """
+    Append rows to a Google Sheets tab.
+    """
+    spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
+
+    if not spreadsheet_id:
+        raise ValueError("spreadsheet_id required")
+
+    if not rows:
+        return
+
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{sheet_name}'",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={
+                "values": rows,
+            },
+        ).execute()
+
+        logger.info(
+            "Appended %d row(s) to sheet '%s'",
+            len(rows),
+            sheet_name,
+        )
+
+    except HttpError as e:
+        logger.error(
+            "Failed to append rows to sheet '%s': %s",
+            sheet_name,
+            e,
+        )
+        raise
 
 # Example usage and testing
 if __name__ == "__main__":

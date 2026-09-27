@@ -25,7 +25,7 @@ ssl_context = ssl.create_default_context(cafile=certifi.where())
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal
 from dotenv import load_dotenv
 from image_templating import router as image_templating_router
 
@@ -36,6 +36,7 @@ from sheets_helper import (
     filter_status_rows,
     update_cell,
     get_column_letter,
+    append_rows,
     # list_sheet_names,
     # SPREADSHEET_ID
 )
@@ -657,8 +658,17 @@ async def get_youtube_videos(
         True,
         description=(
             "When true, exclude videos whose YouTube video ID is already "
-            "present in streamables for this exact account + creator pair."
+            "present in the selected sheet_name for this exact "
+            "account + creator pair."
         ),
+    ),
+    sheet_name: Literal["streamables", "streamables-yt"] = Query(
+        "streamables",
+        description="Google Sheets tab used for dedupe and optional appending",
+    ),
+    append_to_sheet: bool = Query(
+        True,
+        description="Append the final returned videos to sheet_name",
     ),
 ):
     """
@@ -720,97 +730,229 @@ async def get_youtube_videos(
             only_shorts=only_shorts,
         )
 
-        if not exclude_existing:
-            return videos[:max_results]
+        service = None
+        rows = []
+        header = []
 
         #
-        # Read the shared workbook's streamables tab.
+        # We only need Sheets when:
+        #   1. deduping against existing rows, or
+        #   2. appending the final returned rows.
         #
-        service = get_sheets_service()
-        rows = read_sheet_by_name(
-            service,
-            "streamables",
-        )
+        if exclude_existing or append_to_sheet:
+            service = get_sheets_service()
 
-        if not rows:
-            return videos[:max_results]
-
-        header = [
-            str(column).strip()
-            for column in rows[0]
-        ]
-
-        required_columns = {
-            "account",
-            "creator_handle",
-            "yt_link",
-        }
-
-        missing_columns = required_columns - set(header)
-
-        if missing_columns:
-            raise ValueError(
-                "streamables sheet is missing required column(s): "
-                + ", ".join(sorted(missing_columns))
+            rows = read_sheet_by_name(
+                service,
+                sheet_name,
             )
 
-        account_idx = header.index("account")
-        creator_idx = header.index("creator_handle")
-        yt_link_idx = header.index("yt_link")
+            if rows:
+                header = [
+                    str(column).strip()
+                    for column in rows[0]
+                ]
 
-        existing_video_ids = set()
+        #
+        # ---------------------------------------------------------
+        # DEDUPE
+        # ---------------------------------------------------------
+        #
+        # IMPORTANT:
+        # Dedupe ONLY against the selected sheet_name.
+        #
+        if exclude_existing:
+            required_columns = {
+                "account",
+                "creator_handle",
+                "yt_link",
+            }
 
-        for row in rows[1:]:
-            # Safely accommodate short/incomplete sheet rows.
-            row = list(row)
-
-            if len(row) < len(header):
-                row.extend(
-                    [""] * (len(header) - len(row))
+            if not rows:
+                raise ValueError(
+                    f"{sheet_name} sheet has no header row"
                 )
 
-            row_account = (
-                str(row[account_idx] or "")
-                .strip()
-                .removeprefix("@")
-                .lower()
+            missing_columns = required_columns - set(header)
+
+            if missing_columns:
+                raise ValueError(
+                    f"{sheet_name} sheet is missing required column(s): "
+                    + ", ".join(sorted(missing_columns))
+                )
+
+            account_idx = header.index("account")
+            creator_idx = header.index("creator_handle")
+            yt_link_idx = header.index("yt_link")
+
+            existing_video_ids = set()
+
+            for row in rows[1:]:
+                row = list(row)
+
+                # Safely accommodate short/incomplete sheet rows.
+                if len(row) < len(header):
+                    row.extend(
+                        [""] * (len(header) - len(row))
+                    )
+
+                row_account = (
+                    str(row[account_idx] or "")
+                    .strip()
+                    .removeprefix("@")
+                    .lower()
+                )
+
+                row_creator = (
+                    str(row[creator_idx] or "")
+                    .strip()
+                    .removeprefix("@")
+                    .lower()
+                )
+
+                #
+                # Dedupe only inside this exact:
+                #
+                #     sheet_name + account + creator_handle
+                #
+                if (
+                    row_account != normalized_account
+                    or row_creator != normalized_creator
+                ):
+                    continue
+
+                yt_link = str(
+                    row[yt_link_idx] or ""
+                ).strip()
+
+                video_id = handler.extract_video_id(
+                    yt_link
+                )
+
+                if video_id:
+                    existing_video_ids.add(video_id)
+
+            final_videos = [
+                video
+                for video in videos
+                if video.video_id not in existing_video_ids
+            ][:max_results]
+
+        else:
+            final_videos = videos[:max_results]
+
+        #
+        # ---------------------------------------------------------
+        # APPEND FINAL RETURNED VIDEOS
+        # ---------------------------------------------------------
+        #
+        # Only the records that are actually being returned are appended.
+        #
+        if append_to_sheet and final_videos:
+            if service is None:
+                service = get_sheets_service()
+
+            if not header:
+                rows = read_sheet_by_name(
+                    service,
+                    sheet_name,
+                )
+
+                if not rows:
+                    raise ValueError(
+                        f"{sheet_name} sheet has no header row"
+                    )
+
+                header = [
+                    str(column).strip()
+                    for column in rows[0]
+                ]
+
+            append_supported_columns = {
+                "account",
+                "creator_handle",
+                "yt_link",
+                "caption",
+                "video_id",
+                "title",
+                "published_at",
+                "view_count",
+                "like_count",
+                "dislike_count",
+                "comment_count",
+                "thumbnail_url",
+                "channel_title",
+                "relevance_score",
+                "engagement_score",
+            }
+
+            mapped_columns = append_supported_columns.intersection(header)
+
+            if not mapped_columns:
+                raise ValueError(
+                    f"{sheet_name} sheet contains no columns "
+                    "that /yt/videos knows how to populate"
+                )
+
+            append_values = []
+
+            for video in final_videos:
+                #
+                # Canonical values available for mapping.
+                #
+                # Direct response-model fields are retained, while the
+                # contextual/semantic sheet aliases make this compatible
+                # with the existing streamables layout.
+                #
+                video_values = {
+                    # Context
+                    "account": normalized_account,
+                    "creator_handle": normalized_creator,
+
+                    # Existing streamables-compatible aliases
+                    "yt_link": (
+                        f"https://www.youtube.com/watch?v={video.video_id}"
+                    ),
+                    "caption": video.title,
+
+                    # Raw /yt/videos response fields
+                    "video_id": video.video_id,
+                    "title": video.title,
+                    "published_at": video.published_at,
+                    "view_count": video.view_count,
+                    "like_count": video.like_count,
+                    "dislike_count": video.dislike_count,
+                    "comment_count": video.comment_count,
+                    "thumbnail_url": video.thumbnail_url,
+                    "channel_title": video.channel_title,
+                    "relevance_score": video.relevance_score,
+                    "engagement_score": video.engagement_score,
+                }
+
+                #
+                # Build the row in EXACT sheet-column order.
+                #
+                # Columns not represented by the endpoint are intentionally
+                # left blank rather than guessed.
+                #
+                append_values.append([
+                    video_values.get(column, "")
+                    for column in header
+                ])
+
+            append_rows(
+                service,
+                sheet_name,
+                append_values,
             )
 
-            row_creator = (
-                str(row[creator_idx] or "")
-                .strip()
-                .removeprefix("@")
-                .lower()
+            logger.info(
+                "Appended %d /yt/videos result(s) to sheet '%s'",
+                len(append_values),
+                sheet_name,
             )
 
-            #
-            # IMPORTANT:
-            # Only dedupe within this exact logical pair.
-            #
-            if (
-                row_account != normalized_account
-                or row_creator != normalized_creator
-            ):
-                continue
-
-            yt_link = str(
-                row[yt_link_idx] or ""
-            ).strip()
-
-            video_id = handler.extract_video_id(
-                yt_link
-            )
-
-            if video_id:
-                existing_video_ids.add(video_id)
-
-        filtered_videos = [
-            video
-            for video in videos
-            if video.video_id not in existing_video_ids
-        ]
-
-        return filtered_videos[:max_results]
+        return final_videos
 
     except ValueError as error:
         logger.error(
