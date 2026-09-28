@@ -10,6 +10,8 @@ import time
 import shutil
 import sys
 import uuid
+import hashlib
+import hmac
 
 import ssl
 import certifi
@@ -160,6 +162,16 @@ TELEGRAM_STORAGE_API_KEY = os.getenv(
     "TELEGRAM_STORAGE_API_KEY",
     "",
 ).strip()
+
+TELEGRAM_MEDIA_SIGNING_SECRET = os.getenv(
+    "TELEGRAM_MEDIA_SIGNING_SECRET",
+    "",
+).strip()
+
+PUBLIC_API_BASE = os.getenv(
+    "PUBLIC_API_BASE",
+    "https://sh01.vivojaymail.workers.dev",
+).strip().rstrip("/")
 
 if not TELEGRAM_BOT_TOKEN:
     logger.warning(
@@ -573,7 +585,7 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
     Downloads a YouTube video using yt-dlp.
     NO re-encoding, NO compatibility checks — just download the best mp4.
     """
-    output_file = DOWNLOADS_DIR / f"video_{int(datetime.utcnow().timestamp())}.mp4"
+    output_file = DOWNLOADS_DIR / f"video_{uuid.uuid4().hex}.mp4"
    
     # yt-dlp command templates (NO COOKIES)
     cmd_templates = [
@@ -1033,6 +1045,71 @@ def require_telegram_storage_key(
             status_code=401,
             detail="Missing/invalid X-API-KEY",
         )
+
+def get_unused_telegram_item(
+    storage_id: str,
+) -> dict[str, Any]:
+    storage_id = str(storage_id or "").strip()
+
+    if not storage_id:
+        raise HTTPException(
+            status_code=400,
+            detail="storage_id is required",
+        )
+
+    rows = get_telegram_storage_rows()
+
+    item = next(
+        (
+            row
+            for row in rows
+            if str(row.get("storage_id") or "").strip() == storage_id
+        ),
+        None,
+    )
+
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Telegram storage item not found",
+        )
+
+    if telegram_item_is_used(item.get("used")):
+        raise HTTPException(
+            status_code=409,
+            detail="Telegram storage item has already been used",
+        )
+
+    file_id = str(
+        item.get("file_id") or ""
+    ).strip()
+
+    if not file_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Telegram storage item has no file_id",
+        )
+
+    return item
+
+
+def sign_telegram_media_url(
+    storage_id: str,
+    expires: int,
+) -> str:
+    if not TELEGRAM_MEDIA_SIGNING_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_MEDIA_SIGNING_SECRET is not configured",
+        )
+
+    message = f"{storage_id}:{expires}".encode("utf-8")
+
+    return hmac.new(
+        TELEGRAM_MEDIA_SIGNING_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256,
+    ).hexdigest()
 
 # =====================================================
 # ENDPOINTS
@@ -2398,7 +2475,195 @@ async def telegram_mark_used(
             detail=f"Could not mark item used: {exc}",
         )
 
+@app.get("/telegram/source-url")
+async def telegram_source_url(
+    storage_id: str = Query(...),
+    valid_seconds: int = Query(
+        600,
+        ge=30,
+        le=3600,
+    ),
+    x_api_key: str | None = Header(
+        default=None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Mint a short-lived public URL that Cloudinary can fetch.
 
+    No Telegram bot token is exposed.
+    No file is downloaded by n8n.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    # Validate that the item exists and is still unused.
+    get_unused_telegram_item(storage_id)
+
+    expires = int(time.time()) + valid_seconds
+
+    signature = sign_telegram_media_url(
+        storage_id,
+        expires,
+    )
+
+    url = (
+        f"{PUBLIC_API_BASE}"
+        f"/telegram/media-source/{storage_id}"
+        f"?expires={expires}"
+        f"&signature={signature}"
+    )
+
+    return {
+        "storage_id": storage_id,
+        "expires": expires,
+        "valid_seconds": valid_seconds,
+        "url": url,
+    }
+
+@app.get("/telegram/media-source/{storage_id}")
+async def telegram_media_source(
+    storage_id: str,
+    expires: int = Query(...),
+    signature: str = Query(...),
+):
+    """
+    Public, short-lived streaming proxy:
+
+        Telegram -> FastAPI streaming -> Cloudinary
+
+    Nothing is written to disk and the whole file is never loaded into RAM.
+    """
+
+    if not TELEGRAM_MEDIA_SIGNING_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_MEDIA_SIGNING_SECRET is not configured",
+        )
+
+    now = int(time.time())
+
+    if expires < now:
+        raise HTTPException(
+            status_code=403,
+            detail="Media URL has expired",
+        )
+
+    expected_signature = sign_telegram_media_url(
+        storage_id,
+        expires,
+    )
+
+    if not hmac.compare_digest(
+        signature,
+        expected_signature,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid media signature",
+        )
+
+    item = get_unused_telegram_item(
+        storage_id,
+    )
+
+    try:
+        file_info = telegram_api_call(
+            "getFile",
+            {
+                "file_id": item["file_id"],
+            },
+        )
+
+        file_path = str(
+            file_info.get("file_path") or ""
+        ).strip()
+
+        if not file_path:
+            raise RuntimeError(
+                "Telegram getFile returned no file_path"
+            )
+
+        telegram_url = (
+            f"{TELEGRAM_FILE_API_BASE}/{file_path}"
+        )
+
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=30,
+                read=300,
+                write=30,
+                pool=30,
+            )
+        )
+
+        request = client.build_request(
+            "GET",
+            telegram_url,
+        )
+
+        response = await client.send(
+            request,
+            stream=True,
+        )
+
+        if response.status_code != 200:
+            body = await response.aread()
+
+            await response.aclose()
+            await client.aclose()
+
+            raise RuntimeError(
+                "Telegram file download failed: "
+                f"{response.status_code} "
+                f"{body[:300]!r}"
+            )
+
+        async def stream_telegram_file():
+            try:
+                async for chunk in response.aiter_bytes(
+                    chunk_size=64 * 1024
+                ):
+                    yield chunk
+
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        media_type = (
+            str(item.get("mime_type") or "").strip()
+            or response.headers.get("content-type")
+            or "application/octet-stream"
+        )
+
+        headers = {
+            "Cache-Control": "private, no-store",
+            "X-Telegram-Storage-ID": storage_id,
+        }
+
+        if response.headers.get("content-length"):
+            headers["Content-Length"] = (
+                response.headers["content-length"]
+            )
+
+        return StreamingResponse(
+            stream_telegram_file(),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram media-source failed for storage_id=%s",
+            storage_id,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Telegram media proxy failed: {exc}",
+        )
 
 # =====================================================
 # CRON: Exactly one worker runs this daily at 9:50 AM IST
