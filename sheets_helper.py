@@ -468,11 +468,15 @@ def append_rows(
     spreadsheet_id: str = None,
 ) -> None:
     """
-    Append rows to a Google Sheets tab.
+    Append rows to a Google Sheets tab using explicit row coordinates.
 
-    Rows are always anchored from column A so Google Sheets cannot
-    infer a shifted logical-table starting column.
+    This intentionally does NOT use spreadsheets.values.append(), because
+    Google's append API detects a logical table and may shift the starting
+    column if the sheet contains multiple/irregular table-like regions.
+
+    Rows are written explicitly starting from column A.
     """
+
     spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
 
     if not spreadsheet_id:
@@ -480,6 +484,21 @@ def append_rows(
 
     if not rows:
         return
+
+    #
+    # Read current sheet contents so we can determine the next physical row.
+    #
+    existing_rows = read_sheet_by_name(
+        service,
+        sheet_name,
+        spreadsheet_id=spreadsheet_id,
+    )
+
+    #
+    # Row 1 is the header.
+    # If there are N returned rows, next append starts at N + 1.
+    #
+    start_row = len(existing_rows) + 1
 
     row_width = max(
         len(row)
@@ -489,36 +508,59 @@ def append_rows(
     if row_width < 1:
         return
 
+    #
+    # Normalize every row to identical width.
+    #
+    normalized_rows = [
+        list(row) + [""] * (row_width - len(row))
+        for row in rows
+    ]
+
     last_column = column_number_to_letter(
         row_width
     )
 
-    append_range = (
-        f"'{sheet_name}'!A1:{last_column}"
+    end_row = start_row + len(normalized_rows) - 1
+
+    write_range = (
+        f"'{sheet_name}'!"
+        f"A{start_row}:{last_column}{end_row}"
     )
 
     try:
-        service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=append_range,
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={
-                "values": rows,
-            },
-        ).execute()
+        result = (
+            service
+            .spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=write_range,
+                valueInputOption="RAW",
+                body={
+                    "majorDimension": "ROWS",
+                    "values": normalized_rows,
+                },
+            )
+            .execute()
+        )
 
         logger.info(
-            "Appended %d row(s) to sheet '%s' using range %s",
-            len(rows),
+            "Wrote %d row(s) to sheet '%s' at explicit range %s",
+            len(normalized_rows),
             sheet_name,
-            append_range,
+            write_range,
+        )
+
+        logger.debug(
+            "Google Sheets update response: %s",
+            result,
         )
 
     except HttpError as e:
         logger.error(
-            "Failed to append rows to sheet '%s': %s",
+            "Failed writing rows to sheet '%s' at %s: %s",
             sheet_name,
+            write_range,
             e,
         )
         raise
