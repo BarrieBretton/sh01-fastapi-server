@@ -9,6 +9,7 @@ import subprocess
 import time
 import shutil
 import sys
+import uuid
 
 import ssl
 import certifi
@@ -23,7 +24,7 @@ ssl_context = ssl.create_default_context(cafile=certifi.where())
 # import json
 
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Literal
 from dotenv import load_dotenv
@@ -129,6 +130,46 @@ for noisy in ("urllib3", "requests", "requests_oauthlib", "apscheduler"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 logger.info("Application starting up...")
+
+# =====================================================
+# TELEGRAM STORAGE CONFIGURATION
+# =====================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
+
+# This sheet acts as the Telegram storage database.
+# It is intentionally NOT caller-configurable.
+TELEGRAM_STORAGE_SHEET = "telegram-storage"
+
+TELEGRAM_BOT_API_BASE = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    if TELEGRAM_BOT_TOKEN
+    else ""
+)
+
+TELEGRAM_FILE_API_BASE = (
+    f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
+    if TELEGRAM_BOT_TOKEN
+    else ""
+)
+
+TELEGRAM_STORAGE_API_KEY = os.getenv(
+    "TELEGRAM_STORAGE_API_KEY",
+    "",
+).strip()
+
+if not TELEGRAM_BOT_TOKEN:
+    logger.warning(
+        "TELEGRAM_BOT_TOKEN not configured - Telegram storage endpoints disabled"
+    )
+
+if not TELEGRAM_STORAGE_API_KEY:
+    logger.warning(
+        "TELEGRAM_STORAGE_API_KEY not configured - Telegram storage API unavailable"
+    )
 
 # =====================================================
 # CONFIG & AUTH
@@ -461,6 +502,26 @@ class KiteCandlesRequest(BaseModel):
 class KiteLTPRequest(BaseModel):
     symbols: list[str] | str
 
+class TelegramStoreRequest(BaseModel):
+    source_url: str
+    chat_id: int
+
+    caption: str | None = None
+    text: str | None = None
+    file_name: str | None = None
+
+    metadata: dict[str, Any] | None = None
+
+
+class TelegramIndexMessageRequest(BaseModel):
+    update: dict[str, Any]
+
+    metadata: dict[str, Any] | None = None
+
+
+class TelegramMarkUsedRequest(BaseModel):
+    storage_id: str
+
 # =====================================================
 # B2 HELPERS
 # =====================================================
@@ -572,6 +633,406 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
                         pass
     logger.error("All yt-dlp download attempts failed for URL: %s", video_url)
     raise HTTPException(status_code=500, detail=f"Failed to download video: {last_exception}")
+
+# =====================================================
+# TELEGRAM STORAGE HELPERS
+# =====================================================
+
+def require_telegram_config() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_BOT_TOKEN is not configured",
+        )
+
+
+def telegram_api_call(
+    method: str,
+    data: dict[str, Any] | None = None,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """
+    Call Telegram Bot API and return the result object.
+    """
+    require_telegram_config()
+
+    url = f"{TELEGRAM_BOT_API_BASE}/{method}"
+
+    try:
+        response = requests.post(
+            url,
+            data=data or {},
+            timeout=timeout,
+        )
+
+        payload = response.json()
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram API request failed: %s",
+            method,
+        )
+        raise RuntimeError(
+            f"Telegram API request failed: {exc}"
+        ) from exc
+
+    if not response.ok or not payload.get("ok"):
+        description = payload.get(
+            "description",
+            response.text[:500],
+        )
+
+        raise RuntimeError(
+            f"Telegram {method} failed: {description}"
+        )
+
+    return payload.get("result") or {}
+
+
+def extract_telegram_file(
+    message: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Extract the primary Telegram file object from a message.
+
+    Supports:
+      document
+      video
+      audio
+      voice
+      animation
+      video_note
+      photo
+    """
+
+    if not message:
+        return None
+
+    file_object = None
+    file_type = None
+
+    if message.get("document"):
+        file_type = "document"
+        file_object = message["document"]
+
+    elif message.get("video"):
+        file_type = "video"
+        file_object = message["video"]
+
+    elif message.get("audio"):
+        file_type = "audio"
+        file_object = message["audio"]
+
+    elif message.get("voice"):
+        file_type = "voice"
+        file_object = message["voice"]
+
+    elif message.get("animation"):
+        file_type = "animation"
+        file_object = message["animation"]
+
+    elif message.get("video_note"):
+        file_type = "video_note"
+        file_object = message["video_note"]
+
+    elif message.get("photo"):
+        photos = message.get("photo") or []
+
+        if photos:
+            # Highest-resolution photo is normally last.
+            file_type = "photo"
+            file_object = photos[-1]
+
+    if not file_object:
+        return None
+
+    unix_date = message.get("date")
+
+    datetime_utc = ""
+
+    if unix_date:
+        try:
+            datetime_utc = datetime.fromtimestamp(
+                int(unix_date),
+                tz=timezone.utc,
+            ).isoformat()
+        except Exception:
+            datetime_utc = ""
+
+    chat = message.get("chat") or {}
+    sender = message.get("from") or {}
+
+    return {
+        "datetime_utc": datetime_utc,
+        "telegram_date": unix_date or "",
+        "chat_id": chat.get("id", ""),
+        "message_id": message.get("message_id", ""),
+        "file_id": file_object.get("file_id", ""),
+        "file_unique_id": file_object.get(
+            "file_unique_id",
+            "",
+        ),
+        "file_type": file_type,
+        "file_name": file_object.get(
+            "file_name",
+            "",
+        ),
+        "mime_type": file_object.get(
+            "mime_type",
+            "",
+        ),
+        "file_size": file_object.get(
+            "file_size",
+            "",
+        ),
+        "caption": message.get(
+            "caption",
+            "",
+        ),
+        "text": message.get(
+            "text",
+            "",
+        ),
+        "from_id": sender.get(
+            "id",
+            "",
+        ),
+        "from_username": sender.get(
+            "username",
+            "",
+        ),
+    }
+
+
+def append_telegram_metadata(
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Add one Telegram file record to telegram-storage.
+
+    Idempotency:
+        the same Telegram chat_id + message_id will not be inserted twice.
+
+    Every genuinely new record gets its own storage_id.
+    New records start with used blank.
+    """
+
+    metadata = dict(metadata)
+
+    service = get_sheets_service()
+
+    rows = read_sheet_by_name(
+        service,
+        TELEGRAM_STORAGE_SHEET,
+    )
+
+    if not rows:
+        raise ValueError(
+            f"{TELEGRAM_STORAGE_SHEET} sheet has no header row"
+        )
+
+    header = [
+        str(column).strip()
+        for column in rows[0]
+    ]
+
+    required_columns = {
+        "storage_id",
+        "chat_id",
+        "message_id",
+        "file_id",
+        "used",
+    }
+
+    missing = required_columns - set(header)
+
+    if missing:
+        raise ValueError(
+            f"{TELEGRAM_STORAGE_SHEET} sheet is missing required column(s): "
+            + ", ".join(sorted(missing))
+        )
+
+    chat_idx = header.index("chat_id")
+    message_idx = header.index("message_id")
+
+    incoming_chat_id = str(
+        metadata.get("chat_id") or ""
+    ).strip()
+
+    incoming_message_id = str(
+        metadata.get("message_id") or ""
+    ).strip()
+
+    #
+    # Prevent duplicate indexing of the same Telegram message.
+    #
+    for existing_row in rows[1:]:
+        existing_row = list(existing_row)
+
+        if len(existing_row) < len(header):
+            existing_row.extend(
+                [""] * (len(header) - len(existing_row))
+            )
+
+        existing_chat_id = str(
+            existing_row[chat_idx] or ""
+        ).strip()
+
+        existing_message_id = str(
+            existing_row[message_idx] or ""
+        ).strip()
+
+        if (
+            existing_chat_id == incoming_chat_id
+            and existing_message_id == incoming_message_id
+        ):
+            existing_metadata = {
+                header[index]: existing_row[index]
+                for index in range(len(header))
+            }
+
+            logger.info(
+                "Telegram message already indexed: chat_id=%s message_id=%s",
+                incoming_chat_id,
+                incoming_message_id,
+            )
+
+            return existing_metadata
+
+    #
+    # Only genuinely new items receive a new storage_id.
+    #
+    # These fields are owned exclusively by the storage backend.
+    metadata["storage_id"] = str(uuid.uuid4())
+
+    # Every genuinely new record always starts unused.
+    metadata["used"] = ""
+
+    row = [
+        metadata.get(column, "")
+        for column in header
+    ]
+
+    append_rows(
+        service,
+        TELEGRAM_STORAGE_SHEET,
+        [row],
+    )
+
+    return metadata
+
+
+def extract_message_from_update(
+    update: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    n8n Telegram Trigger can return either the Telegram update object
+    or the message itself depending on configuration.
+    """
+
+    if not update:
+        return None
+
+    if update.get("message"):
+        return update["message"]
+
+    if update.get("channel_post"):
+        return update["channel_post"]
+
+    if update.get("edited_message"):
+        return update["edited_message"]
+
+    if update.get("edited_channel_post"):
+        return update["edited_channel_post"]
+
+    # Already looks like a Telegram message.
+    if update.get("message_id") and update.get("chat"):
+        return update
+
+    return None
+
+def telegram_item_is_used(
+    value: Any,
+) -> bool:
+    """
+    Interpret the telegram-storage 'used' column.
+
+    Blank = unused.
+
+    These values mean used:
+        used
+        true
+        yes
+        y
+        1
+    """
+
+    normalized = str(
+        value or ""
+    ).strip().lower()
+
+    return normalized in {
+        "used",
+        "true",
+        "yes",
+        "y",
+        "1",
+    }
+
+def get_telegram_storage_rows() -> list[dict[str, Any]]:
+    service = get_sheets_service()
+
+    rows = read_sheet_by_name(
+        service,
+        TELEGRAM_STORAGE_SHEET,
+    )
+
+    if not rows:
+        return []
+
+    header = [
+        str(column).strip()
+        for column in rows[0]
+    ]
+
+    results = []
+
+    for row_number, row in enumerate(
+        rows[1:],
+        start=2,
+    ):
+        row = list(row)
+
+        if len(row) < len(header):
+            row.extend(
+                [""] * (len(header) - len(row))
+            )
+
+        record = {
+            header[index]: row[index]
+            for index in range(len(header))
+        }
+
+        record["_row_number"] = row_number
+
+        results.append(record)
+
+    return results
+
+def require_telegram_storage_key(
+    x_api_key: str | None,
+) -> None:
+    if not TELEGRAM_STORAGE_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_STORAGE_API_KEY is not configured",
+        )
+
+    if not x_api_key or x_api_key != TELEGRAM_STORAGE_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing/invalid X-API-KEY",
+        )
 
 # =====================================================
 # ENDPOINTS
@@ -1355,6 +1816,589 @@ async def force_kite_refresh():
         "message": "Old token removed. Use the login_url below to authenticate again.",
         "login_url": kite_manager.login_url()
     }
+
+@app.post("/telegram/store")
+async def telegram_store(
+    body: TelegramStoreRequest,
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Store a remote file inside the requested Telegram chat/group
+    and index it in the fixed telegram-storage Google Sheet.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    try:
+        require_telegram_config()
+
+        source_url = (
+            body.source_url or ""
+        ).strip()
+
+        if not source_url:
+            raise HTTPException(
+                status_code=400,
+                detail="source_url is required",
+            )
+
+        caption = (
+            body.caption or ""
+        ).strip()
+
+        telegram_message = telegram_api_call(
+            "sendDocument",
+            {
+                "chat_id": str(body.chat_id),
+                "document": source_url,
+                "caption": caption[:1024],
+            },
+            timeout=300,
+        )
+
+        metadata = extract_telegram_file(
+            telegram_message
+        )
+
+        if not metadata:
+            raise RuntimeError(
+                "Telegram accepted the message but returned no file metadata"
+            )
+
+        metadata["source_url"] = source_url
+
+        if body.file_name:
+            metadata["source_file_name"] = (
+                body.file_name
+            )
+
+        if body.text:
+            metadata["text"] = body.text
+
+        if body.metadata:
+            for key, value in body.metadata.items():
+                if key not in metadata:
+                    metadata[key] = value
+
+        metadata = append_telegram_metadata(
+            metadata
+        )
+
+        return {
+            "success": True,
+            "storage_id": metadata["storage_id"],
+            "chat_id": metadata["chat_id"],
+            "message_id": metadata["message_id"],
+            "file_id": metadata["file_id"],
+            "file_unique_id": metadata.get(
+                "file_unique_id"
+            ),
+            "used": metadata.get("used", ""),
+            "telegram": metadata,
+        }
+
+    except HTTPException:
+        raise
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram storage failed"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Telegram storage failed: {exc}",
+        )
+
+@app.post("/telegram/index-message")
+async def telegram_index_message(
+    body: TelegramIndexMessageRequest,
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Index a Telegram Trigger/message in telegram-storage.
+
+    The chat_id is taken directly from the Telegram message.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    try:
+        message = extract_message_from_update(
+            body.update
+        )
+
+        if not message:
+            raise HTTPException(
+                status_code=400,
+                detail="No Telegram message found in update",
+            )
+
+        metadata = extract_telegram_file(
+            message
+        )
+
+        if not metadata:
+            return {
+                "success": True,
+                "indexed": False,
+                "reason": "Message contains no supported file",
+            }
+
+        if body.metadata:
+            for key, value in body.metadata.items():
+                if key not in metadata:
+                    metadata[key] = value
+
+        metadata = append_telegram_metadata(
+            metadata
+        )
+
+        return {
+            "success": True,
+            "indexed": True,
+            "storage_id": metadata["storage_id"],
+            "telegram": metadata,
+        }
+
+    except HTTPException:
+        raise
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed indexing Telegram message"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Telegram indexing failed: {exc}",
+        )
+
+@app.get("/telegram/file-info")
+async def telegram_file_info(
+    storage_id: str = Query(...),
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Return Telegram file information for one unused storage item.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    try:
+        rows = get_telegram_storage_rows()
+
+        record = next(
+            (
+                row
+                for row in rows
+                if str(
+                    row.get("storage_id") or ""
+                ).strip() == storage_id.strip()
+            ),
+            None,
+        )
+
+        if not record:
+            raise HTTPException(
+                status_code=404,
+                detail="Telegram storage item not found",
+            )
+
+        if telegram_item_is_used(
+            record.get("used")
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Telegram storage item is already marked as used",
+            )
+
+        file_id = str(
+            record.get("file_id") or ""
+        ).strip()
+
+        if not file_id:
+            raise RuntimeError(
+                "Stored record contains no Telegram file_id"
+            )
+
+        result = telegram_api_call(
+            "getFile",
+            {
+                "file_id": file_id,
+            },
+        )
+
+        return {
+            "success": True,
+            "storage_id": storage_id,
+            "chat_id": record.get("chat_id"),
+            "message_id": record.get("message_id"),
+            "file_id": file_id,
+            "file_unique_id": result.get(
+                "file_unique_id"
+            ),
+            "file_size": result.get(
+                "file_size"
+            ),
+            "file_path": result.get(
+                "file_path"
+            ),
+            "file_name": record.get(
+                "file_name"
+            ),
+            "mime_type": record.get(
+                "mime_type"
+            ),
+            "used": False,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Telegram getFile failed"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+@app.get("/telegram/file")
+async def telegram_get_file(
+    storage_id: str = Query(...),
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Retrieve one unused Telegram file using our own storage_id.
+
+    Used items are intentionally not retrievable through this endpoint.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    upstream = None
+
+    try:
+        rows = get_telegram_storage_rows()
+
+        record = next(
+            (
+                row
+                for row in rows
+                if str(
+                    row.get("storage_id") or ""
+                ).strip() == storage_id.strip()
+            ),
+            None,
+        )
+
+        if not record:
+            raise HTTPException(
+                status_code=404,
+                detail="Telegram storage item not found",
+            )
+
+        if telegram_item_is_used(
+            record.get("used")
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Telegram storage item is already marked as used",
+            )
+
+        file_id = str(
+            record.get("file_id") or ""
+        ).strip()
+
+        if not file_id:
+            raise RuntimeError(
+                "Stored record contains no Telegram file_id"
+            )
+
+        file_info = telegram_api_call(
+            "getFile",
+            {
+                "file_id": file_id,
+            },
+        )
+
+        file_path = file_info.get(
+            "file_path"
+        )
+
+        if not file_path:
+            raise RuntimeError(
+                "Telegram returned no file_path"
+            )
+
+        telegram_url = (
+            f"{TELEGRAM_FILE_API_BASE}/{file_path}"
+        )
+
+        upstream = requests.get(
+            telegram_url,
+            stream=True,
+            timeout=300,
+        )
+
+        upstream.raise_for_status()
+
+        content_type = upstream.headers.get(
+            "Content-Type",
+            record.get("mime_type")
+            or "application/octet-stream",
+        )
+
+        response_headers = {
+            "X-Telegram-Storage-ID": storage_id,
+        }
+
+        content_length = upstream.headers.get(
+            "Content-Length"
+        )
+
+        if content_length:
+            response_headers[
+                "Content-Length"
+            ] = content_length
+
+        file_name = str(
+            record.get("file_name") or ""
+        ).strip()
+
+        if file_name:
+            safe_name = file_name.replace(
+                '"',
+                "",
+            )
+
+            response_headers[
+                "Content-Disposition"
+            ] = f'inline; filename="{safe_name}"'
+
+        def stream_file():
+            try:
+                for chunk in upstream.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return StreamingResponse(
+            stream_file(),
+            media_type=content_type,
+            headers=response_headers,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        if upstream is not None:
+            upstream.close()
+
+        logger.exception(
+            "Telegram file retrieval failed"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Telegram retrieval failed: {exc}",
+        )
+
+@app.get("/telegram/items")
+async def telegram_get_items(
+    chat_id: int = Query(...),
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Return ALL indexed Telegram items belonging to chat_id
+    except those marked as used.
+
+    Blank 'used' cells are treated as unused.
+    """
+
+    require_telegram_storage_key(x_api_key)
+
+    try:
+        rows = get_telegram_storage_rows()
+
+        items = []
+
+        for row in rows:
+            try:
+                row_chat_id = int(
+                    row.get("chat_id") or 0
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if row_chat_id != chat_id:
+                continue
+
+            if telegram_item_is_used(
+                row.get("used")
+            ):
+                continue
+
+            # Internal sheet row shouldn't be exposed.
+            clean_row = {
+                key: value
+                for key, value in row.items()
+                if key != "_row_number"
+            }
+
+            items.append(clean_row)
+
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "count": len(items),
+            "items": items,
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "Failed retrieving Telegram storage index"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Telegram index retrieval failed: {exc}",
+        )
+
+@app.post("/telegram/mark-used")
+async def telegram_mark_used(
+    body: TelegramMarkUsedRequest,
+    x_api_key: str | None = Header(
+        None,
+        alias="X-API-KEY",
+    ),
+):
+    """
+    Mark a Telegram storage item as used.
+    """
+    require_telegram_storage_key(x_api_key)
+
+    try:
+        service = get_sheets_service()
+
+        rows = read_sheet_by_name(
+            service,
+            TELEGRAM_STORAGE_SHEET,
+        )
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail="telegram-storage sheet is empty",
+            )
+
+        header = [
+            str(column).strip()
+            for column in rows[0]
+        ]
+
+        if "storage_id" not in header:
+            raise HTTPException(
+                status_code=500,
+                detail="telegram-storage has no storage_id column",
+            )
+
+        if "used" not in header:
+            raise HTTPException(
+                status_code=500,
+                detail="telegram-storage has no used column",
+            )
+
+        storage_idx = header.index(
+            "storage_id"
+        )
+
+        target_row = None
+
+        for row_number, row in enumerate(
+            rows[1:],
+            start=2,
+        ):
+            row = list(row)
+
+            if len(row) <= storage_idx:
+                continue
+
+            if str(
+                row[storage_idx] or ""
+            ).strip() == body.storage_id.strip():
+                target_row = row_number
+                break
+
+        if target_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="storage_id not found",
+            )
+
+        used_column = get_column_letter(
+            header,
+            "used",
+        )
+
+        update_cell(
+            service,
+            TELEGRAM_STORAGE_SHEET,
+            target_row,
+            used_column,
+            "yes",
+        )
+
+        return {
+            "success": True,
+            "storage_id": body.storage_id,
+            "used": True,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Failed marking Telegram item as used"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not mark item used: {exc}",
+        )
+
+
 
 # =====================================================
 # CRON: Exactly one worker runs this daily at 9:50 AM IST
