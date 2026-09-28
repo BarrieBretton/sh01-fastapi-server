@@ -60,8 +60,8 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 load_dotenv(".env")
 
-# Get configuration from environment
-print('env:: ', os.environ)
+# # Get configuration from environment
+# print('env:: ', os.environ)
 
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 CREDENTIALS_PATH = Path(os.getenv('SHEETS_CREDENTIALS_PATH', 'credentials.json'))
@@ -245,7 +245,7 @@ def read_sheet_by_name(
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'",  # Single quotes handle spaces in names
+            range=f"'{sheet_name}'!A:ZZZ",  # Single quotes handle spaces in names
             valueRenderOption=value_render_option
         ).execute()
         
@@ -439,6 +439,28 @@ def batch_update_cells(
         logger.error("Batch update failed: %s", e)
         raise
 
+def column_number_to_letter(column_number: int) -> str:
+    """
+    Convert a 1-based column number to an Excel/Sheets column letter.
+
+    1 -> A
+    26 -> Z
+    27 -> AA
+    """
+    if column_number < 1:
+        raise ValueError("column_number must be >= 1")
+
+    letters = ""
+
+    while column_number > 0:
+        column_number -= 1
+        letters = chr(
+            ord("A") + (column_number % 26)
+        ) + letters
+        column_number //= 26
+
+    return letters
+
 def append_rows(
     service,
     sheet_name: str,
@@ -447,6 +469,9 @@ def append_rows(
 ) -> None:
     """
     Append rows to a Google Sheets tab.
+
+    Rows are always anchored from column A so Google Sheets cannot
+    infer a shifted logical-table starting column.
     """
     spreadsheet_id = spreadsheet_id or SPREADSHEET_ID
 
@@ -456,10 +481,26 @@ def append_rows(
     if not rows:
         return
 
+    row_width = max(
+        len(row)
+        for row in rows
+    )
+
+    if row_width < 1:
+        return
+
+    last_column = column_number_to_letter(
+        row_width
+    )
+
+    append_range = (
+        f"'{sheet_name}'!A1:{last_column}"
+    )
+
     try:
         service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'",
+            range=append_range,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={
@@ -468,9 +509,10 @@ def append_rows(
         ).execute()
 
         logger.info(
-            "Appended %d row(s) to sheet '%s'",
+            "Appended %d row(s) to sheet '%s' using range %s",
             len(rows),
             sheet_name,
+            append_range,
         )
 
     except HttpError as e:
