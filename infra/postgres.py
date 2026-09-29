@@ -1,12 +1,16 @@
-import os
+import json
 import logging
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
 from .registry import registry
 
+
 logger = logging.getLogger("infra.postgres")
+
 
 @dataclass
 class PostgresConfig:
@@ -176,8 +180,6 @@ def postgres_verify(
             f"{result.stderr.strip()}"
         )
 
-    import json
-
     raw = result.stdout.strip()
 
     try:
@@ -193,9 +195,18 @@ def postgres_verify(
     }
 
 
-def postgres_public_table_count(
+def postgres_public_extensions(
     slot: str,
-) -> int:
+) -> list[str]:
+    """
+    Return extensions whose extension schema is public.
+
+    The migration owns/replaces the destination public schema.
+    If an extension is installed directly into public, dropping
+    public could destroy extension-managed objects, so migration
+    is refused in that case.
+    """
+
     db = get_postgres_config(slot)
 
     env = {
@@ -215,10 +226,12 @@ def postgres_public_table_count(
             "--no-align",
             "--command",
             """
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_type = 'BASE TABLE';
+            SELECT e.extname
+            FROM pg_extension e
+            JOIN pg_namespace n
+              ON n.oid = e.extnamespace
+            WHERE n.nspname = 'public'
+            ORDER BY e.extname;
             """,
         ],
         env=env,
@@ -229,11 +242,16 @@ def postgres_public_table_count(
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"Could not inspect destination database {slot}: "
+            f"Could not inspect public-schema extensions for {slot}: "
             f"{result.stderr.strip()}"
         )
 
-    return int(result.stdout.strip() or 0)
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
 
 def postgres_migrate(
     source_slot: str,
@@ -263,157 +281,246 @@ def postgres_migrate(
     }
 
     logger.info(
-        "Starting postgres migration: %s -> %s",
+        "Starting transactional postgres migration: %s -> %s",
         source_slot,
         destination_slot,
     )
 
-    destination_table_count = postgres_public_table_count(
+    # ---------------------------------------------------------
+    # SAFETY CHECK
+    # ---------------------------------------------------------
+    #
+    # The ring owns/replaces the n8n application objects in
+    # public. Do not destroy extension-managed objects that may
+    # happen to have been installed directly into public.
+    #
+    destination_extensions = postgres_public_extensions(
+        destination_slot
+    )
+
+    if destination_extensions:
+        raise RuntimeError(
+            "Destination public schema contains extension-managed "
+            "objects. Refusing destructive replacement. Extensions: "
+            + ", ".join(destination_extensions)
+        )
+
+    logger.info(
+        "Destination public schema extension check passed"
+    )
+
+    # ---------------------------------------------------------
+    # DUMP + RESTORE
+    # ---------------------------------------------------------
+    #
+    # Temporary dump files live only for the duration of this
+    # migration and are automatically deleted.
+    #
+    # We intentionally use separate schema and data dumps so the
+    # destination can be recreated deterministically and restored
+    # inside one destination transaction.
+    #
+    with tempfile.TemporaryDirectory(
+        prefix="postgres-ring-migration-"
+    ) as tmpdir:
+
+        schema_file = os.path.join(
+            tmpdir,
+            "schema.sql",
+        )
+
+        data_file = os.path.join(
+            tmpdir,
+            "data.sql",
+        )
+
+        # -----------------------------------------------------
+        # PHASE 1: SOURCE SCHEMA DUMP
+        # -----------------------------------------------------
+
+        logger.info(
+            "Dumping source public schema"
+        )
+
+        schema_dump = subprocess.run(
+            [
+                "pg_dump",
+                "--host", source.host,
+                "--port", str(source.port),
+                "--username", source.user,
+                "--dbname", source.database,
+                "--no-password",
+
+                "--format", "plain",
+                "--schema", "public",
+                "--schema-only",
+
+                "--no-owner",
+                "--no-privileges",
+
+                "--file", schema_file,
+            ],
+            env=source_env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        if schema_dump.returncode != 0:
+            logger.error(
+                "Schema dump failed rc=%s stderr=%r",
+                schema_dump.returncode,
+                schema_dump.stderr,
+            )
+
+            raise RuntimeError(
+                "Source schema dump failed: "
+                + schema_dump.stderr.strip()
+            )
+
+        schema_size = os.path.getsize(
+            schema_file
+        )
+
+        logger.info(
+            "Source schema dump completed: %s bytes",
+            schema_size,
+        )
+
+        # -----------------------------------------------------
+        # PHASE 2: SOURCE DATA DUMP
+        # -----------------------------------------------------
+
+        logger.info(
+            "Dumping source public data"
+        )
+
+        data_dump = subprocess.run(
+            [
+                "pg_dump",
+                "--host", source.host,
+                "--port", str(source.port),
+                "--username", source.user,
+                "--dbname", source.database,
+                "--no-password",
+
+                "--format", "plain",
+                "--schema", "public",
+                "--data-only",
+
+                "--no-owner",
+                "--no-privileges",
+
+                "--file", data_file,
+            ],
+            env=source_env,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+
+        if data_dump.returncode != 0:
+            logger.error(
+                "Data dump failed rc=%s stderr=%r",
+                data_dump.returncode,
+                data_dump.stderr,
+            )
+
+            raise RuntimeError(
+                "Source data dump failed: "
+                + data_dump.stderr.strip()
+            )
+
+        data_size = os.path.getsize(
+            data_file
+        )
+
+        logger.info(
+            "Source data dump completed: %s bytes",
+            data_size,
+        )
+
+        # -----------------------------------------------------
+        # PHASE 3: TRANSACTIONAL DESTINATION REPLACEMENT
+        # -----------------------------------------------------
+        #
+        # psql --single-transaction wraps all command/file
+        # operations below in one transaction.
+        #
+        # If schema or data restoration fails, ON_ERROR_STOP
+        # causes psql to fail and PostgreSQL rolls the transaction
+        # back instead of leaving the destination half-restored.
+        #
+        # session_replication_role=replica suppresses trigger/FK
+        # execution while inserting the already-consistent source
+        # data.
+        #
+
+        logger.info(
+            "Beginning transactional restore into %s",
+            destination_slot,
+        )
+
+        restore = subprocess.run(
+            [
+                "psql",
+                "--host", destination.host,
+                "--port", str(destination.port),
+                "--username", destination.user,
+                "--dbname", destination.database,
+                "--no-password",
+
+                "--single-transaction",
+                "--set", "ON_ERROR_STOP=1",
+
+                "--command",
+                "DROP SCHEMA IF EXISTS public CASCADE;",
+
+                "--file",
+                schema_file,
+
+                "--command",
+                "SET session_replication_role = replica;",
+
+                "--file",
+                data_file,
+            ],
+            env=destination_env,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+
+        if restore.returncode != 0:
+            logger.error(
+                "Transactional restore failed: "
+                "rc=%s stdout=%r stderr=%r",
+                restore.returncode,
+                restore.stdout,
+                restore.stderr,
+            )
+
+            raise RuntimeError(
+                "Transactional destination restore failed. "
+                f"returncode={restore.returncode}; "
+                f"stderr={restore.stderr.strip()!r}; "
+                f"stdout={restore.stdout.strip()!r}"
+            )
+
+        logger.info(
+            "Transactional restore completed successfully"
+        )
+
+    # Temporary files have now been automatically deleted.
+
+    verification = postgres_verify(
         destination_slot
     )
 
     logger.info(
-        "Destination %s currently has %s public tables",
-        destination_slot,
-        destination_table_count,
+        "Migration verification completed: %s",
+        verification,
     )
-
-    dump = subprocess.Popen(
-        [
-            "pg_dump",
-            "--host", source.host,
-            "--port", str(source.port),
-            "--username", source.user,
-            "--dbname", source.database,
-            "--format", "custom",
-            "--schema", "public",
-            "--no-owner",
-            "--no-privileges",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=source_env,
-    )
-
-    logger.info(
-        "pg_dump started pid=%s",
-        dump.pid,
-    )
-
-    assert dump.stdout is not None
-
-    restore_command = [
-        "pg_restore",
-        "--host", destination.host,
-        "--port", str(destination.port),
-        "--username", destination.user,
-        "--dbname", destination.database,
-        "--no-owner",
-        "--no-privileges",
-        "--exit-on-error",
-        "--verbose",
-    ]
-
-    # An empty destination must not use --clean because archive cleanup
-    # can reference parent relations that do not exist yet.
-    if destination_table_count > 0:
-        restore_command.extend([
-            "--clean",
-            "--if-exists",
-        ])
-
-    logger.info(
-        "pg_restore clean mode=%s",
-        destination_table_count > 0,
-    )
-
-    restore = subprocess.Popen(
-        restore_command,
-        stdin=dump.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=destination_env,
-    )
-
-    logger.info(
-        "pg_restore started pid=%s",
-        restore.pid,
-    )
-
-    dump.stdout.close()
-
-    logger.info("Waiting for pg_restore to finish")
-
-    restore_stdout, restore_stderr = restore.communicate()
-
-    logger.info(
-        "pg_restore finished returncode=%s",
-        restore.returncode,
-    )
-
-    dump_stderr = dump.stderr.read() if dump.stderr else b""
-    dump_returncode = dump.wait()
-
-    logger.info(
-        "pg_dump finished returncode=%s",
-        dump_returncode,
-    )
-
-    restore_stdout_text = restore_stdout.decode(
-        "utf-8",
-        errors="replace",
-    ).strip()
-
-    restore_stderr_text = restore_stderr.decode(
-        "utf-8",
-        errors="replace",
-    ).strip()
-
-    dump_stderr_text = dump_stderr.decode(
-        "utf-8",
-        errors="replace",
-    ).strip()
-
-    # IMPORTANT:
-    # If pg_restore exits early, pg_dump may subsequently fail because
-    # the stdout pipe was closed. Therefore report the restore error first.
-    if restore.returncode != 0:
-        logger.error(
-            "Migration failed: "
-            "restore_rc=%s restore_stderr=%r "
-            "dump_rc=%s dump_stderr=%r",
-            restore.returncode,
-            restore_stderr_text,
-            dump_returncode,
-            dump_stderr_text,
-        )
-
-        raise RuntimeError(
-            "Postgres migration failed. "
-            f"pg_restore returncode={restore.returncode}; "
-            f"pg_restore stderr={restore_stderr_text!r}; "
-            f"pg_dump returncode={dump_returncode}; "
-            f"pg_dump stderr={dump_stderr_text!r}"
-        )
-
-    if dump_returncode != 0:
-        logger.error(
-            "Migration failed: "
-            "dump_rc=%s dump_stderr=%r "
-            "restore_rc=%s restore_stderr=%r",
-            dump_returncode,
-            dump_stderr_text,
-            restore.returncode,
-            restore_stderr_text,
-        )
-
-        raise RuntimeError(
-            "Postgres migration failed. "
-            f"pg_dump returncode={dump_returncode}; "
-            f"pg_dump stderr={dump_stderr_text!r}; "
-            f"pg_restore returncode={restore.returncode}; "
-            f"pg_restore stderr={restore_stderr_text!r}"
-        )
 
     logger.info(
         "Postgres migration completed successfully: %s -> %s",
@@ -424,9 +531,8 @@ def postgres_migrate(
     return {
         "source": source_slot,
         "destination": destination_slot,
-        "dump_returncode": dump_returncode,
+        "schema_dump_bytes": schema_size,
+        "data_dump_bytes": data_size,
         "restore_returncode": restore.returncode,
-        "restore_stdout": restore_stdout_text,
-        "restore_stderr": restore_stderr_text,
-        "dump_stderr": dump_stderr_text,
+        "verification": verification,
     }

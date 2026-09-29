@@ -1,21 +1,21 @@
 # infra/routes.py
+
 import shutil
+import subprocess
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from .auth import require_control_plane_key
-
-from .postgres import (
-    postgres_health,
-    postgres_verify,
-    postgres_migrate,
-)
-
 from .models import (
     ActiveInfrastructure,
     InfraStatusResponse,
+    PostgresMigrationRequest,
     SlotSelectionRequest,
-    PostgresMigrationRequest
+)
+from .postgres import (
+    postgres_health,
+    postgres_migrate,
+    postgres_verify,
 )
 from .registry import registry
 from .state import state
@@ -66,8 +66,7 @@ async def infra_registry():
     """
     Safe registry representation.
 
-    Later we will explicitly redact any secret-bearing
-    fields once provider configs are added.
+    Secret-bearing values are not returned here.
     """
 
     return {
@@ -156,39 +155,62 @@ async def select_b2(
         request,
     )
 
+
 @router.get("/diagnostics/postgres-tools")
 async def postgres_tools_diagnostic():
-    import subprocess
 
-    def version(command: str) -> str | None:
-        path = shutil.which(command)
+    def version(
+        command: str,
+    ) -> str | None:
+        path = shutil.which(
+            command
+        )
 
         if not path:
             return None
 
         result = subprocess.run(
-            [command, "--version"],
+            [
+                command,
+                "--version",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
         )
 
-        return result.stdout.strip() or result.stderr.strip()
+        return (
+            result.stdout.strip()
+            or result.stderr.strip()
+        )
 
     return {
         "pg_dump": {
-            "path": shutil.which("pg_dump"),
-            "version": version("pg_dump"),
+            "path": shutil.which(
+                "pg_dump"
+            ),
+            "version": version(
+                "pg_dump"
+            ),
         },
         "pg_restore": {
-            "path": shutil.which("pg_restore"),
-            "version": version("pg_restore"),
+            "path": shutil.which(
+                "pg_restore"
+            ),
+            "version": version(
+                "pg_restore"
+            ),
         },
         "psql": {
-            "path": shutil.which("psql"),
-            "version": version("psql"),
+            "path": shutil.which(
+                "psql"
+            ),
+            "version": version(
+                "psql"
+            ),
         },
     }
+
 
 @router.get("/postgres/{slot}/health")
 async def postgres_slot_health(
@@ -200,17 +222,22 @@ async def postgres_slot_health(
     ):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown postgres slot: {slot}",
+            detail=(
+                f"Unknown postgres slot: "
+                f"{slot}"
+            ),
         )
 
     try:
-        return postgres_health(slot)
+        return postgres_health(
+            slot
+        )
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=str(exc),
-        )
+        ) from exc
 
 
 @router.post("/postgres/{slot}/verify")
@@ -223,17 +250,22 @@ async def postgres_slot_verify(
     ):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown postgres slot: {slot}",
+            detail=(
+                f"Unknown postgres slot: "
+                f"{slot}"
+            ),
         )
 
     try:
-        return postgres_verify(slot)
+        return postgres_verify(
+            slot
+        )
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=str(exc),
-        )
+        ) from exc
 
 
 @router.post("/postgres/migrate")
@@ -246,7 +278,10 @@ async def migrate_postgres(
     ):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown source postgres slot: {request.source}",
+            detail=(
+                "Unknown source postgres slot: "
+                f"{request.source}"
+            ),
         )
 
     if not registry.exists(
@@ -255,7 +290,19 @@ async def migrate_postgres(
     ):
         raise HTTPException(
             status_code=404,
-            detail=f"Unknown destination postgres slot: {request.destination}",
+            detail=(
+                "Unknown destination postgres slot: "
+                f"{request.destination}"
+            ),
+        )
+
+    if request.source == request.destination:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Source and destination "
+                "Postgres slots must differ"
+            ),
         )
 
     if request.dry_run:
@@ -277,12 +324,20 @@ async def migrate_postgres(
 
         if not source_health["healthy"]:
             raise RuntimeError(
-                "Source database is not healthy"
+                "Source database is not healthy: "
+                + source_health.get(
+                    "stderr",
+                    "",
+                )
             )
 
         if not destination_health["healthy"]:
             raise RuntimeError(
-                "Destination database is not healthy"
+                "Destination database is not healthy: "
+                + destination_health.get(
+                    "stderr",
+                    "",
+                )
             )
 
         migration = postgres_migrate(
@@ -304,4 +359,4 @@ async def migrate_postgres(
         raise HTTPException(
             status_code=500,
             detail=str(exc),
-        )
+        ) from exc
