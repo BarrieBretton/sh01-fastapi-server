@@ -26,3 +26,8 @@ class ActiveInfrastructure(BaseModel):
 class InfraStatusResponse(BaseModel):
     active: ActiveInfrastructure
     available: dict[str, list[str]]
+
+class PostgresMigrationRequest(BaseModel):
+    source: str
+    destination: str
+    dry_run: bool = True
