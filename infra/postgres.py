@@ -199,12 +199,12 @@ def postgres_public_extensions(
     slot: str,
 ) -> list[str]:
     """
-    Return extensions whose extension schema is public.
+    Return extensions installed directly into the public schema.
 
-    The migration owns/replaces the destination public schema.
-    If an extension is installed directly into public, dropping
-    public could destroy extension-managed objects, so migration
-    is refused in that case.
+    The ring migration replaces the destination public schema.
+    If an extension owns objects inside public, dropping public
+    could destroy provider/extension-managed objects, so migration
+    is refused.
     """
 
     db = get_postgres_config(slot)
@@ -287,13 +287,9 @@ def postgres_migrate(
     )
 
     # ---------------------------------------------------------
-    # SAFETY CHECK
+    # DESTINATION SAFETY CHECK
     # ---------------------------------------------------------
-    #
-    # The ring owns/replaces the n8n application objects in
-    # public. Do not destroy extension-managed objects that may
-    # happen to have been installed directly into public.
-    #
+
     destination_extensions = postgres_public_extensions(
         destination_slot
     )
@@ -310,23 +306,28 @@ def postgres_migrate(
     )
 
     # ---------------------------------------------------------
-    # DUMP + RESTORE
+    # TEMPORARY DUMP AREA
     # ---------------------------------------------------------
     #
-    # Temporary dump files live only for the duration of this
-    # migration and are automatically deleted.
+    # The dump files exist only while this migration runs.
+    # TemporaryDirectory removes them automatically.
     #
-    # We intentionally use separate schema and data dumps so the
-    # destination can be recreated deterministically and restored
-    # inside one destination transaction.
+    # Migration is split into:
     #
+    #   pre-data  -> tables/types/sequences
+    #   data      -> table contents
+    #   post-data -> indexes/FKs/triggers/etc.
+    #
+    # This lets us load data before FKs/triggers are recreated.
+    #
+
     with tempfile.TemporaryDirectory(
         prefix="postgres-ring-migration-"
     ) as tmpdir:
 
-        schema_file = os.path.join(
+        pre_data_file = os.path.join(
             tmpdir,
-            "schema.sql",
+            "pre-data.sql",
         )
 
         data_file = os.path.join(
@@ -334,15 +335,20 @@ def postgres_migrate(
             "data.sql",
         )
 
+        post_data_file = os.path.join(
+            tmpdir,
+            "post-data.sql",
+        )
+
         # -----------------------------------------------------
-        # PHASE 1: SOURCE SCHEMA DUMP
+        # PHASE 1: PRE-DATA
         # -----------------------------------------------------
 
         logger.info(
-            "Dumping source public schema"
+            "Dumping source public pre-data"
         )
 
-        schema_dump = subprocess.run(
+        pre_data_dump = subprocess.run(
             [
                 "pg_dump",
                 "--host", source.host,
@@ -353,12 +359,12 @@ def postgres_migrate(
 
                 "--format", "plain",
                 "--schema", "public",
-                "--schema-only",
+                "--section", "pre-data",
 
                 "--no-owner",
                 "--no-privileges",
 
-                "--file", schema_file,
+                "--file", pre_data_file,
             ],
             env=source_env,
             capture_output=True,
@@ -366,29 +372,29 @@ def postgres_migrate(
             timeout=300,
         )
 
-        if schema_dump.returncode != 0:
+        if pre_data_dump.returncode != 0:
             logger.error(
-                "Schema dump failed rc=%s stderr=%r",
-                schema_dump.returncode,
-                schema_dump.stderr,
+                "Pre-data dump failed rc=%s stderr=%r",
+                pre_data_dump.returncode,
+                pre_data_dump.stderr,
             )
 
             raise RuntimeError(
-                "Source schema dump failed: "
-                + schema_dump.stderr.strip()
+                "Source pre-data dump failed: "
+                + pre_data_dump.stderr.strip()
             )
 
-        schema_size = os.path.getsize(
-            schema_file
+        pre_data_size = os.path.getsize(
+            pre_data_file
         )
 
         logger.info(
-            "Source schema dump completed: %s bytes",
-            schema_size,
+            "Source pre-data dump completed: %s bytes",
+            pre_data_size,
         )
 
         # -----------------------------------------------------
-        # PHASE 2: SOURCE DATA DUMP
+        # PHASE 2: DATA
         # -----------------------------------------------------
 
         logger.info(
@@ -441,19 +447,75 @@ def postgres_migrate(
         )
 
         # -----------------------------------------------------
-        # PHASE 3: TRANSACTIONAL DESTINATION REPLACEMENT
+        # PHASE 3: POST-DATA
+        # -----------------------------------------------------
+
+        logger.info(
+            "Dumping source public post-data"
+        )
+
+        post_data_dump = subprocess.run(
+            [
+                "pg_dump",
+                "--host", source.host,
+                "--port", str(source.port),
+                "--username", source.user,
+                "--dbname", source.database,
+                "--no-password",
+
+                "--format", "plain",
+                "--schema", "public",
+                "--section", "post-data",
+
+                "--no-owner",
+                "--no-privileges",
+
+                "--file", post_data_file,
+            ],
+            env=source_env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        if post_data_dump.returncode != 0:
+            logger.error(
+                "Post-data dump failed rc=%s stderr=%r",
+                post_data_dump.returncode,
+                post_data_dump.stderr,
+            )
+
+            raise RuntimeError(
+                "Source post-data dump failed: "
+                + post_data_dump.stderr.strip()
+            )
+
+        post_data_size = os.path.getsize(
+            post_data_file
+        )
+
+        logger.info(
+            "Source post-data dump completed: %s bytes",
+            post_data_size,
+        )
+
+        # -----------------------------------------------------
+        # PHASE 4: ATOMIC DESTINATION REPLACEMENT
         # -----------------------------------------------------
         #
-        # psql --single-transaction wraps all command/file
-        # operations below in one transaction.
+        # psql --single-transaction applies:
         #
-        # If schema or data restoration fails, ON_ERROR_STOP
-        # causes psql to fail and PostgreSQL rolls the transaction
-        # back instead of leaving the destination half-restored.
+        #   DROP old public
+        #   restore pre-data
+        #   restore data
+        #   restore post-data
         #
-        # session_replication_role=replica suppresses trigger/FK
-        # execution while inserting the already-consistent source
-        # data.
+        # as one transaction.
+        #
+        # ON_ERROR_STOP=1 makes any SQL error abort psql.
+        #
+        # Therefore a failed restore rolls the transaction back
+        # instead of leaving the destination partially migrated.
         #
 
         logger.info(
@@ -477,13 +539,13 @@ def postgres_migrate(
                 "DROP SCHEMA IF EXISTS public CASCADE;",
 
                 "--file",
-                schema_file,
-
-                "--command",
-                "SET session_replication_role = replica;",
+                pre_data_file,
 
                 "--file",
                 data_file,
+
+                "--file",
+                post_data_file,
             ],
             env=destination_env,
             capture_output=True,
@@ -511,7 +573,7 @@ def postgres_migrate(
             "Transactional restore completed successfully"
         )
 
-    # Temporary files have now been automatically deleted.
+    # Temp files are automatically deleted here.
 
     verification = postgres_verify(
         destination_slot
@@ -531,8 +593,9 @@ def postgres_migrate(
     return {
         "source": source_slot,
         "destination": destination_slot,
-        "schema_dump_bytes": schema_size,
+        "pre_data_dump_bytes": pre_data_size,
         "data_dump_bytes": data_size,
+        "post_data_dump_bytes": post_data_size,
         "restore_returncode": restore.returncode,
         "verification": verification,
     }
