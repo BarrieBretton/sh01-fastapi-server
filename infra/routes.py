@@ -158,10 +158,36 @@ async def select_b2(
 
 @router.get("/diagnostics/postgres-tools")
 async def postgres_tools_diagnostic():
+    import subprocess
+
+    def version(command: str) -> str | None:
+        path = shutil.which(command)
+
+        if not path:
+            return None
+
+        result = subprocess.run(
+            [command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        return result.stdout.strip() or result.stderr.strip()
+
     return {
-        "pg_dump": shutil.which("pg_dump"),
-        "pg_restore": shutil.which("pg_restore"),
-        "psql": shutil.which("psql"),
+        "pg_dump": {
+            "path": shutil.which("pg_dump"),
+            "version": version("pg_dump"),
+        },
+        "pg_restore": {
+            "path": shutil.which("pg_restore"),
+            "version": version("pg_restore"),
+        },
+        "psql": {
+            "path": shutil.which("psql"),
+            "version": version("psql"),
+        },
     }
 
 @router.get("/postgres/{slot}/health")
