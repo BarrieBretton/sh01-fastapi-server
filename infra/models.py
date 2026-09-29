@@ -14,12 +14,11 @@ class SlotSelectionRequest(BaseModel):
 
 class RenderSlotSelectionRequest(BaseModel):
     slot: str
-    role: RenderRole = "n8n"
     dry_run: bool = True
 
 
 class ActiveInfrastructure(BaseModel):
-    render: dict[str, str | None]
+    render: str | None = None
     postgres: str | None = None
     b2: str | None = None
 

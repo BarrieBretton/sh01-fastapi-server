@@ -1,5 +1,3 @@
-# infra/registry.py
-
 import json
 import os
 from typing import Any
@@ -23,18 +21,8 @@ class InfraRegistry:
         section = self._registry.get(infra_type, {})
         return sorted(section.keys())
 
-    def render_slots(self, role: str | None = None) -> list[str]:
-        slots = self.slots("render")
-        if role is None:
-            return slots
-        return [
-            slot
-            for slot in slots
-            if str(self.get("render", slot).get("role", "n8n")).strip().lower() == role.lower()
-        ]
-
-    def render_role(self, slot: str) -> str:
-        return str(self.get("render", slot).get("role", "n8n")).strip().lower()
+    def render_slots(self) -> list[str]:
+        return self.slots("render")
 
     def exists(self, infra_type: str, slot: str) -> bool:
         return slot in self._registry.get(infra_type, {})
@@ -46,6 +34,15 @@ class InfraRegistry:
         if not isinstance(value, dict):
             raise RuntimeError(f"Registry entry {infra_type}.{slot} must be an object")
         return value
+
+    def render_service(self, slot: str, role: str) -> dict[str, Any]:
+        if role not in {"n8n", "sh01"}:
+            raise KeyError(f"Unknown Render service role: {role}")
+        slot_cfg = self.get("render", slot)
+        service_cfg = slot_cfg.get(role)
+        if not isinstance(service_cfg, dict):
+            raise RuntimeError(f"Render slot '{slot}' is missing service config '{role}'")
+        return service_cfg
 
 
 registry = InfraRegistry()

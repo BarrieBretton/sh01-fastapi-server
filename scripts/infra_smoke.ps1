@@ -14,12 +14,7 @@ function Invoke-InfraGet([string]$Path) {
 }
 
 function Invoke-InfraPost([string]$Path, $Body) {
-    Invoke-RestMethod `
-        -Method POST `
-        -Uri "$Base$Path" `
-        -Headers $headers `
-        -ContentType "application/json" `
-        -Body ($Body | ConvertTo-Json -Depth 20)
+    Invoke-RestMethod -Method POST -Uri "$Base$Path" -Headers $headers -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 20)
 }
 
 Write-Host "=== control plane health ===" -ForegroundColor Cyan
@@ -37,22 +32,15 @@ foreach ($slot in $status.available.postgres) {
     if (-not $r.healthy) { throw "Postgres health failed: $slot" }
 }
 
-Write-Host "`n=== n8n Render ring ===" -ForegroundColor Cyan
-foreach ($slot in $status.available.render.n8n) {
-    $service = Invoke-InfraGet "/infra/render/$slot/status"
-    $service | ConvertTo-Json -Depth 10
-    $r = Invoke-InfraGet "/infra/render/$slot/health"
-    $r | ConvertTo-Json -Depth 10
-    if (-not $r.healthy) { Write-Warning "n8n Render slot is not currently healthy (may be intentionally suspended): $slot" }
-}
-
-Write-Host "`n=== SH01 Render ring ===" -ForegroundColor Cyan
-foreach ($slot in $status.available.render.sh01) {
-    $service = Invoke-InfraGet "/infra/render/$slot/status"
-    $service | ConvertTo-Json -Depth 10
-    $r = Invoke-InfraGet "/infra/render/$slot/health"
-    $r | ConvertTo-Json -Depth 10
-    if (-not $r.healthy) { Write-Warning "SH01 Render slot is not currently healthy (may be intentionally suspended): $slot" }
+Write-Host "`n=== paired Render slots ===" -ForegroundColor Cyan
+foreach ($slot in $status.available.render) {
+    foreach ($role in @("n8n", "sh01")) {
+        $service = Invoke-InfraGet "/infra/render/$slot/$role/status"
+        $service | ConvertTo-Json -Depth 10
+        $r = Invoke-InfraGet "/infra/render/$slot/$role/health"
+        $r | ConvertTo-Json -Depth 10
+        if (-not $r.healthy) { Write-Warning "$slot/$role is not currently healthy (may be intentionally suspended)" }
+    }
 }
 
 if ($status.available.b2.Count -gt 0) {
@@ -64,25 +52,12 @@ if ($status.available.b2.Count -gt 0) {
     }
 }
 
-Write-Host "`n=== n8n Cloudflare router ===" -ForegroundColor Cyan
-$n8nRouter = Invoke-InfraGet "/infra/router/n8n/status"
-$n8nRouter | ConvertTo-Json -Depth 10
-if (-not $n8nRouter.persistence_available) {
-    throw "n8n Worker ROUTER_STATE KV binding is not available"
-}
-if ($n8nRouter.maintenance) {
-    throw "n8n Worker is unexpectedly in maintenance mode"
-}
-
-Write-Host "`n=== SH01 Cloudflare router ===" -ForegroundColor Cyan
-try {
-    $sh01Router = Invoke-InfraGet "/infra/router/sh01/status"
-    $sh01Router | ConvertTo-Json -Depth 10
-    if (-not $sh01Router.persistence_available) {
-        Write-Warning "SH01 Worker ROUTER_STATE KV binding is not available"
-    }
-} catch {
-    Write-Warning "SH01 router control is not configured yet: $($_.Exception.Message)"
+foreach ($role in @("n8n", "sh01")) {
+    Write-Host "`n=== $role Cloudflare router ===" -ForegroundColor Cyan
+    $router = Invoke-InfraGet "/infra/router/$role/status"
+    $router | ConvertTo-Json -Depth 10
+    if (-not $router.persistence_available) { throw "$role Worker ROUTER_STATE KV binding is not available" }
+    if ($router.maintenance) { throw "$role Worker is unexpectedly in maintenance mode" }
 }
 
 Write-Host "`n=== failover dry run ===" -ForegroundColor Cyan
@@ -101,8 +76,7 @@ if (-not $ExecuteFailover) {
     exit 0
 }
 
-Write-Host "`n=== EXECUTING FULL N8N STACK FAILOVER ===" -ForegroundColor Yellow
-Write-Host "The n8n Worker will enter maintenance mode while the active writer is suspended and Postgres is copied." -ForegroundColor Yellow
+Write-Host "`n=== EXECUTING FULL PAIRED RENDER FAILOVER ===" -ForegroundColor Yellow
 $liveBody = @{
     sync_b2 = [bool]$SyncB2
     prune_b2_extra = [bool]$PruneB2Extra
@@ -115,7 +89,6 @@ $accepted | ConvertTo-Json -Depth 20
 $jobId = $accepted.job.id
 if (-not $jobId) { throw "No failover job id returned" }
 
-Write-Host "Polling job $jobId ..." -ForegroundColor Cyan
 while ($true) {
     Start-Sleep -Seconds 5
     $job = Invoke-InfraGet "/infra/jobs/$jobId"
@@ -134,9 +107,9 @@ Write-Host "`n=== final status ===" -ForegroundColor Cyan
 $final = Invoke-InfraGet "/infra/status"
 $final | ConvertTo-Json -Depth 20
 
-Write-Host "`n=== final n8n router ===" -ForegroundColor Cyan
-$finalRouter = Invoke-InfraGet "/infra/router/n8n/status"
-$finalRouter | ConvertTo-Json -Depth 10
-if ($finalRouter.maintenance) { throw "n8n router was left in maintenance mode" }
+foreach ($role in @("n8n", "sh01")) {
+    $finalRouter = Invoke-InfraGet "/infra/router/$role/status"
+    if ($finalRouter.maintenance) { throw "$role router was left in maintenance mode" }
+}
 
-Write-Host "`nFull n8n stack failover completed successfully." -ForegroundColor Green
+Write-Host "`nFull paired Render failover completed successfully." -ForegroundColor Green

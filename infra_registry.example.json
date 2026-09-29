@@ -1,32 +1,30 @@
 {
   "render": {
     "render-a": {
-      "role": "n8n",
-      "service_id_env": "RENDER_A_SERVICE_ID",
-      "api_key_env": "RENDER_A_API_KEY",
-      "base_url_env": "RENDER_A_BASE_URL",
-      "health_path": "/healthz/readiness"
+      "api_key_env": "RENDER_API_KEY",
+      "n8n": {
+        "service_id_env": "RENDER_A_N8N_SERVICE_ID",
+        "base_url_env": "RENDER_A_N8N_BASE_URL",
+        "health_path": "/healthz/readiness"
+      },
+      "sh01": {
+        "service_id_env": "RENDER_A_SH01_SERVICE_ID",
+        "base_url_env": "RENDER_A_SH01_BASE_URL",
+        "health_path": "/"
+      }
     },
     "render-b": {
-      "role": "n8n",
-      "service_id_env": "RENDER_B_SERVICE_ID",
-      "api_key_env": "RENDER_B_API_KEY",
-      "base_url_env": "RENDER_B_BASE_URL",
-      "health_path": "/healthz/readiness"
-    },
-    "sh01-a": {
-      "role": "sh01",
-      "service_id_env": "SH01_A_SERVICE_ID",
-      "api_key_env": "SH01_A_API_KEY",
-      "base_url_env": "SH01_A_BASE_URL",
-      "health_path": "/"
-    },
-    "sh01-b": {
-      "role": "sh01",
-      "service_id_env": "SH01_B_SERVICE_ID",
-      "api_key_env": "SH01_B_API_KEY",
-      "base_url_env": "SH01_B_BASE_URL",
-      "health_path": "/"
+      "api_key_env": "RENDER_API_KEY",
+      "n8n": {
+        "service_id_env": "RENDER_B_N8N_SERVICE_ID",
+        "base_url_env": "RENDER_B_N8N_BASE_URL",
+        "health_path": "/healthz/readiness"
+      },
+      "sh01": {
+        "service_id_env": "RENDER_B_SH01_SERVICE_ID",
+        "base_url_env": "RENDER_B_SH01_BASE_URL",
+        "health_path": "/"
+      }
     }
   },
   "postgres": {

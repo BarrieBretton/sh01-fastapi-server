@@ -22,7 +22,6 @@ from .render_provider import render_health, render_service_status
 from .router_client import router_status
 from .state import state
 
-
 router = APIRouter(
     prefix="/infra",
     tags=["Infrastructure Control Plane"],
@@ -37,11 +36,7 @@ def _require_slot(kind: str, slot: str) -> None:
 
 @router.get("/health")
 async def infra_health():
-    return {
-        "ok": True,
-        "service": "infra-control-plane",
-        "state": state.snapshot(),
-    }
+    return {"ok": True, "service": "infra-control-plane", "state": state.snapshot()}
 
 
 @router.get("/status", response_model=InfraStatusResponse)
@@ -49,10 +44,7 @@ async def infra_status():
     return InfraStatusResponse(
         active=ActiveInfrastructure(**state.all()),
         available={
-            "render": {
-                "n8n": registry.render_slots("n8n"),
-                "sh01": registry.render_slots("sh01"),
-            },
+            "render": registry.render_slots(),
             "postgres": registry.slots("postgres"),
             "b2": registry.slots("b2"),
         },
@@ -62,10 +54,7 @@ async def infra_status():
 @router.get("/registry")
 async def infra_registry():
     return {
-        "render": {
-            "n8n": registry.render_slots("n8n"),
-            "sh01": registry.render_slots("sh01"),
-        },
+        "render": registry.render_slots(),
         "postgres": registry.slots("postgres"),
         "b2": registry.slots("b2"),
     }
@@ -89,28 +78,18 @@ def select_slot(infra_type: str, request: SlotSelectionRequest):
 @router.post("/select/render")
 async def select_render(request: RenderSlotSelectionRequest):
     _require_slot("render", request.slot)
-    actual_role = registry.render_role(request.slot)
-    if actual_role != request.role:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Render slot {request.slot} has role={actual_role}, not role={request.role}",
-        )
-    current = state.get_active("render", role=request.role)
+    registry.render_service(request.slot, "n8n")
+    registry.render_service(request.slot, "sh01")
+    current = state.get_active("render")
     if request.dry_run:
         return {
             "infra_type": "render",
-            "role": request.role,
             "previous": current,
             "target": request.slot,
             "dry_run": True,
             "changed": False,
         }
-    result = state.set_active(
-        "render",
-        request.slot,
-        persist=True,
-        role=request.role,
-    )
+    result = state.set_active("render", request.slot, persist=True)
     return {**result, "dry_run": False, "changed": True}
 
 
@@ -202,17 +181,21 @@ async def migrate_postgres(request: PostgresMigrationRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/render/{slot}/health")
-async def render_slot_health(slot: str):
+@router.get("/render/{slot}/{role}/health")
+async def render_slot_health(slot: str, role: str):
     _require_slot("render", slot)
-    return render_health(slot)
+    if role not in {"n8n", "sh01"}:
+        raise HTTPException(status_code=404, detail=f"Unknown Render role: {role}")
+    return render_health(slot, role)
 
 
-@router.get("/render/{slot}/status")
-async def render_slot_status(slot: str):
+@router.get("/render/{slot}/{role}/status")
+async def render_slot_status(slot: str, role: str):
     _require_slot("render", slot)
+    if role not in {"n8n", "sh01"}:
+        raise HTTPException(status_code=404, detail=f"Unknown Render role: {role}")
     try:
-        return render_service_status(slot)
+        return render_service_status(slot, role)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -270,7 +253,6 @@ async def cloudflare_router_status(role: str):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# Compatibility alias for the original package. It means the n8n router.
 @router.get("/router/status")
 async def cloudflare_router_status_legacy():
     try:
