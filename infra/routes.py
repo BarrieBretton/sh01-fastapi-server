@@ -13,6 +13,7 @@ from .models import (
     SlotSelectionRequest,
 )
 from .postgres import (
+    postgres_compare,
     postgres_health,
     postgres_migrate,
     postgres_verify,
@@ -259,6 +260,57 @@ async def postgres_slot_verify(
     try:
         return postgres_verify(
             slot
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get("/postgres/compare")
+async def compare_postgres(
+    source: str,
+    destination: str,
+):
+    if not registry.exists(
+        "postgres",
+        source,
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Unknown source postgres slot: "
+                f"{source}"
+            ),
+        )
+
+    if not registry.exists(
+        "postgres",
+        destination,
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Unknown destination postgres slot: "
+                f"{destination}"
+            ),
+        )
+
+    if source == destination:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Source and destination "
+                "Postgres slots must differ"
+            ),
+        )
+
+    try:
+        return postgres_compare(
+            source,
+            destination,
         )
 
     except Exception as exc:

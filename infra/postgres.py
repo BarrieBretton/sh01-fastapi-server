@@ -195,6 +195,251 @@ def postgres_verify(
     }
 
 
+def postgres_public_tables(
+    slot: str,
+) -> list[str]:
+    db = get_postgres_config(slot)
+
+    env = {
+        **os.environ,
+        "PGPASSWORD": db.password,
+    }
+
+    result = subprocess.run(
+        [
+            "psql",
+            "--host", db.host,
+            "--port", str(db.port),
+            "--username", db.user,
+            "--dbname", db.database,
+            "--no-password",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name;
+            """,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not list public tables for {slot}: "
+            f"{result.stderr.strip()}"
+        )
+
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def postgres_table_row_count(
+    slot: str,
+    table_name: str,
+) -> int:
+    db = get_postgres_config(slot)
+
+    env = {
+        **os.environ,
+        "PGPASSWORD": db.password,
+    }
+
+    escaped_table = table_name.replace(
+        '"',
+        '""',
+    )
+
+    result = subprocess.run(
+        [
+            "psql",
+            "--host", db.host,
+            "--port", str(db.port),
+            "--username", db.user,
+            "--dbname", db.database,
+            "--no-password",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            (
+                f'SELECT COUNT(*) '
+                f'FROM public."{escaped_table}";'
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not count rows in "
+            f"{slot}.public.{table_name}: "
+            f"{result.stderr.strip()}"
+        )
+
+    return int(
+        result.stdout.strip() or 0
+    )
+
+
+def postgres_compare(
+    source_slot: str,
+    destination_slot: str,
+) -> dict[str, Any]:
+    if source_slot == destination_slot:
+        raise ValueError(
+            "Source and destination Postgres slots must differ"
+        )
+
+    logger.info(
+        "Comparing postgres slots: %s <-> %s",
+        source_slot,
+        destination_slot,
+    )
+
+    source_tables = postgres_public_tables(
+        source_slot
+    )
+
+    destination_tables = postgres_public_tables(
+        destination_slot
+    )
+
+    source_set = set(
+        source_tables
+    )
+
+    destination_set = set(
+        destination_tables
+    )
+
+    missing_on_destination = sorted(
+        source_set - destination_set
+    )
+
+    extra_on_destination = sorted(
+        destination_set - source_set
+    )
+
+    common_tables = sorted(
+        source_set & destination_set
+    )
+
+    row_counts: dict[str, dict[str, int]] = {}
+    row_count_mismatches: list[dict[str, Any]] = []
+
+    for table_name in common_tables:
+        source_count = postgres_table_row_count(
+            source_slot,
+            table_name,
+        )
+
+        destination_count = postgres_table_row_count(
+            destination_slot,
+            table_name,
+        )
+
+        row_counts[table_name] = {
+            "source": source_count,
+            "destination": destination_count,
+        }
+
+        if source_count != destination_count:
+            row_count_mismatches.append(
+                {
+                    "table": table_name,
+                    "source": source_count,
+                    "destination": destination_count,
+                    "difference": (
+                        destination_count
+                        - source_count
+                    ),
+                }
+            )
+
+    source_verification = postgres_verify(
+        source_slot
+    )
+
+    destination_verification = postgres_verify(
+        destination_slot
+    )
+
+    table_set_match = (
+        not missing_on_destination
+        and not extra_on_destination
+    )
+
+    row_counts_match = (
+        len(row_count_mismatches) == 0
+    )
+
+    key_tables_match = (
+        source_verification["key_tables"]
+        == destination_verification["key_tables"]
+    )
+
+    match = (
+        table_set_match
+        and row_counts_match
+        and key_tables_match
+    )
+
+    result = {
+        "match": match,
+        "source": source_slot,
+        "destination": destination_slot,
+        "source_table_count": len(
+            source_tables
+        ),
+        "destination_table_count": len(
+            destination_tables
+        ),
+        "table_set_match": table_set_match,
+        "row_counts_match": row_counts_match,
+        "key_tables_match": key_tables_match,
+        "missing_on_destination": (
+            missing_on_destination
+        ),
+        "extra_on_destination": (
+            extra_on_destination
+        ),
+        "row_count_mismatches": (
+            row_count_mismatches
+        ),
+        "source_key_tables": (
+            source_verification["key_tables"]
+        ),
+        "destination_key_tables": (
+            destination_verification["key_tables"]
+        ),
+        "row_counts": row_counts,
+    }
+
+    logger.info(
+        "Postgres comparison completed: match=%s "
+        "source_tables=%s destination_tables=%s "
+        "row_mismatches=%s",
+        match,
+        len(source_tables),
+        len(destination_tables),
+        len(row_count_mismatches),
+    )
+
+    return result
+
+
 def postgres_public_extensions(
     slot: str,
 ) -> list[str]:
