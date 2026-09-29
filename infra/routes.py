@@ -1,4 +1,5 @@
 # infra/routes.py
+import shutil
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -146,3 +147,11 @@ async def select_b2(
         "b2",
         request,
     )
+
+@router.get("/diagnostics/postgres-tools")
+async def postgres_tools_diagnostic():
+    return {
+        "pg_dump": shutil.which("pg_dump"),
+        "pg_restore": shutil.which("pg_restore"),
+        "psql": shutil.which("psql"),
+    }
