@@ -1,10 +1,12 @@
 import os
+import logging
 import subprocess
 from dataclasses import dataclass
 from typing import Any
 
 from .registry import registry
 
+logger = logging.getLogger("infra.postgres")
 
 @dataclass
 class PostgresConfig:
@@ -218,6 +220,12 @@ def postgres_migrate(
         "PGPASSWORD": destination.password,
     }
 
+    logger.info(
+        "Starting postgres migration: %s -> %s",
+        source_slot,
+        destination_slot,
+    )
+
     dump = subprocess.Popen(
         [
             "pg_dump",
@@ -233,6 +241,11 @@ def postgres_migrate(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=source_env,
+    )
+
+    logger.info(
+        "pg_dump started pid=%s",
+        dump.pid,
     )
 
     assert dump.stdout is not None
@@ -257,12 +270,29 @@ def postgres_migrate(
         env=destination_env,
     )
 
+    logger.info(
+        "pg_restore started pid=%s",
+        restore.pid,
+    )
+
     dump.stdout.close()
+
+    logger.info("Waiting for pg_restore to finish")
 
     restore_stdout, restore_stderr = restore.communicate()
 
+    logger.info(
+        "pg_restore finished returncode=%s",
+        restore.returncode,
+    )
+
     dump_stderr = dump.stderr.read() if dump.stderr else b""
     dump_returncode = dump.wait()
+
+    logger.info(
+        "pg_dump finished returncode=%s",
+        dump_returncode,
+    )
 
     restore_stdout_text = restore_stdout.decode(
         "utf-8",
@@ -283,6 +313,16 @@ def postgres_migrate(
     # If pg_restore exits early, pg_dump may subsequently fail because
     # the stdout pipe was closed. Therefore report the restore error first.
     if restore.returncode != 0:
+        logger.error(
+            "Migration failed: "
+            "restore_rc=%s restore_stderr=%r "
+            "dump_rc=%s dump_stderr=%r",
+            restore.returncode,
+            restore_stderr_text,
+            dump_returncode,
+            dump_stderr_text,
+        )
+
         raise RuntimeError(
             "Postgres migration failed. "
             f"pg_restore returncode={restore.returncode}; "
@@ -292,6 +332,16 @@ def postgres_migrate(
         )
 
     if dump_returncode != 0:
+        logger.error(
+            "Migration failed: "
+            "dump_rc=%s dump_stderr=%r "
+            "restore_rc=%s restore_stderr=%r",
+            dump_returncode,
+            dump_stderr_text,
+            restore.returncode,
+            restore_stderr_text,
+        )
+
         raise RuntimeError(
             "Postgres migration failed. "
             f"pg_dump returncode={dump_returncode}; "
@@ -299,6 +349,12 @@ def postgres_migrate(
             f"pg_restore returncode={restore.returncode}; "
             f"pg_restore stderr={restore_stderr_text!r}"
         )
+
+    logger.info(
+        "Postgres migration completed successfully: %s -> %s",
+        source_slot,
+        destination_slot,
+    )
 
     return {
         "source": source_slot,
@@ -309,4 +365,3 @@ def postgres_migrate(
         "restore_stderr": restore_stderr_text,
         "dump_stderr": dump_stderr_text,
     }
-
