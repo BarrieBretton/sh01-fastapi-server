@@ -1,15 +1,67 @@
-# SH01 control plane - corrected final overlay
+# SH01 Control Plane Setup
 
-This overlay supersedes the earlier one-shot package. It is designed around the two Cloudflare Workers you actually run today:
+This document describes the **current paired Render-slot control-plane architecture**.
 
-- `https://n8n-prod-1.vivojaymail.workers.dev/` fronts the n8n Render ring.
-- `https://sh01.vivojaymail.workers.dev/` fronts the SH01/FastAPI Render ring.
+> Historical note: an earlier version modeled n8n and SH01 as independent Render rings. That model is obsolete. The authoritative model is now:
+>
+> ```text
+> render-a = [n8n-a, sh01-a]
+> render-b = [n8n-b, sh01-b]
+> ```
 
-The existing proxy/failover behavior of both Workers is preserved. The only routing additions are a preferred-backend control, maintenance mode, and KV persistence.
+The two Cloudflare Workers currently used are:
 
-## 1. Files to copy into the repo
+- `https://n8n-prod-1.vivojaymail.workers.dev/`
+- `https://sh01.vivojaymail.workers.dev/`
 
-Replace/add these files from this package:
+The Workers preserve their existing proxy/failover behavior while adding:
+
+- preferred-backend control,
+- maintenance mode,
+- KV-backed router state,
+- authenticated control endpoints.
+
+---
+
+## 1. Paired Render topology
+
+Current topology:
+
+```text
+render-a
+├── n8n-a   -> https://n8n-fbal.onrender.com
+└── sh01-a  -> https://sh01-fastapi-server.onrender.com
+
+render-b
+├── n8n-b   -> https://n8n-hbek.onrender.com
+└── sh01-b  -> https://sh01.onrender.com
+```
+
+Future slots follow the same pattern:
+
+```text
+render-c
+├── n8n-c
+└── sh01-c
+```
+
+The control plane stores a single active Render slot:
+
+```json
+{
+  "render": "render-a",
+  "postgres": "supabase-b",
+  "b2": "b2-a"
+}
+```
+
+The Render, Postgres, and B2 slot names are independent. `render-a` does not imply `supabase-a` or `b2-a`.
+
+---
+
+## 2. Repository files
+
+The control-plane implementation lives primarily in:
 
 ```text
 infra/models.py
@@ -20,53 +72,103 @@ infra/persistence.py
 infra/jobs.py
 infra/runtime_config.py
 infra/render_provider.py
+infra/postgres.py
 infra/b2ring.py
 infra/router_client.py
 infra/orchestrator.py
+
 infra_registry.example.json
+
 scripts/infra_smoke.ps1
-CONTROL_PLANE_SETUP.md
+
 cloudflare/n8n-prod-1-worker.js
 cloudflare/sh01-worker.js
 cloudflare/wrangler.n8n.example.jsonc
 cloudflare/wrangler.sh01.example.jsonc
 ```
 
-Keep your already-proven `infra/postgres.py` exactly as-is.
+`app.py` already includes `infra_router`.
 
-Your existing `app.py` already includes `infra_router`, so no app router change is required.
-
-## 2. Render rings are independent
-
-The registry remains flat for compatibility, but every Render slot has a role:
-
-```json
-"render-a": { "role": "n8n", ... },
-"render-b": { "role": "n8n", ... },
-"sh01-a":   { "role": "sh01", ... },
-"sh01-b":   { "role": "sh01", ... }
-```
-
-You can add `render-c`, `render-d`, `sh01-c`, etc. No A/B toggle is hardcoded. The next target is selected from the sorted slots for that role.
-
-Durable state becomes:
-
-```json
-{
-  "render": {
-    "n8n": "render-b",
-    "sh01": "sh01-a"
-  },
-  "postgres": "supabase-b",
-  "b2": "b2-a"
-}
-```
-
-For compatibility, an old persisted string value such as `"render": "render-a"` is automatically interpreted as the n8n Render slot.
+---
 
 ## 3. Master Render environment
 
-Keep the existing Postgres migration variables on Session Pooler port 5432:
+### Control-plane auth
+
+```text
+CONTROL_PLANE_API_KEY=<strong secret>
+```
+
+The `/infra/*` API uses:
+
+```text
+X-API-KEY: <CONTROL_PLANE_API_KEY>
+```
+
+### Bootstrap state
+
+Current bootstrap:
+
+```text
+ACTIVE_RENDER_SLOT=render-a
+ACTIVE_POSTGRES_SLOT=supabase-b
+ACTIVE_B2_SLOT=b2-a
+```
+
+These are only bootstrap/fallback values. Successful failovers persist durable state, which becomes authoritative across restarts.
+
+Legacy variables such as:
+
+```text
+ACTIVE_N8N_RENDER_SLOT
+ACTIVE_SH01_RENDER_SLOT
+```
+
+are obsolete for new configuration.
+
+---
+
+## 4. Render API configuration
+
+Use one Render account/workspace API key:
+
+```text
+RENDER_API_KEY=<rnd_...>
+```
+
+The current paired services use:
+
+```text
+RENDER_A_N8N_SERVICE_ID=<srv-...>
+RENDER_A_N8N_BASE_URL=https://n8n-fbal.onrender.com
+
+RENDER_A_SH01_SERVICE_ID=<srv-...>
+RENDER_A_SH01_BASE_URL=https://sh01-fastapi-server.onrender.com
+
+RENDER_B_N8N_SERVICE_ID=<srv-...>
+RENDER_B_N8N_BASE_URL=https://n8n-hbek.onrender.com
+
+RENDER_B_SH01_SERVICE_ID=<srv-...>
+RENDER_B_SH01_BASE_URL=https://sh01.onrender.com
+```
+
+The Render API key is account/workspace-scoped. It is not an n8n-specific or SH01-specific key.
+
+The control plane needs permission to:
+
+- inspect services,
+- read/update service environment variables,
+- suspend/resume services,
+- trigger deploys,
+- inspect deploy status.
+
+The control plane never rewrites `N8N_ENCRYPTION_KEY`; keep the same encryption key on all n8n slots.
+
+---
+
+## 5. Supabase/Postgres configuration
+
+The control plane uses port `5432` for migration/control-plane access:
 
 ```text
 SUPABASE_A_HOST=...
@@ -82,45 +184,32 @@ SUPABASE_B_DB=postgres
 SUPABASE_B_PASSWORD=...
 ```
 
-The registry uses `runtime_port: 6543` when configuring n8n itself, so n8n continues to use the Supabase Transaction Pooler.
-
-### n8n Render slots
+The n8n runtime uses Supabase's transaction-pooler port:
 
 ```text
-RENDER_A_API_KEY=...
-RENDER_A_SERVICE_ID=srv-...
-RENDER_A_BASE_URL=https://n8n-fbal.onrender.com
-
-RENDER_B_API_KEY=...
-RENDER_B_SERVICE_ID=srv-...
-RENDER_B_BASE_URL=https://n8n-hbek.onrender.com
+6543
 ```
 
-Add more slots by adding more registry entries and corresponding env pointers.
+This is represented in the registry as:
 
-The Render API key needs permission to read the service, add/update service env vars, suspend/resume the service, and trigger/read deploys.
+```json
+"runtime_port": 6543
+```
 
-The control plane updates only the DB/B2 variables listed in the registry maps. It never updates `N8N_ENCRYPTION_KEY`; the same encryption key must remain on every n8n Render slot.
-
-### SH01 Render slots
-
-Add service IDs/API keys/base URLs for the SH01 backends you want visible to the control plane:
+So:
 
 ```text
-SH01_A_API_KEY=...
-SH01_A_SERVICE_ID=srv-...
-SH01_A_BASE_URL=https://sh01-fastapi-server.onrender.com
-
-SH01_B_API_KEY=...
-SH01_B_SERVICE_ID=srv-...
-SH01_B_BASE_URL=https://sh01.onrender.com
+migration/control-plane connection -> 5432
+n8n runtime connection             -> 6543
 ```
 
-The n8n stack failover endpoint does not modify or cut over the SH01 ring. SH01 is modeled separately so it can be monitored/control-routed without accidentally coupling it to n8n.
+The current Postgres migration logic covers the `public` schema.
 
-### B2 slots
+---
 
-Your existing account can remain `b2-a`:
+## 6. Backblaze B2 configuration
+
+Current B2 A slot:
 
 ```text
 BACKBLAZE_KEY_ID=...
@@ -128,7 +217,7 @@ BACKBLAZE_APPLICATION_KEY=...
 BACKBLAZE_BUCKET_NAME=...
 ```
 
-Second account/bucket:
+A future B2 B slot may use:
 
 ```text
 B2_B_KEY_ID=...
@@ -136,50 +225,89 @@ B2_B_APPLICATION_KEY=...
 B2_B_BUCKET_NAME=...
 ```
 
-For mirroring, source credentials need list/read; destination needs list/read/write. `prune_extra=true` additionally needs delete.
+Do not register a B2 slot in `INFRA_REGISTRY_JSON` until its required env vars actually exist.
 
-### Durable startup defaults
+For mirroring:
 
 ```text
-ACTIVE_N8N_RENDER_SLOT=render-a
-ACTIVE_SH01_RENDER_SLOT=sh01-a
-ACTIVE_POSTGRES_SLOT=supabase-b
-ACTIVE_B2_SLOT=b2-a
+source      -> list/read
+destination -> list/read/write
 ```
 
-`ACTIVE_RENDER_SLOT` is still accepted as a backward-compatible fallback for the n8n role.
+If `prune_extra=true` is used, destination delete permission is also required.
 
-## 4. INFRA_REGISTRY_JSON
+`prune_extra` is destructive.
 
-Use `infra_registry.example.json` as the shape and map the env pointer names to your actual variables.
+---
 
-The registry contains env-variable names, not secret values.
+## 7. Cloudflare router control
 
-## 5. Upgrade the existing n8n Cloudflare Worker
+### n8n Worker
 
-Do not replace its failover engine with a generic proxy. Use `cloudflare/n8n-prod-1-worker.js`, which is your existing implementation plus the control layer.
+Worker:
 
-Keep Worker var `BACKENDS` as a comma-separated list of every trusted n8n Render origin:
+```text
+https://n8n-prod-1.vivojaymail.workers.dev
+```
+
+Normal variable:
 
 ```text
 BACKENDS=https://n8n-fbal.onrender.com,https://n8n-hbek.onrender.com
 ```
 
-You can add C/D/E later by appending them.
-
-Create/bind a Workers KV namespace as:
-
-```text
-ROUTER_STATE
-```
-
-Set Worker secret:
+Secret:
 
 ```text
 ROUTER_CONTROL_KEY=<strong random secret>
 ```
 
-The new protected endpoints are:
+Dedicated KV namespace bound as:
+
+```text
+ROUTER_STATE
+```
+
+### SH01 Worker
+
+Worker:
+
+```text
+https://sh01.vivojaymail.workers.dev
+```
+
+Normal variables:
+
+```text
+BACKENDS=https://sh01-fastapi-server.onrender.com,https://sh01.onrender.com
+TIMEOUT_MS=90000
+```
+
+Secret:
+
+```text
+ROUTER_CONTROL_KEY=<different strong random secret>
+```
+
+Dedicated KV namespace bound as:
+
+```text
+ROUTER_STATE
+```
+
+Use separate KV namespaces for the two Workers.
+
+### Master router-control env vars
+
+```text
+N8N_ROUTER_CONTROL_BASE_URL=https://n8n-prod-1.vivojaymail.workers.dev
+N8N_ROUTER_CONTROL_KEY=<same secret as n8n Worker>
+
+SH01_ROUTER_CONTROL_BASE_URL=https://sh01.vivojaymail.workers.dev
+SH01_ROUTER_CONTROL_KEY=<same secret as SH01 Worker>
+```
+
+The Worker control endpoints are:
 
 ```text
 GET  /__control/status
@@ -187,131 +315,301 @@ POST /__control/preferred
 POST /__control/maintenance
 ```
 
-`POST /__control/preferred` accepts only an origin already present in `BACKENDS`. It cannot turn the Worker into an arbitrary proxy.
+`POST /__control/preferred` only accepts a backend already present in `BACKENDS`.
 
-Example payload:
+---
+
+## 8. `INFRA_REGISTRY_JSON`
+
+The registry stores **env-var names**, not secret values.
+
+Current shape:
 
 ```json
-{"backend":"https://n8n-hbek.onrender.com"}
+{
+  "render": {
+    "render-a": {
+      "api_key_env": "RENDER_API_KEY",
+      "n8n": {
+        "service_id_env": "RENDER_A_N8N_SERVICE_ID",
+        "base_url_env": "RENDER_A_N8N_BASE_URL",
+        "health_path": "/healthz/readiness"
+      },
+      "sh01": {
+        "service_id_env": "RENDER_A_SH01_SERVICE_ID",
+        "base_url_env": "RENDER_A_SH01_BASE_URL",
+        "health_path": "/"
+      }
+    },
+    "render-b": {
+      "api_key_env": "RENDER_API_KEY",
+      "n8n": {
+        "service_id_env": "RENDER_B_N8N_SERVICE_ID",
+        "base_url_env": "RENDER_B_N8N_BASE_URL",
+        "health_path": "/healthz/readiness"
+      },
+      "sh01": {
+        "service_id_env": "RENDER_B_SH01_SERVICE_ID",
+        "base_url_env": "RENDER_B_SH01_BASE_URL",
+        "health_path": "/"
+      }
+    }
+  },
+  "postgres": {
+    "supabase-a": {
+      "host_env": "SUPABASE_A_HOST",
+      "port_env": "SUPABASE_A_PORT",
+      "user_env": "SUPABASE_A_USER",
+      "database_env": "SUPABASE_A_DB",
+      "password_env": "SUPABASE_A_PASSWORD",
+      "runtime_port": 6543
+    },
+    "supabase-b": {
+      "host_env": "SUPABASE_B_HOST",
+      "port_env": "SUPABASE_B_PORT",
+      "user_env": "SUPABASE_B_USER",
+      "database_env": "SUPABASE_B_DB",
+      "password_env": "SUPABASE_B_PASSWORD",
+      "runtime_port": 6543
+    }
+  },
+  "b2": {
+    "b2-a": {
+      "key_id_env": "BACKBLAZE_KEY_ID",
+      "application_key_env": "BACKBLAZE_APPLICATION_KEY",
+      "bucket_name_env": "BACKBLAZE_BUCKET_NAME"
+    }
+  }
+}
 ```
 
-The effective proxy order becomes the preferred backend first, followed by every other configured backend in its original order. All original Render suspension detection, retry statuses, body replay, headers, and 30-second timeout remain.
+In the Render dashboard, store raw JSON directly. Do not surround the value with literal single quotes.
 
-Maintenance mode deliberately returns HTTP 503 for normal n8n traffic. The orchestrator uses this while suspending the active n8n writer and copying Postgres, preventing the Worker's normal failover behavior from sending writes to a stale standby during migration.
+---
 
-## 6. Upgrade the existing SH01 Cloudflare Worker
+## 9. Adding a new paired Render slot
 
-Use `cloudflare/sh01-worker.js`.
+Example: `render-c`.
 
-It preserves the SH01-specific behavior you already have, including `TIMEOUT_MS`, `x-forwarded-host`, and `x-failover-attempts`, while adding the same protected preferred/maintenance control contract.
-
-Use a separate KV namespace for SH01. Both namespaces may use the binding name `ROUTER_STATE` because they belong to different Worker deployments.
-
-Set its own secret `ROUTER_CONTROL_KEY`.
-
-## 7. Master router-control variables
-
-On the master Render service:
+Create:
 
 ```text
-N8N_ROUTER_CONTROL_BASE_URL=https://n8n-prod-1.vivojaymail.workers.dev
-N8N_ROUTER_CONTROL_KEY=<n8n Worker secret>
-
-SH01_ROUTER_CONTROL_BASE_URL=https://sh01.vivojaymail.workers.dev
-SH01_ROUTER_CONTROL_KEY=<sh01 Worker secret>
+n8n-c
+sh01-c
 ```
 
-The legacy `ROUTER_CONTROL_BASE_URL` / `ROUTER_CONTROL_KEY` are accepted only as n8n fallbacks so the first package does not immediately break, but migrate to the role-specific variables above.
+Add:
 
-## 8. Safe n8n failover sequence
+```text
+RENDER_C_N8N_SERVICE_ID=<srv-...>
+RENDER_C_N8N_BASE_URL=https://<n8n-c>.onrender.com
 
-A live `/infra/failover` performs:
+RENDER_C_SH01_SERVICE_ID=<srv-...>
+RENDER_C_SH01_BASE_URL=https://<sh01-c>.onrender.com
+```
+
+Add to the registry:
+
+```json
+"render-c": {
+  "api_key_env": "RENDER_API_KEY",
+  "n8n": {
+    "service_id_env": "RENDER_C_N8N_SERVICE_ID",
+    "base_url_env": "RENDER_C_N8N_BASE_URL",
+    "health_path": "/healthz/readiness"
+  },
+  "sh01": {
+    "service_id_env": "RENDER_C_SH01_SERVICE_ID",
+    "base_url_env": "RENDER_C_SH01_BASE_URL",
+    "health_path": "/"
+  }
+}
+```
+
+Append the new n8n origin to the n8n Worker's `BACKENDS`.
+
+Append the new SH01 origin to the SH01 Worker's `BACKENDS`.
+
+No code change should be required.
+
+---
+
+## 10. Adding a new Supabase/Postgres slot
+
+Example: `supabase-c`.
+
+Add:
+
+```text
+SUPABASE_C_HOST=...
+SUPABASE_C_PORT=5432
+SUPABASE_C_USER=...
+SUPABASE_C_DB=postgres
+SUPABASE_C_PASSWORD=...
+```
+
+Registry:
+
+```json
+"supabase-c": {
+  "host_env": "SUPABASE_C_HOST",
+  "port_env": "SUPABASE_C_PORT",
+  "user_env": "SUPABASE_C_USER",
+  "database_env": "SUPABASE_C_DB",
+  "password_env": "SUPABASE_C_PASSWORD",
+  "runtime_port": 6543
+}
+```
+
+Then redeploy/restart the master and run the non-destructive smoke test.
+
+---
+
+## 11. Adding a new B2 slot
+
+Example: `b2-c`.
+
+Add:
+
+```text
+B2_C_KEY_ID=...
+B2_C_APPLICATION_KEY=...
+B2_C_BUCKET_NAME=...
+```
+
+Registry:
+
+```json
+"b2-c": {
+  "key_id_env": "B2_C_KEY_ID",
+  "application_key_env": "B2_C_APPLICATION_KEY",
+  "bucket_name_env": "B2_C_BUCKET_NAME"
+}
+```
+
+Validate permissions before live sync/failover.
+
+---
+
+## 12. Paired failover sequence
+
+A live paired failover performs:
 
 ```text
 preflight
+-> verify source/target Postgres
+-> snapshot all n8n and SH01 Render service states
+-> snapshot target runtime env
+-> verify both Cloudflare router-control states
+-> refuse to start if either router is already in maintenance
 -> n8n Worker maintenance ON
--> snapshot all registered n8n Render service states
--> suspend EVERY currently running n8n Render service
--> verify zero registered n8n writers remain running
--> transactional Postgres public-schema migration
--> exact table-set and row-count comparison
--> B2 compare/mirror if configured
--> update target n8n DB runtime to target Supabase transaction pooler :6543
--> update target n8n B2 runtime if configured
--> resume target n8n Render service if suspended
--> deploy target n8n
--> wait for target /healthz/readiness
--> set n8n Worker preferred backend to target
--> persist durable active state while ingress is still frozen
--> n8n Worker maintenance OFF LAST
+-> SH01 Worker maintenance ON
+-> suspend every running n8n Render service
+-> verify zero registered n8n services remain running
+-> suspend every running SH01 Render service
+-> verify zero registered SH01 services remain running
+-> migrate/compare Postgres if changing DB slot
+-> compare/mirror B2 if configured
+-> configure target n8n DB/B2 runtime
+-> configure target SH01 B2 runtime
+-> resume/deploy/health-check target n8n
+-> resume/deploy/health-check target SH01
+-> set n8n Worker preferred backend to target n8n
+-> set SH01 Worker preferred backend to target SH01
+-> persist durable active Render/Postgres/B2 state
+-> n8n Worker maintenance OFF
+-> SH01 Worker maintenance OFF
 ```
 
-If the job fails after ingress is frozen, rollback restores the exact pre-failover n8n Render running/suspended topology, restores the old preferred backend, and disables maintenance. Any target that was started by the failed cutover but was previously suspended is suspended again. Durable active state is not committed until the entire cutover succeeds.
+Both public entry points remain in maintenance until state and routing are committed.
 
-Only one full failover can run at a time in the process.
+Changing paired Render slots requires `switch_router=true`.
 
-## 9. Deploy the repo overlay
+Changing Postgres slots requires `quiesce_source=true`.
 
-After copying the corrected package into your existing working tree:
+---
+
+## 13. Rollback sequence
+
+On failure, rollback attempts to:
+
+```text
+both Workers maintenance ON
+-> suspend currently-running n8n + SH01 services
+-> restore target n8n env
+-> restore target SH01 env
+-> redeploy restored target services when required
+-> restore exact pre-failover n8n running/suspended topology
+-> restore exact pre-failover SH01 running/suspended topology
+-> restore both Worker preferred backends
+-> restore durable state if changed
+-> both Workers maintenance OFF
+```
+
+---
+
+## 14. Validation
+
+Set:
 
 ```powershell
-git status
-git diff
+$BASE = "https://sh01-fastapi-server-mtwu.onrender.com"
+$KEY = "<CONTROL_PLANE_API_KEY>"
 ```
 
-Then stage the complete control-plane change:
+Health:
 
 ```powershell
-git add `
-  infra/models.py `
-  infra/routes.py `
-  infra/state.py `
-  infra/registry.py `
-  infra/persistence.py `
-  infra/jobs.py `
-  infra/runtime_config.py `
-  infra/render_provider.py `
-  infra/b2ring.py `
-  infra/router_client.py `
-  infra/orchestrator.py `
-  infra_registry.example.json `
-  scripts/infra_smoke.ps1 `
-  CONTROL_PLANE_SETUP.md `
-  cloudflare/n8n-prod-1-worker.js `
-  cloudflare/sh01-worker.js `
-  cloudflare/wrangler.n8n.example.jsonc `
-  cloudflare/wrangler.sh01.example.jsonc
-
-git diff --cached
-git commit -m "feat: complete resilient infrastructure control plane"
-git push
+Invoke-RestMethod `
+  -Method GET `
+  -Uri "$BASE/infra/health" `
+  -Headers @{ "X-API-KEY" = $KEY } |
+  ConvertTo-Json -Depth 20
 ```
 
-The Cloudflare dashboard Worker code/KV/secret changes are deployed separately from the GitHub repo unless you already deploy those Workers with Wrangler.
+Status:
 
-## 10. Comprehensive non-destructive test
+```powershell
+Invoke-RestMethod `
+  -Method GET `
+  -Uri "$BASE/infra/status" `
+  -Headers @{ "X-API-KEY" = $KEY } |
+  ConvertTo-Json -Depth 20
+```
 
-After the master deploys and both Workers are upgraded:
+n8n router:
+
+```powershell
+Invoke-RestMethod `
+  -Method GET `
+  -Uri "$BASE/infra/router/n8n/status" `
+  -Headers @{ "X-API-KEY" = $KEY } |
+  ConvertTo-Json -Depth 20
+```
+
+SH01 router:
+
+```powershell
+Invoke-RestMethod `
+  -Method GET `
+  -Uri "$BASE/infra/router/sh01/status" `
+  -Headers @{ "X-API-KEY" = $KEY } |
+  ConvertTo-Json -Depth 20
+```
+
+---
+
+## 15. Smoke test
+
+Non-destructive:
 
 ```powershell
 .\scripts\infra_smoke.ps1 -Base $BASE -Key $KEY
 ```
 
-It checks:
+Do not run live failover until this output has been reviewed.
 
-- control-plane state
-- every Postgres slot
-- n8n and SH01 Render rings
-- every B2 slot
-- n8n router KV/control state
-- SH01 router control state when configured
-- full failover plan without executing it
-
-Suspended standby Render slots may fail direct health and are warnings rather than test failures.
-
-## 11. Full live test
-
-When the dry run is correct:
+Live test, only after validation:
 
 ```powershell
 .\scripts\infra_smoke.ps1 `
@@ -321,53 +619,34 @@ When the dry run is correct:
   -SyncB2
 ```
 
-Do not add `-PruneB2Extra` unless destination-only B2 objects should actually be permanently deleted.
+Do not add `-PruneB2Extra` unless destination-only B2 objects are intentionally disposable.
 
-During the Postgres migration the public n8n Worker intentionally serves maintenance 503s, because allowing writes during a database snapshot would make an exact cutover unsafe.
+---
 
-## 12. Useful API calls
+## 16. Security
 
-Current state:
+Never commit real values for:
 
-```powershell
-Invoke-RestMethod -Method GET -Uri "$BASE/infra/status" -Headers @{ "X-API-KEY" = $KEY } | ConvertTo-Json -Depth 20
+```text
+CONTROL_PLANE_API_KEY
+RENDER_API_KEY
+N8N_ROUTER_CONTROL_KEY
+SH01_ROUTER_CONTROL_KEY
+SUPABASE_*_PASSWORD
+BACKBLAZE_APPLICATION_KEY
+B2_*_APPLICATION_KEY
 ```
 
-n8n router:
+Cloudflare `ROUTER_CONTROL_KEY` must be a Worker Secret.
 
-```powershell
-Invoke-RestMethod -Method GET -Uri "$BASE/infra/router/n8n/status" -Headers @{ "X-API-KEY" = $KEY } | ConvertTo-Json -Depth 20
-```
+---
 
-SH01 router:
+## 17. Known limitations
 
-```powershell
-Invoke-RestMethod -Method GET -Uri "$BASE/infra/router/sh01/status" -Headers @{ "X-API-KEY" = $KEY } | ConvertTo-Json -Depth 20
-```
-
-Dry-run next n8n stack hop:
-
-```powershell
-$body = @{
-  sync_b2 = $true
-  prune_b2_extra = $false
-  switch_router = $true
-  quiesce_source = $true
-  dry_run = $true
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-  -Method POST `
-  -Uri "$BASE/infra/failover" `
-  -Headers @{ "X-API-KEY" = $KEY } `
-  -ContentType "application/json" `
-  -Body $body | ConvertTo-Json -Depth 30
-```
-
-A live request returns a job ID. Poll `/infra/jobs/{job_id}`.
-
-## 13. Boundaries / known separate issue
-
-The stale Redis cron-master hostname in `app.py` is separate from this control plane. This overlay does not change it.
-
-The Postgres migration still copies the `public` schema only, matching the migration you already proved. If you later depend on additional Supabase-managed schemas, define a separate migration policy before assuming they move with this failover.
+- `_FAILOVER_LOCK` is process-local, not distributed.
+- Workers KV is eventually consistent.
+- Postgres migration currently targets the `public` schema.
+- `prune_extra` is destructive.
+- SH01 direct health currently depends on `/` returning 2xx.
+- The target n8n service may begin workloads once resumed/deployed before public cutover.
+- Multi-process control-plane deployment would require stronger distributed locking/state coordination.
