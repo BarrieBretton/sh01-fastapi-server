@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Literal
 from dotenv import load_dotenv
 from image_templating import router as image_templating_router
+from infra.routes import router as infra_router
 
 # Add this import at the top with other imports
 from sheets_helper import (
@@ -304,7 +305,7 @@ class VideoToFBResponse(BaseModel):
 
 app = FastAPI(title="Python Server - SideHustle-01", version="2.2")
 app.include_router(image_templating_router, prefix="/img")
-
+app.include_router(infra_router)
 
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
