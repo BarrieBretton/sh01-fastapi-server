@@ -268,6 +268,16 @@ def postgres_migrate(
         destination_slot,
     )
 
+    destination_table_count = postgres_public_table_count(
+        destination_slot
+    )
+
+    logger.info(
+        "Destination %s currently has %s public tables",
+        destination_slot,
+        destination_table_count,
+    )
+
     dump = subprocess.Popen(
         [
             "pg_dump",
@@ -291,16 +301,6 @@ def postgres_migrate(
     )
 
     assert dump.stdout is not None
-
-    destination_table_count = postgres_public_table_count(
-        destination_slot
-    )
-
-    logger.info(
-        "Destination %s currently has %s public tables",
-        destination_slot,
-        destination_table_count,
-    )
 
     restore_command = [
         "pg_restore",
