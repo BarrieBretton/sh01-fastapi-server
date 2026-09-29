@@ -117,6 +117,39 @@ def postgres_verify(
         "PGPASSWORD": db.password,
     }
 
+    sql = r"""
+    WITH public_tables AS (
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+    ),
+    key_tables AS (
+        SELECT
+            t.table_name,
+            CASE
+                WHEN to_regclass('public."' || t.table_name || '"') IS NOT NULL
+                    THEN true
+                ELSE false
+            END AS exists
+        FROM (
+            VALUES
+                ('workflow_entity'),
+                ('credentials_entity'),
+                ('execution_entity')
+        ) AS t(table_name)
+    )
+    SELECT json_build_object(
+        'public_table_count',
+        (SELECT COUNT(*) FROM public_tables),
+        'key_tables',
+        (
+            SELECT json_object_agg(table_name, exists)
+            FROM key_tables
+        )
+    );
+    """
+
     result = subprocess.run(
         [
             "psql",
@@ -126,12 +159,8 @@ def postgres_verify(
             "--dbname", db.database,
             "--no-password",
             "--tuples-only",
-            "--command",
-            """
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = 'public';
-            """,
+            "--no-align",
+            "--command", sql,
         ],
         env=env,
         capture_output=True,
@@ -145,11 +174,20 @@ def postgres_verify(
             f"{result.stderr.strip()}"
         )
 
+    import json
+
+    raw = result.stdout.strip()
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Could not parse verification output for {slot}: {raw}"
+        ) from exc
+
     return {
         "slot": slot,
-        "public_table_count": int(
-            result.stdout.strip() or 0
-        ),
+        **payload,
     }
 
 
