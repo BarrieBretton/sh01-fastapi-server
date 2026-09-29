@@ -1,0 +1,62 @@
+{
+  "render": {
+    "render-a": {
+      "role": "n8n",
+      "service_id_env": "RENDER_A_SERVICE_ID",
+      "api_key_env": "RENDER_A_API_KEY",
+      "base_url_env": "RENDER_A_BASE_URL",
+      "health_path": "/healthz/readiness"
+    },
+    "render-b": {
+      "role": "n8n",
+      "service_id_env": "RENDER_B_SERVICE_ID",
+      "api_key_env": "RENDER_B_API_KEY",
+      "base_url_env": "RENDER_B_BASE_URL",
+      "health_path": "/healthz/readiness"
+    },
+    "sh01-a": {
+      "role": "sh01",
+      "service_id_env": "SH01_A_SERVICE_ID",
+      "api_key_env": "SH01_A_API_KEY",
+      "base_url_env": "SH01_A_BASE_URL",
+      "health_path": "/"
+    },
+    "sh01-b": {
+      "role": "sh01",
+      "service_id_env": "SH01_B_SERVICE_ID",
+      "api_key_env": "SH01_B_API_KEY",
+      "base_url_env": "SH01_B_BASE_URL",
+      "health_path": "/"
+    }
+  },
+  "postgres": {
+    "supabase-a": {
+      "host_env": "SUPABASE_A_HOST",
+      "port_env": "SUPABASE_A_PORT",
+      "user_env": "SUPABASE_A_USER",
+      "database_env": "SUPABASE_A_DB",
+      "password_env": "SUPABASE_A_PASSWORD",
+      "runtime_port": 6543
+    },
+    "supabase-b": {
+      "host_env": "SUPABASE_B_HOST",
+      "port_env": "SUPABASE_B_PORT",
+      "user_env": "SUPABASE_B_USER",
+      "database_env": "SUPABASE_B_DB",
+      "password_env": "SUPABASE_B_PASSWORD",
+      "runtime_port": 6543
+    }
+  },
+  "b2": {
+    "b2-a": {
+      "key_id_env": "BACKBLAZE_KEY_ID",
+      "application_key_env": "BACKBLAZE_APPLICATION_KEY",
+      "bucket_name_env": "BACKBLAZE_BUCKET_NAME"
+    },
+    "b2-b": {
+      "key_id_env": "B2_B_KEY_ID",
+      "application_key_env": "B2_B_APPLICATION_KEY",
+      "bucket_name_env": "B2_B_BUCKET_NAME"
+    }
+  }
+}

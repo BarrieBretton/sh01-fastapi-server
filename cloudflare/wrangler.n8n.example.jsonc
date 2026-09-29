@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "n8n-prod-1",
+  "main": "n8n-prod-1-worker.js",
+  "compatibility_date": "2026-09-29",
+  "vars": {
+    "BACKENDS": "https://n8n-fbal.onrender.com,https://n8n-hbek.onrender.com"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "ROUTER_STATE",
+      "id": "YOUR_N8N_ROUTER_KV_NAMESPACE_ID"
+    }
+  ]
+}

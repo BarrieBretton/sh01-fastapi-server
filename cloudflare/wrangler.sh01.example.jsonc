@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sh01",
+  "main": "sh01-worker.js",
+  "compatibility_date": "2026-09-29",
+  "vars": {
+    "BACKENDS": "https://sh01-fastapi-server.onrender.com,https://sh01.onrender.com",
+    "TIMEOUT_MS": "90000"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "ROUTER_STATE",
+      "id": "YOUR_SH01_ROUTER_KV_NAMESPACE_ID"
+    }
+  ]
+}
