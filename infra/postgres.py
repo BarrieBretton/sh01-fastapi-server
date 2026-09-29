@@ -249,6 +249,7 @@ def postgres_migrate(
             "--no-owner",
             "--no-privileges",
             "--exit-on-error",
+            "--verbose",
         ],
         stdin=dump.stdout,
         stdout=subprocess.PIPE,
@@ -258,29 +259,45 @@ def postgres_migrate(
 
     dump.stdout.close()
 
-    restore_stdout, restore_stderr = (
-        restore.communicate()
-    )
+    restore_stdout, restore_stderr = restore.communicate()
 
     dump_stderr = dump.stderr.read() if dump.stderr else b""
     dump_returncode = dump.wait()
 
-    if dump_returncode != 0:
-        raise RuntimeError(
-            "pg_dump failed: "
-            + dump_stderr.decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
+    restore_stdout_text = restore_stdout.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
 
+    restore_stderr_text = restore_stderr.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
+    dump_stderr_text = dump_stderr.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
+    # IMPORTANT:
+    # If pg_restore exits early, pg_dump may subsequently fail because
+    # the stdout pipe was closed. Therefore report the restore error first.
     if restore.returncode != 0:
         raise RuntimeError(
-            "pg_restore failed: "
-            + restore_stderr.decode(
-                "utf-8",
-                errors="replace",
-            )
+            "Postgres migration failed. "
+            f"pg_restore returncode={restore.returncode}; "
+            f"pg_restore stderr={restore_stderr_text!r}; "
+            f"pg_dump returncode={dump_returncode}; "
+            f"pg_dump stderr={dump_stderr_text!r}"
+        )
+
+    if dump_returncode != 0:
+        raise RuntimeError(
+            "Postgres migration failed. "
+            f"pg_dump returncode={dump_returncode}; "
+            f"pg_dump stderr={dump_stderr_text!r}; "
+            f"pg_restore returncode={restore.returncode}; "
+            f"pg_restore stderr={restore_stderr_text!r}"
         )
 
     return {
@@ -288,12 +305,8 @@ def postgres_migrate(
         "destination": destination_slot,
         "dump_returncode": dump_returncode,
         "restore_returncode": restore.returncode,
-        "restore_stdout": restore_stdout.decode(
-            "utf-8",
-            errors="replace",
-        ).strip(),
-        "restore_stderr": restore_stderr.decode(
-            "utf-8",
-            errors="replace",
-        ).strip(),
+        "restore_stdout": restore_stdout_text,
+        "restore_stderr": restore_stderr_text,
+        "dump_stderr": dump_stderr_text,
     }
+
