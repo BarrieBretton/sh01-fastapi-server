@@ -12,6 +12,7 @@ RUN apt-get update && \
         g++ \
         curl \
         ffmpeg \
+        postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip setuptools wheel
