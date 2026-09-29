@@ -193,6 +193,48 @@ def postgres_verify(
     }
 
 
+def postgres_public_table_count(
+    slot: str,
+) -> int:
+    db = get_postgres_config(slot)
+
+    env = {
+        **os.environ,
+        "PGPASSWORD": db.password,
+    }
+
+    result = subprocess.run(
+        [
+            "psql",
+            "--host", db.host,
+            "--port", str(db.port),
+            "--username", db.user,
+            "--dbname", db.database,
+            "--no-password",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE';
+            """,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not inspect destination database {slot}: "
+            f"{result.stderr.strip()}"
+        )
+
+    return int(result.stdout.strip() or 0)
+
 def postgres_migrate(
     source_slot: str,
     destination_slot: str,
@@ -250,20 +292,43 @@ def postgres_migrate(
 
     assert dump.stdout is not None
 
-    restore = subprocess.Popen(
-        [
-            "pg_restore",
-            "--host", destination.host,
-            "--port", str(destination.port),
-            "--username", destination.user,
-            "--dbname", destination.database,
+    destination_table_count = postgres_public_table_count(
+        destination_slot
+    )
+
+    logger.info(
+        "Destination %s currently has %s public tables",
+        destination_slot,
+        destination_table_count,
+    )
+
+    restore_command = [
+        "pg_restore",
+        "--host", destination.host,
+        "--port", str(destination.port),
+        "--username", destination.user,
+        "--dbname", destination.database,
+        "--no-owner",
+        "--no-privileges",
+        "--exit-on-error",
+        "--verbose",
+    ]
+
+    # An empty destination must not use --clean because archive cleanup
+    # can reference parent relations that do not exist yet.
+    if destination_table_count > 0:
+        restore_command.extend([
             "--clean",
             "--if-exists",
-            "--no-owner",
-            "--no-privileges",
-            "--exit-on-error",
-            "--verbose",
-        ],
+        ])
+
+    logger.info(
+        "pg_restore clean mode=%s",
+        destination_table_count > 0,
+    )
+
+    restore = subprocess.Popen(
+        restore_command,
         stdin=dump.stdout,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
