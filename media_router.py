@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import ipaddress
@@ -113,13 +113,13 @@ async def _download_public_image(url: str, destination: Path) -> None:
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     if not location:
-                        raise HTTPException(status_code=502, detail="Image redirect had no Location header")
+                        raise HTTPException(status_code=424, detail="Image redirect had no Location header")
                     current = urljoin(current, location)
                     continue
 
                 if response.status_code >= 400:
                     raise HTTPException(
-                        status_code=502,
+                        status_code=424,
                         detail=f"Image download failed with HTTP {response.status_code}",
                     )
 
@@ -151,11 +151,11 @@ async def _telegram_file_path(file_id: str) -> str:
         response = await client.get(url, params={"file_id": file_id})
 
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Telegram getFile failed: HTTP {response.status_code}")
+        raise HTTPException(status_code=424, detail=f"Telegram getFile failed: HTTP {response.status_code}")
 
     payload = response.json()
     if not payload.get("ok") or not payload.get("result", {}).get("file_path"):
-        raise HTTPException(status_code=502, detail=f"Telegram getFile failed: {payload}")
+        raise HTTPException(status_code=424, detail=f"Telegram getFile failed: {payload}")
     return str(payload["result"]["file_path"])
 
 
@@ -167,7 +167,7 @@ async def _download_telegram_audio(file_id: str, destination: Path) -> None:
         async with client.stream("GET", url) as response:
             if response.status_code >= 400:
                 raise HTTPException(
-                    status_code=502,
+                    status_code=424,
                     detail=f"Telegram file download failed: HTTP {response.status_code}",
                 )
             total = 0
@@ -329,3 +329,4 @@ async def delete_rendered_video(
     except Exception as exc:
         logger.exception("Rendered-media delete failed token=%s", token)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
