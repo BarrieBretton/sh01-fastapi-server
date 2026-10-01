@@ -692,7 +692,7 @@ def _run_ffmpeg(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=1800,
+            timeout=7200,
             check=False,
         )
 
