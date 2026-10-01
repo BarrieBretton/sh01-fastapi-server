@@ -2,10 +2,11 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sh01",
   "main": "sh01-worker.js",
-  "compatibility_date": "2026-09-29",
+  "compatibility_date": "2026-10-02",
   "vars": {
     "BACKENDS": "https://sh01-fastapi-server.onrender.com,https://sh01.onrender.com",
-    "TIMEOUT_MS": "90000"
+    "TIMEOUT_MS": "90000",
+    "ALLOW_FALLBACK": "false"
   },
   "kv_namespaces": [
     {

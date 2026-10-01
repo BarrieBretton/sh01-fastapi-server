@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "infra-sla-watchdog",
+  "main": "infra-sla-watchdog-worker.js",
+  "compatibility_date": "2026-10-02",
+  "triggers": {
+    "crons": ["*/2 * * * *"]
+  },
+  "vars": {
+    "CONTROL_PLANE_BASE_URL": "https://sh01-fastapi-server-mtwu.onrender.com"
+  }
+}

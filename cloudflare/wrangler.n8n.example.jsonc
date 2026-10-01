@@ -2,9 +2,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "n8n-prod-1",
   "main": "n8n-prod-1-worker.js",
-  "compatibility_date": "2026-09-29",
+  "compatibility_date": "2026-10-02",
   "vars": {
-    "BACKENDS": "https://n8n-fbal.onrender.com,https://n8n-hbek.onrender.com"
+    "BACKENDS": "https://n8n-fbal.onrender.com,https://n8n-hbek.onrender.com",
+    "ALLOW_FALLBACK": "false"
   },
   "kv_namespaces": [
     {

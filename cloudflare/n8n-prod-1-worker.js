@@ -22,10 +22,13 @@ function configuredBackends(env) {
     .split(",")
     .map(normalizeOrigin)
     .filter(Boolean);
-
   return fromEnv.length
     ? [...new Set(fromEnv)]
     : ["https://n8n-fbal.onrender.com", "https://n8n-hbek.onrender.com"];
+}
+
+function allowFallback(env) {
+  return String(env?.ALLOW_FALLBACK || "false").trim().toLowerCase() === "true";
 }
 
 function authorized(request, env) {
@@ -62,17 +65,23 @@ async function saveControlState(env, state) {
   return payload;
 }
 
-function effectiveOrder(configured, preferred) {
-  if (!preferred || !configured.includes(preferred)) return [...configured];
-  return [preferred, ...configured.filter((x) => x !== preferred)];
+function effectiveOrder(configured, preferred, fallback) {
+  if (preferred && configured.includes(preferred)) {
+    return fallback
+      ? [preferred, ...configured.filter((x) => x !== preferred)]
+      : [preferred];
+  }
+  if (!configured.length) return [];
+  return fallback ? [...configured] : [configured[0]];
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const configured = configuredBackends(env);
     const control = await loadControlState(env);
-    const targets = effectiveOrder(configured, control.preferred);
+    const fallback = allowFallback(env);
+    const targets = effectiveOrder(configured, control.preferred, fallback);
 
     if (url.pathname === "/__control/status") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
@@ -82,6 +91,7 @@ export default {
         configured,
         preferred: control.preferred,
         effective_order: targets,
+        allow_fallback: fallback,
         maintenance: control.maintenance,
         updated_at: control.updated_at,
         persistence_available: control.persistence_available,
@@ -91,17 +101,11 @@ export default {
     if (url.pathname === "/__control/preferred" && request.method === "POST") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: "invalid_json" }, 400);
-      }
+      try { body = await request.json(); }
+      catch { return json({ error: "invalid_json" }, 400); }
       const preferred = normalizeOrigin(body?.backend);
       if (!preferred || !configured.includes(preferred)) {
-        return json({
-          error: "backend_not_configured",
-          configured,
-        }, 400);
+        return json({ error: "backend_not_configured", configured }, 400);
       }
       try {
         const saved = await saveControlState(env, { ...control, preferred });
@@ -109,7 +113,8 @@ export default {
           ok: true,
           configured,
           preferred: saved.preferred,
-          effective_order: effectiveOrder(configured, saved.preferred),
+          effective_order: effectiveOrder(configured, saved.preferred, fallback),
+          allow_fallback: fallback,
           maintenance: saved.maintenance,
           updated_at: saved.updated_at,
         });
@@ -121,14 +126,9 @@ export default {
     if (url.pathname === "/__control/maintenance" && request.method === "POST") {
       if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: "invalid_json" }, 400);
-      }
-      if (typeof body?.enabled !== "boolean") {
-        return json({ error: "enabled_must_be_boolean" }, 400);
-      }
+      try { body = await request.json(); }
+      catch { return json({ error: "invalid_json" }, 400); }
+      if (typeof body?.enabled !== "boolean") return json({ error: "enabled_must_be_boolean" }, 400);
       try {
         const saved = await saveControlState(env, { ...control, maintenance: body.enabled });
         return json({ ok: true, maintenance: saved.maintenance, updated_at: saved.updated_at });
@@ -137,52 +137,29 @@ export default {
       }
     }
 
-    if (url.pathname.startsWith("/__control/")) {
-      return json({ error: "not_found" }, 404);
-    }
+    if (url.pathname.startsWith("/__control/")) return json({ error: "not_found" }, 404);
 
     if (control.maintenance) {
       return new Response("n8n maintenance in progress", {
         status: 503,
-        headers: {
-          "retry-after": "30",
-          "x-router-maintenance": "1",
-        },
+        headers: { "retry-after": "30", "x-router-maintenance": "1" },
       });
     }
 
-    // Buffer request body ONCE (so we can retry across targets)
     let bodyBytes = null;
-    if (!["GET", "HEAD"].includes(request.method)) {
-      bodyBytes = await request.clone().arrayBuffer();
-    }
+    if (!["GET", "HEAD"].includes(request.method)) bodyBytes = await request.clone().arrayBuffer();
 
-    // Upstream statuses that usually mean "try another backend"
     const retriableStatuses = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+    const hopByHop = new Set([
+      "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+      "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
+    ]);
 
-    // Strict Render "suspended/disabled" detection (avoid false positives)
     function looksLikeRenderSuspended(htmlText) {
       const t = htmlText.toLowerCase();
-      return (
-        t.includes("service suspended") ||
-        t.includes("site disabled") ||
-        (t.includes("render.com") && t.includes("suspended"))
-      );
+      return t.includes("service suspended") || t.includes("site disabled") ||
+        (t.includes("render.com") && t.includes("suspended"));
     }
-
-    // Hop-by-hop headers you should not forward
-    const hopByHop = new Set([
-      "connection",
-      "keep-alive",
-      "proxy-authenticate",
-      "proxy-authorization",
-      "te",
-      "trailer",
-      "transfer-encoding",
-      "upgrade",
-      "host",
-      "content-length",
-    ]);
 
     function buildForwardHeaders(originalHeaders, targetHost) {
       const h = new Headers();
@@ -190,54 +167,37 @@ export default {
         if (!hopByHop.has(k.toLowerCase())) h.set(k, v);
       }
       h.set("host", targetHost);
-      h.set("x-proxy-by", "cf-worker-failover");
+      h.set("x-proxy-by", "cf-worker-ring-router");
       return h;
     }
 
     async function fetchWithTimeout(targetUrl, init, ms) {
       const ac = new AbortController();
-      const t = setTimeout(() => ac.abort("timeout"), ms);
-      try {
-        return await fetch(targetUrl, { ...init, signal: ac.signal });
-      } finally {
-        clearTimeout(t);
-      }
+      const timer = setTimeout(() => ac.abort("timeout"), ms);
+      try { return await fetch(targetUrl, { ...init, signal: ac.signal }); }
+      finally { clearTimeout(timer); }
     }
 
     let lastFailure = "none";
-
     for (const target of targets) {
       const targetUrl = new URL(target);
       const forwardUrl = targetUrl.origin + url.pathname + url.search;
-
       try {
         const headers = buildForwardHeaders(request.headers, targetUrl.host);
-        const resp = await fetchWithTimeout(
-          forwardUrl,
-          {
-            method: request.method,
-            headers,
-            body: bodyBytes,
-            redirect: "manual",
-          },
-          30000
-        );
+        const resp = await fetchWithTimeout(forwardUrl, {
+          method: request.method,
+          headers,
+          body: bodyBytes,
+          redirect: "manual",
+        }, 30000);
 
-        const debugHeaders = new Headers(resp.headers);
-        debugHeaders.set("x-backend-used", targetUrl.origin);
-        debugHeaders.set("x-backend-status", String(resp.status));
+        const outHeaders = new Headers(resp.headers);
+        outHeaders.set("x-backend-used", targetUrl.origin);
+        outHeaders.set("x-backend-status", String(resp.status));
 
         if (retriableStatuses.has(resp.status)) {
           lastFailure = `retriable_status_${resp.status}`;
-          const ct = resp.headers.get("content-type") || "";
-          if (ct.includes("text/html")) {
-            const text = await resp.clone().text();
-            if (looksLikeRenderSuspended(text)) {
-              lastFailure = "render_suspended_page";
-              continue;
-            }
-          }
-          continue;
+          if (fallback) continue;
         }
 
         const contentType = resp.headers.get("content-type") || "";
@@ -245,19 +205,18 @@ export default {
           const text = await resp.clone().text();
           if (looksLikeRenderSuspended(text)) {
             lastFailure = "render_suspended_page";
-            continue;
+            if (fallback) continue;
           }
-          return new Response(text, { status: resp.status, headers: debugHeaders });
+          return new Response(text, { status: resp.status, headers: outHeaders });
         }
-
-        return new Response(resp.body, { status: resp.status, headers: debugHeaders });
+        return new Response(resp.body, { status: resp.status, headers: outHeaders });
       } catch (e) {
         lastFailure = `exception_${String(e?.message || e)}`;
-        continue;
+        if (!fallback) break;
       }
     }
 
-    return new Response("No active backend available", {
+    return new Response("Active backend unavailable", {
       status: 502,
       headers: { "x-failover-last-failure": lastFailure },
     });
