@@ -187,33 +187,41 @@ def _run_ffmpeg(image_path: Path, audio_path: Path, output_path: Path) -> None:
     cmd = [
         ffmpeg,
         "-y",
-        "-loop",
-        "1",
-        "-framerate",
-        "30",
-        "-i",
-        str(image_path),
-        "-i",
-        str(audio_path),
+
+        # Image input
+        "-framerate", "30",
+        "-loop", "1",
+        "-i", str(image_path),
+
+        # Audio input
+        "-i", str(audio_path),
+
+        # Limit filter threading to reduce RAM usage
+        "-filter_threads", "1",
+
+        # Video filter
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-r",
-        "30",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "48000",
-        "-movflags",
-        "+faststart",
+        (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+            "format=yuv420p"
+        ),
+
+        # Video encoding
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-threads", "1",
+        "-r", "30",
+
+        # Audio encoding
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "48000",
+
+        "-movflags", "+faststart",
         "-shortest",
+
         str(output_path),
     ]
 
