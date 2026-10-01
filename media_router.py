@@ -184,38 +184,82 @@ def _run_ffmpeg(image_path: Path, audio_path: Path, output_path: Path) -> None:
     if not ffmpeg:
         raise HTTPException(status_code=500, detail="ffmpeg is not installed on SH01")
 
+    prepared_image = output_path.parent / f"{output_path.stem}_prepared.png"
+
+    # Stage 1:
+    # Resize/pad the source image ONCE.
+    # PNG avoids introducing a lossy intermediate image.
+    prepare_cmd = [
+        ffmpeg,
+        "-y",
+
+        "-i", str(image_path),
+
+        "-vf",
+        (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+        ),
+
+        "-frames:v", "1",
+
+        str(prepared_image),
+    ]
+
+    prepare_result = subprocess.run(
+        prepare_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=300,
+        check=False,
+    )
+
+    if (
+        prepare_result.returncode != 0
+        or not prepared_image.exists()
+        or prepared_image.stat().st_size == 0
+    ):
+        logger.error(
+            "ffmpeg image preparation failed: %s",
+            prepare_result.stderr.decode("utf-8", errors="replace")[-8000:],
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg failed to prepare the source image",
+        )
+
+    # Stage 2:
+    # The image is already 1080x1920, so scale/pad is no longer
+    # performed for every encoded frame.
     cmd = [
         ffmpeg,
         "-y",
 
-        # Image input
-        "-framerate", "30",
+        # Prepared static image
         "-loop", "1",
-        "-i", str(image_path),
+        "-framerate", "30",
+        "-i", str(prepared_image),
 
-        # Audio input
+        # Audio
         "-i", str(audio_path),
 
-        # Reduce filter-side memory usage
-        "-filter_threads", "1",
-
-        # Video filter
-        "-vf",
-        (
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-            "format=yuv420p"
-        ),
-
-        # Video encoding
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "23",
+        # Hard-limit encoder parallelism for the 512 MB container
         "-threads", "1",
-        "-x264-params", "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0",
-        "-r", "30",
 
-        # Audio encoding
+        # Video
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "stillimage",
+        "-crf", "20",
+
+        # Reduce x264 frame buffering/lookahead memory.
+        "-x264-params",
+        "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0:mbtree=0",
+
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+
+        # Audio
         "-c:a", "aac",
         "-b:a", "192k",
         "-ar", "48000",
@@ -226,11 +270,34 @@ def _run_ffmpeg(image_path: Path, audio_path: Path, output_path: Path) -> None:
         str(output_path),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-        logger.error("ffmpeg failed: %s", result.stderr[-8000:])
-        raise HTTPException(status_code=500, detail="ffmpeg failed to render the MP4")
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1800,
+            check=False,
+        )
 
+        if (
+            result.returncode != 0
+            or not output_path.exists()
+            or output_path.stat().st_size == 0
+        ):
+            logger.error(
+                "ffmpeg failed: %s",
+                result.stderr.decode("utf-8", errors="replace")[-8000:],
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg failed to render the MP4",
+            )
+
+    finally:
+        try:
+            prepared_image.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 @router.post("/audio-image-video")
 async def build_audio_image_video(
