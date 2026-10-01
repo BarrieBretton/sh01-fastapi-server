@@ -196,7 +196,7 @@ def _run_ffmpeg(image_path: Path, audio_path: Path, output_path: Path) -> None:
         # Audio input
         "-i", str(audio_path),
 
-        # Limit filter threading to reduce RAM usage
+        # Reduce filter-side memory usage
         "-filter_threads", "1",
 
         # Video filter
@@ -209,9 +209,10 @@ def _run_ffmpeg(image_path: Path, audio_path: Path, output_path: Path) -> None:
 
         # Video encoding
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "slow",
         "-crf", "23",
         "-threads", "1",
+        "-x264-params", "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0",
         "-r", "30",
 
         # Audio encoding
