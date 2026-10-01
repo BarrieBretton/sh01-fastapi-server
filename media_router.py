@@ -229,6 +229,11 @@ async def build_audio_image_video(
     x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
 ):
     _require_media_key(x_api_key)
+    logger.info(
+        "Media render START queue_id=%s image_url=%s",
+        request.queue_id,
+        request.image_url,
+    )
 
     if not BACKBLAZE_BUCKET_NAME:
         raise HTTPException(status_code=500, detail="BACKBLAZE_BUCKET_NAME is not configured")
@@ -243,12 +248,34 @@ async def build_audio_image_video(
             audio_path = root / "audio.bin"
             output_path = root / f"{token}.mp4"
 
+            logger.info("Media render DOWNLOAD START queue_id=%s", request.queue_id)
             await asyncio.gather(
                 _download_public_image(request.image_url, image_path),
                 _download_telegram_audio(request.audio_file_id, audio_path),
             )
 
+            logger.info(
+                "Media render DOWNLOAD COMPLETE queue_id=%s image_bytes=%s audio_bytes=%s",
+                request.queue_id,
+                image_path.stat().st_size,
+                audio_path.stat().st_size,
+            )
+
+            logger.info("Media render FFMPEG START queue_id=%s", request.queue_id)
+
             await asyncio.to_thread(_run_ffmpeg, image_path, audio_path, output_path)
+
+            logger.info(
+                "Media render FFMPEG COMPLETE queue_id=%s output_bytes=%s",
+                request.queue_id,
+                output_path.stat().st_size,
+            )
+
+            logger.info(
+                "Media render B2 UPLOAD START queue_id=%s b2_file=%s",
+                request.queue_id,
+                b2_file_name,
+            )
 
             manager = get_b2_manager()
             await asyncio.to_thread(
@@ -261,6 +288,12 @@ async def build_audio_image_video(
             )
 
             size_bytes = output_path.stat().st_size
+
+            logger.info(
+                "Media render B2 UPLOAD COMPLETE queue_id=%s b2_file=%s",
+                request.queue_id,
+                b2_file_name,
+            )
 
         logger.info(
             "Rendered Telegram audio social video queue_id=%s token=%s b2=%s size=%s",
