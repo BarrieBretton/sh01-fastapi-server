@@ -13,6 +13,7 @@ from .models import (
     InfraStatusResponse,
     PostgresMigrationRequest,
     RenderSlotSelectionRequest,
+    SlaTickRequest,
     SlotSelectionRequest,
 )
 from .orchestrator import build_failover_plan, run_failover
@@ -20,6 +21,7 @@ from .postgres import postgres_compare, postgres_health, postgres_migrate, postg
 from .registry import registry
 from .render_provider import render_health, render_service_status
 from .router_client import router_status
+from .sla import run_sla_tick, sla_status
 from .state import state
 
 router = APIRouter(
@@ -257,6 +259,30 @@ async def cloudflare_router_status(role: str):
 async def cloudflare_router_status_legacy():
     try:
         return router_status("n8n")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/sla/status")
+async def infrastructure_sla_status():
+    try:
+        return sla_status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/sla/tick")
+async def infrastructure_sla_tick(request: SlaTickRequest):
+    try:
+        if request.dry_run:
+            return run_sla_tick(dry_run=True)
+        job = jobs.submit(
+            "infra_sla_tick",
+            request.model_dump(),
+            run_sla_tick,
+            False,
+        )
+        return {"accepted": True, "job": job}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -50,3 +50,7 @@ class FailoverRequest(BaseModel):
     switch_router: bool = True
     quiesce_source: bool = True
     dry_run: bool = True
+
+
+class SlaTickRequest(BaseModel):
+    dry_run: bool = False
