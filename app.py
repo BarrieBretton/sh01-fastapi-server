@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Any, Literal
 from dotenv import load_dotenv
 from image_templating import router as image_templating_router
 from infra.routes import router as infra_router
+from infra.media_job_store_routes import router as media_job_store_router
 from media_router import router as media_router
 from caption_router import router as caption_router
 from auto_editor import router as auto_editor_router
@@ -309,6 +310,7 @@ class VideoToFBResponse(BaseModel):
 app = FastAPI(title="Python Server - SideHustle-01", version="2.2")
 app.include_router(image_templating_router, prefix="/img")
 app.include_router(infra_router)
+app.include_router(media_job_store_router)
 app.include_router(media_router)
 app.include_router(caption_router)
 app.include_router(auto_editor_router)

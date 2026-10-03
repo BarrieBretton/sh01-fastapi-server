@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from b2_helper import get_b2_manager
-from infra.persistence import store
+from media_job_store import store
 from media_capacity import MEDIA_RENDER_LOCK, HEAVY_MEDIA_CAPACITY, reserve_heavy_media_or_raise
 from caption_router import (
     BACKBLAZE_BUCKET_NAME,

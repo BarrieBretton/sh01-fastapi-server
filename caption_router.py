@@ -29,7 +29,7 @@ from media_capacity import (
     HEAVY_MEDIA_CAPACITY,
     reserve_heavy_media_or_raise,
 )
-from infra.persistence import store
+from media_job_store import store
 
 logger = logging.getLogger("caption_clipper")
 
