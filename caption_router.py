@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from b2_helper import get_b2_manager
 from media_capacity import MEDIA_RENDER_LOCK
+from infra.persistence import store
 
 logger = logging.getLogger("caption_clipper")
 
@@ -567,6 +568,63 @@ def _job_view(job: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in job.items() if not k.startswith("_")}
 
 
+CAPTION_JOB_KIND = "caption_clip"
+
+
+def _job_id_for_request(request_id: str) -> str:
+    key = MEDIA_CLIP_API_KEY or "caption-clips"
+    return hmac.new(
+        key.encode("utf-8"),
+        f"caption-job:{request_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+
+
+def _durable_payload(req: ClipCaptionRequest, request_id: str, token: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "token": token,
+        "request": req.model_dump(mode="json"),
+    }
+
+
+async def _persist_job(job: dict[str, Any], payload: dict[str, Any] | None = None) -> None:
+    await asyncio.to_thread(
+        store.put_job,
+        str(job["job_id"]),
+        CAPTION_JOB_KIND,
+        str(job.get("status") or "unknown"),
+        payload,
+        _job_view(job),
+        job.get("error"),
+    )
+
+
+async def _load_durable_job(job_id: str) -> dict[str, Any] | None:
+    row = await asyncio.to_thread(store.get_job, job_id)
+    if not row or row.get("kind") != CAPTION_JOB_KIND:
+        return None
+
+    result = row.get("result")
+    if isinstance(result, dict):
+        job = dict(result)
+    else:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        job = {
+            "job_id": job_id,
+            "request_id": payload.get("request_id"),
+            "token": payload.get("token"),
+            "status": row.get("status"),
+            "stage": row.get("status"),
+            "error": row.get("error"),
+        }
+
+    job.setdefault("job_id", job_id)
+    job["durable"] = True
+    job["durable_updated_at"] = row.get("updated_at")
+    return job
+
+
 async def _prune_jobs() -> None:
     now = time.time()
     async with _jobs_lock:
@@ -581,8 +639,20 @@ async def _prune_jobs() -> None:
 
 async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
     job = _jobs[job_id]
+    durable_payload = _durable_payload(
+        req,
+        str(job["request_id"]),
+        str(job["token"]),
+    )
+
     async with MEDIA_RENDER_LOCK:
-        job.update(status="running", started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), stage="download")
+        job.update(
+            status="running",
+            started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            stage="download",
+        )
+        await _persist_job(job, durable_payload)
+
         try:
             with tempfile.TemporaryDirectory(prefix="sh01-caption-clip-") as tmp:
                 root = Path(tmp)
@@ -598,7 +668,11 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
 
                 total_duration = await asyncio.to_thread(_ffprobe_duration, source)
                 start = min(req.start_seconds, max(0.0, total_duration - 0.05))
-                end = req.end_seconds if req.end_seconds is not None else min(total_duration, start + MAX_CLIP_SECONDS)
+                end = (
+                    req.end_seconds
+                    if req.end_seconds is not None
+                    else min(total_duration, start + MAX_CLIP_SECONDS)
+                )
                 end = min(end, total_duration)
                 duration = end - start
                 if duration <= 0.05:
@@ -606,7 +680,14 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 if duration > MAX_CLIP_SECONDS + 0.01:
                     raise RuntimeError(f"Clip exceeds {MAX_CLIP_SECONDS}s maximum")
 
-                job.update(stage="transcription", clip_start=start, clip_end=end, clip_duration=duration)
+                job.update(
+                    stage="transcription",
+                    clip_start=start,
+                    clip_end=end,
+                    clip_duration=duration,
+                )
+                await _persist_job(job, durable_payload)
+
                 if req.word_timestamps:
                     words = [w.model_dump() for w in req.word_timestamps]
                 else:
@@ -623,12 +704,17 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 video_effect = req.video_effect or preset["video_effect"]
 
                 await asyncio.to_thread(_make_ass, words, caption_cfg, ass)
-                job.update(stage="render", word_count=len(words), resolved_preset={
-                    "preset": req.preset,
-                    "caption": caption_cfg,
-                    "fit_mode": fit_mode,
-                    "video_effect": video_effect,
-                })
+                job.update(
+                    stage="render",
+                    word_count=len(words),
+                    resolved_preset={
+                        "preset": req.preset,
+                        "caption": caption_cfg,
+                        "fit_mode": fit_mode,
+                        "video_effect": video_effect,
+                    },
+                )
+                await _persist_job(job, durable_payload)
 
                 await asyncio.to_thread(
                     _render_video,
@@ -645,6 +731,8 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 )
 
                 job.update(stage="upload")
+                await _persist_job(job, durable_payload)
+
                 token = str(job["token"])
                 b2_name = f"{B2_PREFIX}/{token}.mp4"
                 if not BACKBLAZE_BUCKET_NAME:
@@ -667,7 +755,11 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                     b2_file_name=b2_name,
                     size_bytes=output.stat().st_size,
                     error=None,
+                    error_type=None,
+                    failed_stage=None,
                 )
+                await _persist_job(job, durable_payload)
+
         except Exception as exc:
             failed_stage = job.get("stage")
 
@@ -693,56 +785,103 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 error=error_message[:3000],
                 error_type=type(exc).__name__,
             )
+            await _persist_job(job, durable_payload)
+
         finally:
             job["_finished_epoch"] = time.time()
 
 
 @router.post("/clip-caption")
-async def create_caption_clip(req: ClipCaptionRequest, x_api_key: str | None = Header(None, alias="X-API-KEY")):
+async def create_caption_clip(
+    req: ClipCaptionRequest,
+    x_api_key: str | None = Header(None, alias="X-API-KEY"),
+):
     _require_key(x_api_key)
     await _prune_jobs()
 
     request_id = (req.request_id or str(uuid.uuid4())).strip()
     token = _request_token(request_id)
+    job_id = _job_id_for_request(request_id)
+    durable_payload = _durable_payload(req, request_id, token)
 
     async with _jobs_lock:
-        existing = next((j for j in _jobs.values() if j.get("request_id") == request_id), None)
-        if existing and existing.get("status") in {"queued", "running", "complete"}:
+        local = _jobs.get(job_id)
+        if local and local.get("status") in {"queued", "running", "complete"}:
             from fastapi.responses import JSONResponse
-            status_code = 200 if existing.get("status") == "complete" else 202
-            return JSONResponse(status_code=status_code, content=_job_view(existing))
+            status_code = 200 if local.get("status") == "complete" else 202
+            return JSONResponse(status_code=status_code, content=_job_view(local))
 
-        job_id = secrets.token_hex(16)
-        job = {
-            "job_id": job_id,
-            "request_id": request_id,
-            "status": "queued",
-            "stage": "queued",
-            "preset": req.preset,
-            "token": token,
-            "status_url": f"{PUBLIC_API_BASE}/media/clip-caption-jobs/{job_id}",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "video_url": None,
-            "error": None,
-        }
+    durable = await _load_durable_job(job_id)
+    if durable and durable.get("status") == "complete":
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=200, content=_job_view(durable))
+
+    previous_attempt = int((durable or {}).get("attempt") or 0)
+    recovered_from = (durable or {}).get("status")
+
+    job = {
+        "job_id": job_id,
+        "request_id": request_id,
+        "status": "queued",
+        "stage": "queued",
+        "preset": req.preset,
+        "token": token,
+        "status_url": f"{PUBLIC_API_BASE}/media/clip-caption-jobs/{job_id}",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "video_url": None,
+        "error": None,
+        "attempt": previous_attempt + 1,
+        "recovered_from": recovered_from,
+    }
+
+    async with _jobs_lock:
         _jobs[job_id] = job
+
+    await _persist_job(job, durable_payload)
 
     task = asyncio.create_task(_execute(job_id, req))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=202, content=_job_view(job))
 
 
 @router.get("/clip-caption-jobs/{job_id}")
-async def caption_clip_job(job_id: str, x_api_key: str | None = Header(None, alias="X-API-KEY")):
+async def caption_clip_job(
+    job_id: str,
+    x_api_key: str | None = Header(None, alias="X-API-KEY"),
+):
     _require_key(x_api_key)
     await _prune_jobs()
+
     async with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown or expired clip-caption job")
-        return _job_view(job)
+        local = _jobs.get(job_id)
+        if local:
+            return _job_view(local)
+
+    durable = await _load_durable_job(job_id)
+    if not durable:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown or expired clip-caption job",
+        )
+
+    # If this process does not own the task but the durable row says it was
+    # queued/running, the worker that owned it disappeared (restart/failover).
+    # Report it as recoverable instead of pretending work is still progressing.
+    if durable.get("status") in {"queued", "running"}:
+        durable["previous_status"] = durable.get("status")
+        durable["status"] = "interrupted"
+        durable["stage"] = "interrupted"
+        durable["recoverable"] = True
+        durable["retry"] = {
+            "method": "POST",
+            "path": "/media/clip-caption",
+            "instruction": "Resubmit the same request_id and request body to resume as a new attempt.",
+        }
+
+    return _job_view(durable)
 
 
 @router.get("/clip-caption-presets")
