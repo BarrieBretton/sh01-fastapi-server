@@ -59,6 +59,13 @@ AUTO_EDIT_MIN_SEGMENT = float(os.getenv("AUTO_EDIT_MIN_SEGMENT", "0.75"))
 AUTO_EDIT_DEFAULT_TARGET = float(os.getenv("AUTO_EDIT_DEFAULT_TARGET_SECONDS", "45"))
 AUTO_EDIT_ASSET_MAX = max(1, min(12, int(os.getenv("AUTO_EDIT_ASSET_MAX", "8"))))
 AUTO_EDIT_JOB_RETENTION_SECONDS = max(3600, int(os.getenv("AUTO_EDIT_JOB_RETENTION_SECONDS", "86400")))
+AUTO_EDIT_MIN_WORD_PROBABILITY = float(os.getenv("AUTO_EDIT_MIN_WORD_PROBABILITY", "0.18"))
+AUTO_EDIT_FILTER_LOW_CONFIDENCE_WORDS = os.getenv(
+    "AUTO_EDIT_FILTER_LOW_CONFIDENCE_WORDS", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+AUTO_EDIT_ASR_DEBUG_TAIL_WORDS = max(
+    0, min(50, int(os.getenv("AUTO_EDIT_ASR_DEBUG_TAIL_WORDS", "12")))
+)
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
@@ -240,6 +247,33 @@ async def _load(job_id: str) -> dict[str, Any] | None:
     out["durable"] = True
     out["durable_updated_at"] = row.get("updated_at")
     return out
+
+
+
+def _filter_transcript_words(words: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Drop only clearly low-confidence ASR words without token blacklists."""
+    if not AUTO_EDIT_FILTER_LOW_CONFIDENCE_WORDS:
+        return words, []
+
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+
+    for w in words:
+        p = w.get("probability")
+        if isinstance(p, (int, float)) and float(p) < AUTO_EDIT_MIN_WORD_PROBABILITY:
+            dropped.append(w)
+        else:
+            kept.append(w)
+
+    if words and not kept:
+        logger.warning(
+            "auto-edit ASR filter would drop all %s words; keeping original transcript",
+            len(words),
+        )
+        return words, []
+
+    return kept, dropped
+
 
 
 def _detect_scenes(source: Path, absolute_start: float, duration: float, threshold: float) -> list[float]:
@@ -816,10 +850,50 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 await _persist(job, durable_payload)
                 await asyncio.to_thread(_extract_audio, source, start, duration, audio)
                 words = await _transcribe_faster_whisper(audio, req.language)
+
+                if AUTO_EDIT_ASR_DEBUG_TAIL_WORDS:
+                    logger.info(
+                        "auto-edit transcript tail=%s",
+                        [
+                            {
+                                "word": w.get("word"),
+                                "start": w.get("start"),
+                                "end": w.get("end"),
+                                "probability": w.get("probability"),
+                            }
+                            for w in words[-AUTO_EDIT_ASR_DEBUG_TAIL_WORDS:]
+                        ],
+                    )
+
+                words, dropped_words = _filter_transcript_words(words)
+                if dropped_words:
+                    logger.info(
+                        "auto-edit dropped low-confidence transcript words threshold=%.3f words=%s",
+                        AUTO_EDIT_MIN_WORD_PROBABILITY,
+                        [
+                            {
+                                "word": w.get("word"),
+                                "start": w.get("start"),
+                                "end": w.get("end"),
+                                "probability": w.get("probability"),
+                            }
+                            for w in dropped_words
+                        ],
+                    )
+
                 await _release_whisper_model()
                 await asyncio.to_thread(_trim_process_memory)
 
-                job.update(stage="analysis", transcript_word_count=len(words))
+                job.update(
+                    stage="analysis",
+                    transcript_word_count=len(words),
+                    transcript_words_dropped=len(dropped_words),
+                    transcript_min_probability=(
+                        AUTO_EDIT_MIN_WORD_PROBABILITY
+                        if AUTO_EDIT_FILTER_LOW_CONFIDENCE_WORDS
+                        else None
+                    ),
+                )
                 await _persist(job, durable_payload)
                 scene_points = []
                 if req.smart_cut:
