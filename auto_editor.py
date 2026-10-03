@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import hashlib
 import hmac
 import json
@@ -153,6 +155,19 @@ def _require_key(key: str | None) -> None:
         raise HTTPException(status_code=500, detail="MEDIA_CLIP_API_KEY is not configured")
     if not key or not secrets.compare_digest(key, MEDIA_CLIP_API_KEY):
         raise HTTPException(status_code=401, detail="Missing/invalid X-API-KEY")
+
+
+
+def _trim_process_memory() -> None:
+    """Best-effort release of freed Python/C-extension heap pages before FFmpeg."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _now() -> str:
@@ -438,19 +453,52 @@ def _render_segment(source: Path, dest: Path, absolute_start: float, duration: f
     fit_mode = req.fit_mode or str(preset["fit_mode"])
     effect = req.video_effect or str(preset["video_effect"])
     vf = _base_filter(fit_mode, effect, req.dynamic_zoom, req.reframe, idx, req.fps, duration)
-    _run([
-        ffmpeg, "-y", "-ss", f"{absolute_start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
-        "-vf", vf, "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-crf", str(req.crf), "-r", str(req.fps), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", f"{req.audio_bitrate}k", "-ar", "48000", "-movflags", "+faststart", "-shortest", str(dest)
-    ], FFMPEG_TIMEOUT_SECONDS, f"auto-edit segment {idx}")
+
+    cmd = [
+        ffmpeg, "-y",
+        "-filter_threads", "1",
+        "-filter_complex_threads", "1",
+        "-ss", f"{absolute_start:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", str(source),
+    ]
+
+    # blur mode uses split/overlay and is therefore a complex filter graph.
+    # crop/fit_black are simple single-chain filters and can stay on -vf.
+    if fit_mode == "blur":
+        cmd += [
+            "-filter_complex", f"[0:v]{vf}[v]",
+            "-map", "[v]",
+            "-map", "0:a?",
+        ]
+    else:
+        cmd += ["-vf", vf]
+
+    cmd += [
+        "-threads", "1",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-x264-params", "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0:mbtree=0",
+        "-tune", "zerolatency",
+        "-crf", str(req.crf),
+        "-r", str(req.fps),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", f"{req.audio_bitrate}k",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(dest),
+    ]
+
+    _run(cmd, FFMPEG_TIMEOUT_SECONDS, f"auto-edit segment {idx}")
 
 
 def _concat_no_transition(paths: list[Path], dest: Path, root: Path) -> float:
     ffmpeg = shutil.which("ffmpeg")
     concat = root / "concat.txt"
     concat.write_text("".join(f"file '{p.as_posix()}'\n" for p in paths), encoding="utf-8")
-    _run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(dest)], FFMPEG_TIMEOUT_SECONDS, "auto-edit concat")
+    _run([ffmpeg, "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(dest)], FFMPEG_TIMEOUT_SECONDS, "auto-edit concat")
     return _ffprobe_duration(dest)
 
 
@@ -465,8 +513,8 @@ def _merge_transition(left: Path, right: Path, dest: Path, transition: str, seco
         f"[0:a][1:a]acrossfade=d={d:.3f}:c1=tri:c2=tri[a]"
     )
     _run([
-        ffmpeg, "-y", "-i", str(left), "-i", str(right), "-filter_complex", fc,
-        "-map", "[v]", "-map", "[a]", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+        ffmpeg, "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-i", str(left), "-i", str(right), "-filter_complex", fc,
+        "-map", "[v]", "-map", "[a]", "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0:mbtree=0", "-crf", "22",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dest)
     ], FFMPEG_TIMEOUT_SECONDS, "auto-edit transition")
     return dl + dr - d
@@ -558,7 +606,7 @@ async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple
 
 def _finalize_video(base: Path, ass: Path, output: Path, duration: float, req: AutoEditRequest, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], hook: str) -> None:
     ffmpeg = shutil.which("ffmpeg")
-    cmd = [ffmpeg, "-y", "-i", str(base)]
+    cmd = [ffmpeg, "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-i", str(base)]
     input_index = 1
     overlay_indices: list[tuple[OverlayAsset, int]] = []
     for spec, path in overlays:
@@ -622,7 +670,7 @@ def _finalize_video(base: Path, ass: Path, output: Path, duration: float, req: A
         amap = "0:a"
 
     cmd += ["-filter_complex", ";".join(filters), "-map", f"[{vlabel}]", "-map", amap,
-            "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-threads", "1", "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", "ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0:mbtree=0", "-tune", "zerolatency",
             "-crf", str(req.crf), "-r", str(req.fps), "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", f"{req.audio_bitrate}k", "-ar", "48000",
             "-t", f"{duration:.3f}", "-movflags", "+faststart", str(output)]
@@ -651,10 +699,14 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
     segment_paths: list[Path] = []
     for i, seg in enumerate(segments):
         p = variant_root / f"segment_{i}.mp4"
+        logger.info("auto-edit variant=%s segment=%s render start", variant + 1, i + 1)
         await asyncio.to_thread(_render_segment, source, p, base_start + float(seg["start"]), float(seg["end"]) - float(seg["start"]), req, i)
+        logger.info("auto-edit variant=%s segment=%s render complete", variant + 1, i + 1)
         segment_paths.append(p)
 
+    logger.info("auto-edit variant=%s combine start segments=%s", variant + 1, len(segment_paths))
     combined, output_starts, duration = await asyncio.to_thread(_combine_segments, segment_paths, variant_root, req)
+    logger.info("auto-edit variant=%s combine complete duration=%.3f", variant + 1, duration)
     mapped = _remap_words(words, segments, output_starts)
     preset = json.loads(json.dumps(PRESETS[req.preset]))
     caption_cfg = preset["caption"]
@@ -666,7 +718,9 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
     await asyncio.to_thread(_inject_hook_ass, ass, hook)
 
     final = variant_root / "final.mp4"
+    logger.info("auto-edit variant=%s final render start", variant + 1)
     await asyncio.to_thread(_finalize_video, combined, ass, final, duration, req, overlays, music, sfx, hook)
+    logger.info("auto-edit variant=%s final render complete bytes=%s", variant + 1, final.stat().st_size if final.exists() else 0)
 
     token = _token(request_id, variant)
     b2_name = f"{B2_PREFIX}/{token}.mp4"
@@ -728,6 +782,7 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 await asyncio.to_thread(_extract_audio, source, start, duration, audio)
                 words = await _transcribe_faster_whisper(audio, req.language)
                 await _release_whisper_model()
+                await asyncio.to_thread(_trim_process_memory)
 
                 job.update(stage="analysis", transcript_word_count=len(words))
                 await _persist(job, durable_payload)
