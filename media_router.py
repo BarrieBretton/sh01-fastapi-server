@@ -21,7 +21,11 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from b2_helper import get_b2_manager
-from media_capacity import MEDIA_RENDER_LOCK
+from media_capacity import (
+    MEDIA_RENDER_LOCK,
+    HEAVY_MEDIA_CAPACITY,
+    reserve_heavy_media_or_raise,
+)
 
 
 logger = logging.getLogger("media_renderer")
@@ -735,6 +739,7 @@ async def _run_render_job(
     global _active_job_id
 
     job = _render_jobs[job_id]
+    capacity_lease_id = str(job.get("_capacity_lease_id") or "")
 
     async with _render_execution_lock:
         job["status"] = "running"
@@ -941,6 +946,9 @@ async def _run_render_job(
                 ):
                     _active_job_id = None
 
+            if capacity_lease_id:
+                await HEAVY_MEDIA_CAPACITY.release(capacity_lease_id)
+
 
 @router.post(
     "/audio-image-video",
@@ -1058,6 +1066,13 @@ async def build_audio_image_video(
             16
         )
 
+        lease = await reserve_heavy_media_or_raise(
+            kind="audio_image_video",
+            job_id=job_id,
+            request_id=queue_id,
+            endpoint="/media/audio-image-video",
+        )
+
         token = (
             _render_token_for_queue(
                 queue_id
@@ -1083,6 +1098,7 @@ async def build_audio_image_video(
             ),
             "size_bytes": None,
             "error": None,
+            "_capacity_lease_id": lease.lease_id,
         }
 
         _render_jobs[job_id] = job
@@ -1131,6 +1147,7 @@ async def build_audio_image_video(
                     None,
                 )
 
+            await HEAVY_MEDIA_CAPACITY.release(lease.lease_id)
             raise
 
         payload = _job_payload(
@@ -1239,6 +1256,23 @@ async def get_render_state(
                 )
             ),
         }
+
+
+@router.get(
+    "/capacity",
+)
+async def get_media_capacity(
+    x_api_key: str | None = Header(
+        default=None,
+        alias="X-API-KEY",
+    ),
+):
+    """Return the single SH01-wide heavy-media slot state."""
+    _require_media_key(x_api_key)
+    return {
+        "ok": True,
+        "heavy_media": await HEAVY_MEDIA_CAPACITY.status(),
+    }
 
 
 @router.get(

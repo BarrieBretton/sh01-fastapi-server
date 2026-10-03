@@ -24,7 +24,11 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from b2_helper import get_b2_manager
-from media_capacity import MEDIA_RENDER_LOCK
+from media_capacity import (
+    MEDIA_RENDER_LOCK,
+    HEAVY_MEDIA_CAPACITY,
+    reserve_heavy_media_or_raise,
+)
 from infra.persistence import store
 
 logger = logging.getLogger("caption_clipper")
@@ -700,6 +704,7 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
         str(job["request_id"]),
         str(job["token"]),
     )
+    capacity_lease_id = str(job.get("_capacity_lease_id") or "")
 
     async with MEDIA_RENDER_LOCK:
         job.update(
@@ -846,6 +851,8 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
 
         finally:
             job["_finished_epoch"] = time.time()
+            if capacity_lease_id:
+                await HEAVY_MEDIA_CAPACITY.release(capacity_lease_id)
 
 
 @router.post("/clip-caption")
@@ -876,6 +883,13 @@ async def create_caption_clip(
     previous_attempt = int((durable or {}).get("attempt") or 0)
     recovered_from = (durable or {}).get("status")
 
+    lease = await reserve_heavy_media_or_raise(
+        kind="clip_caption",
+        job_id=job_id,
+        request_id=request_id,
+        endpoint="/media/clip-caption",
+    )
+
     job = {
         "job_id": job_id,
         "request_id": request_id,
@@ -889,16 +903,22 @@ async def create_caption_clip(
         "error": None,
         "attempt": previous_attempt + 1,
         "recovered_from": recovered_from,
+        "_capacity_lease_id": lease.lease_id,
     }
 
     async with _jobs_lock:
         _jobs[job_id] = job
 
-    await _persist_job(job, durable_payload)
-
-    task = asyncio.create_task(_execute(job_id, req))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    try:
+        await _persist_job(job, durable_payload)
+        task = asyncio.create_task(_execute(job_id, req))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        async with _jobs_lock:
+            _jobs.pop(job_id, None)
+        await HEAVY_MEDIA_CAPACITY.release(lease.lease_id)
+        raise
 
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=202, content=_job_view(job))
