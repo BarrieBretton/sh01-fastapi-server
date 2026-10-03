@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from b2_helper import get_b2_manager
+from media_capacity import MEDIA_RENDER_LOCK
 
 
 logger = logging.getLogger("media_renderer")
@@ -106,7 +107,7 @@ RENDER_JOB_RETENTION_SECONDS = max(
 # ---------------------------------------------------------------------
 
 _render_state_lock = asyncio.Lock()
-_render_execution_lock = asyncio.Lock()
+_render_execution_lock = MEDIA_RENDER_LOCK
 
 _render_jobs: dict[str, dict] = {}
 _queue_to_job: dict[str, str] = {}
