@@ -208,7 +208,7 @@ class ClipCaptionRequest(BaseModel):
     audio_bitrate: Literal[128, 160, 192, 256] = 192
 
     language: str | None = Field(default=None, min_length=2, max_length=10)
-    transcription_model: Literal["whisper-1"] = "whisper-1"
+    # transcription_model: Literal["whisper-1"] = "whisper-1"
     word_timestamps: list[WordStamp] | None = None
 
     @model_validator(mode="after")
@@ -669,12 +669,29 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                     error=None,
                 )
         except Exception as exc:
-            logger.exception("Caption clip job failed job_id=%s", job_id)
+            failed_stage = job.get("stage")
+
+            logger.exception(
+                "Caption clip job failed job_id=%s stage=%s",
+                job_id,
+                failed_stage,
+            )
+
+            if isinstance(exc, HTTPException):
+                error_message = str(exc.detail)
+            else:
+                error_message = str(exc) or repr(exc)
+
             job.update(
                 status="failed",
                 stage="failed",
-                completed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                error=str(exc)[:3000],
+                failed_stage=failed_stage,
+                completed_at=time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(),
+                ),
+                error=error_message[:3000],
+                error_type=type(exc).__name__,
             )
         finally:
             job["_finished_epoch"] = time.time()
