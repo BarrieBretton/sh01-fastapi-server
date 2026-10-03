@@ -218,7 +218,9 @@ class DurableStore:
                 logger.warning("Failed persisting job %s to %s: %s", job_id, slot, exc)
 
         if not written:
-            logger.warning("Job %s could not be persisted to any Postgres slot", job_id)
+            message = f"Job {job_id} could not be persisted to any Postgres slot"
+            logger.error(message)
+            raise RuntimeError(message)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         safe_id = job_id.replace("'", "''")
