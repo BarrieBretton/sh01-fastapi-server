@@ -195,9 +195,19 @@ class CaptionOverrides(BaseModel):
     margin_v: int | None = Field(default=None, ge=80, le=700)
     bold: bool | None = None
     uppercase: bool | None = None
-    max_words: int | None = Field(default=None, ge=2, le=12)
-    max_chars: int | None = Field(default=None, ge=10, le=60)
+    max_words: int | None = Field(default=None, ge=2, le=24)
+    max_chars: int | None = Field(default=None, ge=10, le=120)
     animation: Literal["none", "fade", "pop", "bounce", "slide_up"] | None = None
+
+    auto_size: bool | None = None
+    min_font_size: int | None = Field(default=None, ge=24, le=96)
+    safe_width_ratio: float | None = Field(default=None, ge=0.55, le=0.95)
+    max_lines: int | None = Field(default=None, ge=1, le=3)
+    wrap_mode: Literal["balanced", "auto", "single_line"] | None = None
+
+    grouping: Literal["phrase", "sentence"] | None = None
+    animation_scope: Literal["phrase", "word"] | None = None
+    highlight_mode: Literal["word", "none"] | None = None
 
 
 class ClipCaptionRequest(BaseModel):
@@ -463,10 +473,38 @@ def _ass_escape(text: str) -> str:
     return text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", " ")
 
 
-def _chunks(words: list[dict[str, Any]], max_words: int, max_chars: int) -> list[list[dict[str, Any]]]:
+def _chunks(
+    words: list[dict[str, Any]],
+    max_words: int,
+    max_chars: int,
+    grouping: str = "phrase",
+) -> list[list[dict[str, Any]]]:
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     chars = 0
+
+    if grouping == "sentence":
+        hard_words = max(max_words * 3, 18)
+        hard_chars = max(max_chars * 3, 90)
+        for i, w in enumerate(words):
+            token = str(w["word"]).strip()
+            projected = chars + len(token) + (1 if current else 0)
+            current.append(w)
+            chars = projected
+
+            punct_break = token.rstrip().endswith((".", "!", "?"))
+            next_gap = False
+            if i + 1 < len(words):
+                next_gap = float(words[i + 1]["start"]) - float(w["end"]) > 0.9
+
+            if punct_break or next_gap or len(current) >= hard_words or chars >= hard_chars:
+                chunks.append(current)
+                current = []
+                chars = 0
+        if current:
+            chunks.append(current)
+        return chunks
+
     for w in words:
         token = str(w["word"]).strip()
         projected = chars + len(token) + (1 if current else 0)
@@ -478,12 +516,121 @@ def _chunks(words: list[dict[str, Any]], max_words: int, max_chars: int) -> list
             chars = 0
         current.append(w)
         chars += len(token) + (1 if len(current) > 1 else 0)
+
     if current:
         chunks.append(current)
     return chunks
 
 
-def _animation_tag(name: str, margin_v: int) -> str:
+def _text_units(text: str) -> float:
+    total = 0.0
+    for ch in text:
+        if ch.isspace():
+            total += 0.34
+        elif ch in "ilI1|.,'`:;!":
+            total += 0.32
+        elif ch in "MW@#%&":
+            total += 0.92
+        elif ch.isupper():
+            total += 0.68
+        elif ch.isdigit():
+            total += 0.58
+        else:
+            total += 0.56
+    return max(total, 0.5)
+
+
+def _balanced_line_ranges(tokens: list[str], max_lines: int) -> list[tuple[int, int]]:
+    n = len(tokens)
+    if n <= 1 or max_lines <= 1:
+        return [(0, n)]
+
+    def line_width(a: int, b: int) -> float:
+        return _text_units(" ".join(tokens[a:b]))
+
+    candidates: list[list[tuple[int, int]]] = []
+    if max_lines >= 2 and n >= 2:
+        for i in range(1, n):
+            candidates.append([(0, i), (i, n)])
+    if max_lines >= 3 and n >= 3:
+        for i in range(1, n - 1):
+            for j in range(i + 1, n):
+                candidates.append([(0, i), (i, j), (j, n)])
+
+    if not candidates:
+        return [(0, n)]
+
+    best = candidates[0]
+    best_score = float('inf')
+    for ranges in candidates:
+        widths = [line_width(a, b) for a, b in ranges]
+        score = max(widths) + ((max(widths) - min(widths)) * 0.12) + ((len(ranges) - 1) * 0.18)
+        if score < best_score:
+            best_score = score
+            best = ranges
+    return best
+
+
+def _layout_caption_tokens(
+    tokens: list[str],
+    preferred_font_size: int,
+    *,
+    auto_size: bool = True,
+    min_font_size: int = 28,
+    safe_width_ratio: float = 0.84,
+    max_lines: int = 2,
+    wrap_mode: str = "balanced",
+) -> tuple[list[tuple[int, int]], int]:
+    if not tokens:
+        return [(0, 0)], preferred_font_size
+
+    max_lines = max(1, min(3, int(max_lines)))
+    safe_width_ratio = max(0.55, min(0.95, float(safe_width_ratio)))
+    min_font_size = min(int(preferred_font_size), max(24, int(min_font_size)))
+
+    ranges = [(0, len(tokens))] if wrap_mode == "single_line" else _balanced_line_ranges(tokens, max_lines)
+    available_px = RENDER_WIDTH * safe_width_ratio
+    max_units = max(_text_units(" ".join(tokens[a:b])) for a, b in ranges if a < b)
+
+    if not auto_size:
+        return ranges, int(preferred_font_size)
+
+    fitted = int((available_px * 0.98) / max(max_units, 0.5))
+    return ranges, max(min_font_size, min(int(preferred_font_size), fitted))
+
+
+def _render_caption_text(group, ranges, cfg, active_index):
+    lines: list[str] = []
+    highlight_mode = str(cfg.get("highlight_mode") or "word")
+    for a, b in ranges:
+        pieces: list[str] = []
+        for j in range(a, b):
+            w = group[j]
+            token = _ass_escape(str(w["word"]).upper() if cfg.get("uppercase") else str(w["word"]))
+            if highlight_mode == "word" and active_index == j:
+                pieces.append(r"{\c" + cfg["highlight"] + r"}" + token + r"{\c" + cfg["primary"] + r"}")
+            else:
+                pieces.append(token)
+        lines.append(" ".join(pieces))
+    return r"\N".join(lines)
+
+
+def _entry_animation_tag(name: str, margin_v: int) -> str:
+    if name == "fade":
+        return r"\fad(80,0)"
+    if name == "pop":
+        return r"\fscx82\fscy82\t(0,90,\fscx112\fscy112)\t(90,190,\fscx100\fscy100)"
+    if name == "bounce":
+        return r"\fscx90\fscy90\t(0,80,\fscx116\fscy116)\t(80,150,\fscx96\fscy96)\t(150,220,\fscx100\fscy100)"
+    if name == "slide_up":
+        y2 = RENDER_HEIGHT - margin_v
+        y1 = y2 + max(45, int(RENDER_HEIGHT * 0.047))
+        x = RENDER_WIDTH // 2
+        return rf"\an2\move({x},{y1},{x},{y2},0,180)"
+    return ""
+
+
+def _word_animation_tag(name: str, margin_v: int) -> str:
     if name == "fade":
         return r"\fad(80,80)"
     if name == "pop":
@@ -501,30 +648,76 @@ def _animation_tag(name: str, margin_v: int) -> str:
 def _make_ass(words: list[dict[str, Any]], cfg: dict[str, Any], dest: Path) -> None:
     max_words = int(cfg["max_words"])
     max_chars = int(cfg["max_chars"])
-    groups = _chunks(words, max_words, max_chars)
+    grouping = str(cfg.get("grouping") or "phrase")
+    auto_size = bool(cfg.get("auto_size", True))
+    min_font_size = int(cfg.get("min_font_size") or max(28, int(int(cfg["font_size"]) * 0.58)))
+    safe_width_ratio = float(cfg.get("safe_width_ratio") or 0.84)
+    max_lines = int(cfg.get("max_lines") or 2)
+    wrap_mode = str(cfg.get("wrap_mode") or "balanced")
+    animation_scope = str(cfg.get("animation_scope") or "phrase")
+    highlight_mode = str(cfg.get("highlight_mode") or "word")
 
+    cfg.update(
+        grouping=grouping,
+        auto_size=auto_size,
+        min_font_size=min_font_size,
+        safe_width_ratio=safe_width_ratio,
+        max_lines=max_lines,
+        wrap_mode=wrap_mode,
+        animation_scope=animation_scope,
+        highlight_mode=highlight_mode,
+    )
+
+    groups = _chunks(words, max_words, max_chars, grouping=grouping)
     bold = -1 if cfg.get("bold") else 0
-    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {RENDER_WIDTH}\nPlayResY: {RENDER_HEIGHT}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Caption,{cfg['font']},{cfg['font_size']},{cfg['primary']},{cfg['highlight']},{cfg['outline']},&H64000000,{bold},0,0,0,100,100,0,0,1,{cfg['outline_width']},{cfg['shadow']},2,70,70,{cfg['margin_v']},1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"""
+    margin_px = max(24, int((RENDER_WIDTH * (1.0 - safe_width_ratio)) / 2))
+
+    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {RENDER_WIDTH}\nPlayResY: {RENDER_HEIGHT}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Caption,{cfg['font']},{cfg['font_size']},{cfg['primary']},{cfg['highlight']},{cfg['outline']},&H64000000,{bold},0,0,0,100,100,0,0,1,{cfg['outline_width']},{cfg['shadow']},2,{margin_px},{margin_px},{cfg['margin_v']},1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"""
 
     lines = [header]
+    animation = str(cfg.get("animation") or "none")
+    margin_v = int(cfg["margin_v"])
+
     for group in groups:
+        if not group:
+            continue
+
+        tokens = [str(w["word"]).upper() if cfg.get("uppercase") else str(w["word"]) for w in group]
+        ranges, font_size = _layout_caption_tokens(
+            tokens,
+            int(cfg["font_size"]),
+            auto_size=auto_size,
+            min_font_size=min_font_size,
+            safe_width_ratio=safe_width_ratio,
+            max_lines=max_lines,
+            wrap_mode=wrap_mode,
+        )
+        group_start = float(group[0]["start"])
+        group_end = float(group[-1]["end"])
+
+        if highlight_mode == "none":
+            text = _render_caption_text(group, ranges, cfg, None)
+            tag = _word_animation_tag(animation, margin_v)
+            lines.append(f"Dialogue: 0,{_ass_time(group_start)},{_ass_time(group_end)},Caption,,0,0,0,,{{\\fs{font_size}{tag}}}{text}\n")
+            continue
+
         for idx, active in enumerate(group):
             start = float(active["start"])
-            end = float(active["end"])
             if idx + 1 < len(group):
-                end = max(end, min(float(group[idx + 1]["start"]), end + 0.25))
-            pieces = []
-            for j, w in enumerate(group):
-                token = _ass_escape(str(w["word"]).upper() if cfg.get("uppercase") else str(w["word"]))
-                if j == idx:
-                    pieces.append(r"{\c" + cfg["highlight"] + r"}" + token + r"{\c" + cfg["primary"] + r"}")
-                else:
-                    pieces.append(token)
-            text = " ".join(pieces)
-            tag = _animation_tag(str(cfg.get("animation") or "none"), int(cfg["margin_v"]))
-            lines.append(
-                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{{{tag}}}{text}\n"
-            )
+                end = max(float(active["end"]), min(float(group[idx + 1]["start"]), float(active["end"]) + 0.25))
+            else:
+                end = max(float(active["end"]), group_end)
+
+            text = _render_caption_text(group, ranges, cfg, idx)
+            if animation_scope == "word":
+                tag = _word_animation_tag(animation, margin_v)
+            else:
+                tag = _entry_animation_tag(animation, margin_v) if idx == 0 else ""
+                if idx == len(group) - 1 and animation != "none":
+                    tag += r"\fad(0,60)"
+
+            lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,{{\\fs{font_size}{tag}}}{text}\n")
+
     dest.write_text("".join(lines), encoding="utf-8")
 
 

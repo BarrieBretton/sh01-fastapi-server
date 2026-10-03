@@ -36,6 +36,8 @@ from caption_router import (
     PUBLIC_API_BASE,
     RENDER_HEIGHT,
     RENDER_WIDTH,
+    CaptionOverrides,
+    _layout_caption_tokens,
     _download_telegram,
     _download_url,
     _extract_audio,
@@ -107,6 +109,7 @@ class AutoEditRequest(BaseModel):
 
     preset: Literal["viral_punch", "clean_minimal", "karaoke_glow", "podcast_bold", "cinematic"] = "viral_punch"
     language: str | None = Field(default=None, min_length=2, max_length=10)
+    caption_overrides: CaptionOverrides | None = None
 
     smart_cut: bool = True
     remove_silence: bool = True
@@ -680,16 +683,43 @@ def _finalize_video(base: Path, ass: Path, output: Path, duration: float, req: A
 def _inject_hook_ass(path: Path, hook: str) -> None:
     if not hook:
         return
-    text = hook.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", " ")
+
+    raw_tokens = hook.split()
+    preferred = max(34, int(RENDER_HEIGHT * 0.035))
+    ranges, font_size = _layout_caption_tokens(
+        raw_tokens,
+        preferred,
+        auto_size=True,
+        min_font_size=max(28, int(preferred * 0.72)),
+        safe_width_ratio=0.84,
+        max_lines=2,
+        wrap_mode="balanced",
+    )
+
+    wrapped_lines: list[str] = []
+    for a, b in ranges:
+        line = " ".join(raw_tokens[a:b])
+        wrapped_lines.append(
+            line.replace("\\", r"\\")
+                .replace("{", r"\{")
+                .replace("}", r"\}")
+                .replace("\n", " ")
+        )
+    text = r"\N".join(wrapped_lines)
+
     raw = path.read_text(encoding="utf-8")
     hook_style = (
-        f"Style: Hook,DejaVu Sans,{max(34, int(RENDER_HEIGHT * 0.035))},&H00FFFFFF,&H00FFFFFF,"
+        f"Style: Hook,DejaVu Sans,{preferred},&H00FFFFFF,&H00FFFFFF,"
         "&H00101010,&H70000000,-1,0,0,0,100,100,0,0,1,5,1,8,50,50,90,1\n"
     )
     marker = "\n[Events]\n"
     if marker in raw:
         raw = raw.replace(marker, "\n" + hook_style + marker, 1)
-    raw += f"Dialogue: 5,0:00:00.00,0:00:01.35,Hook,,0,0,0,,{{\\fad(80,160)}}{text}\n"
+
+    raw += (
+        f"Dialogue: 5,0:00:00.00,0:00:01.35,Hook,,0,0,0,,"
+        f"{{\\fs{font_size}\\fad(80,160)}}{text}\n"
+    )
     path.write_text(raw, encoding="utf-8")
 
 
@@ -710,6 +740,11 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
     mapped = _remap_words(words, segments, output_starts)
     preset = json.loads(json.dumps(PRESETS[req.preset]))
     caption_cfg = preset["caption"]
+    if req.caption_overrides:
+        for key, value in req.caption_overrides.model_dump().items():
+            if value is not None:
+                caption_cfg[key] = value
+
     ass = variant_root / "captions.ass"
     await asyncio.to_thread(_make_ass, mapped, caption_cfg, ass)
 
