@@ -910,7 +910,17 @@ async def create_caption_clip(
         _jobs[job_id] = job
 
     try:
-        await _persist_job(job, durable_payload)
+        persisted = await _persist_job(job, durable_payload)
+        if not persisted:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "durable_job_registration_failed",
+                    "message": "Caption job was not accepted because durable job registration failed",
+                    "retryable": True,
+                },
+                headers={"Retry-After": "5"},
+            )
         task = asyncio.create_task(_execute(job_id, req))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)

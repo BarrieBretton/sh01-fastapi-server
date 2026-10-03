@@ -836,7 +836,20 @@ async def create_auto_edit(req: AutoEditRequest, x_api_key: str | None = Header(
     async with _jobs_lock:
         _jobs[job_id] = job
     try:
-        await _persist(job, {"request_id": request_id, "request": req.model_dump(mode="json")})
+        persisted = await _persist(
+            job,
+            {"request_id": request_id, "request": req.model_dump(mode="json")},
+        )
+        if not persisted:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "durable_job_registration_failed",
+                    "message": "Auto-edit job was not accepted because durable job registration failed",
+                    "retryable": True,
+                },
+                headers={"Retry-After": "5"},
+            )
         task = asyncio.create_task(_execute(job_id, req))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
