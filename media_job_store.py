@@ -54,7 +54,16 @@ class MediaJobStore:
                     timeout=TIMEOUT_SECONDS,
                 )
                 if allow_404 and response.status_code == 404:
-                    return None
+                    try:
+                        detail = response.json().get("detail")
+                    except Exception:
+                        detail = None
+                    if detail == "Unknown media job":
+                        return None
+                    raise RuntimeError(
+                        "Media job store endpoint returned an unexpected 404: "
+                        f"{response.text[:1000]}"
+                    )
                 if response.status_code < 500:
                     response.raise_for_status()
                     return response
