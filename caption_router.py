@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import gc
 import hmac
 import ipaddress
 import json
@@ -53,6 +54,12 @@ WHISPER_COMPUTE_TYPE = os.getenv("MEDIA_CLIP_WHISPER_COMPUTE_TYPE", "int8").stri
 WHISPER_CACHE_DIR = os.getenv("MEDIA_CLIP_WHISPER_CACHE_DIR", "/tmp/faster-whisper").strip() or "/tmp/faster-whisper"
 WHISPER_CPU_THREADS = max(1, int(os.getenv("MEDIA_CLIP_WHISPER_CPU_THREADS", "1")))
 WHISPER_VAD = os.getenv("MEDIA_CLIP_WHISPER_VAD", "true").strip().lower() in {"1", "true", "yes", "on"}
+RENDER_WIDTH = max(360, int(os.getenv("MEDIA_CLIP_RENDER_WIDTH", "720")))
+RENDER_HEIGHT = max(640, int(os.getenv("MEDIA_CLIP_RENDER_HEIGHT", "1280")))
+DURABLE_TIMEOUT_SECONDS = max(2, int(os.getenv("MEDIA_CLIP_DURABLE_TIMEOUT_SECONDS", "8")))
+UNLOAD_WHISPER_BEFORE_RENDER = os.getenv(
+    "MEDIA_CLIP_UNLOAD_WHISPER_BEFORE_RENDER", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
@@ -428,6 +435,17 @@ async def _transcribe_faster_whisper(
             ) from exc
 
 
+async def _release_whisper_model() -> None:
+    global _whisper_model
+    if not UNLOAD_WHISPER_BEFORE_RENDER:
+        return
+    async with _whisper_model_lock:
+        if _whisper_model is not None:
+            logger.info("Releasing faster-whisper model before FFmpeg render")
+            _whisper_model = None
+    await asyncio.to_thread(gc.collect)
+
+
 def _ass_time(seconds: float) -> str:
     seconds = max(0.0, seconds)
     cs = int(round(seconds * 100))
@@ -469,9 +487,10 @@ def _animation_tag(name: str, margin_v: int) -> str:
     if name == "bounce":
         return r"\fscx90\fscy90\t(0,80,\fscx116\fscy116)\t(80,150,\fscx96\fscy96)\t(150,220,\fscx100\fscy100)\fad(20,50)"
     if name == "slide_up":
-        y2 = 1920 - margin_v
-        y1 = y2 + 90
-        return rf"\an2\move(540,{y1},540,{y2},0,180)\fad(25,70)"
+        y2 = RENDER_HEIGHT - margin_v
+        y1 = y2 + max(45, int(RENDER_HEIGHT * 0.047))
+        x = RENDER_WIDTH // 2
+        return rf"\an2\move({x},{y1},{x},{y2},0,180)\fad(25,70)"
     return ""
 
 
@@ -481,7 +500,7 @@ def _make_ass(words: list[dict[str, Any]], cfg: dict[str, Any], dest: Path) -> N
     groups = _chunks(words, max_words, max_chars)
 
     bold = -1 if cfg.get("bold") else 0
-    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Caption,{cfg['font']},{cfg['font_size']},{cfg['primary']},{cfg['highlight']},{cfg['outline']},&H64000000,{bold},0,0,0,100,100,0,0,1,{cfg['outline_width']},{cfg['shadow']},2,70,70,{cfg['margin_v']},1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"""
+    header = f"""[Script Info]\nScriptType: v4.00+\nPlayResX: {RENDER_WIDTH}\nPlayResY: {RENDER_HEIGHT}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Caption,{cfg['font']},{cfg['font_size']},{cfg['primary']},{cfg['highlight']},{cfg['outline']},&H64000000,{bold},0,0,0,100,100,0,0,1,{cfg['outline_width']},{cfg['shadow']},2,70,70,{cfg['margin_v']},1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"""
 
     lines = [header]
     for group in groups:
@@ -507,22 +526,30 @@ def _make_ass(words: list[dict[str, Any]], cfg: dict[str, Any], dest: Path) -> N
 
 def _video_filter(fit_mode: str, effect: str, ass_path: Path) -> str:
     ass = str(ass_path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+    w = RENDER_WIDTH
+    h = RENDER_HEIGHT
+
     if fit_mode == "crop":
-        base = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
     elif fit_mode == "fit_black":
-        base = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+        base = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
     else:
+        # Keep the blurred background branch deliberately small, then upscale it.
+        # This avoids two full 1080x1920 working frames on low-memory Render instances.
+        bg_w = max(180, w // 2)
+        bg_h = max(320, h // 2)
         base = (
             "split=2[bg][fg];"
-            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=28:2[bg2];"
-            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fg2];"
+            f"[bg]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,"
+            f"crop={bg_w}:{bg_h},boxblur=12:1,scale={w}:{h}[bg2];"
+            f"[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fg2];"
             "[bg2][fg2]overlay=(W-w)/2:(H-h)/2"
         )
 
     effects = {
         "none": "",
-        "crisp": ",eq=contrast=1.04:saturation=1.04,unsharp=5:5:0.35:5:5:0",
-        "punchy": ",eq=contrast=1.08:saturation=1.12:brightness=0.01,unsharp=5:5:0.45:5:5:0",
+        "crisp": ",eq=contrast=1.04:saturation=1.04,unsharp=3:3:0.25:3:3:0",
+        "punchy": ",eq=contrast=1.08:saturation=1.12:brightness=0.01,unsharp=3:3:0.30:3:3:0",
         "cinematic": ",eq=contrast=1.07:saturation=0.92:gamma=0.98,vignette=PI/7",
         "warm": ",eq=contrast=1.04:saturation=1.08:gamma_r=1.03:gamma_b=0.97",
     }
@@ -549,7 +576,7 @@ def _render_video(
         ffmpeg, "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
         "-vf", vf,
         "-threads", "1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", str(crf),
         "-r", str(fps), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "48000",
         "-movflags", "+faststart", "-shortest", str(output),
@@ -588,20 +615,49 @@ def _durable_payload(req: ClipCaptionRequest, request_id: str, token: str) -> di
     }
 
 
-async def _persist_job(job: dict[str, Any], payload: dict[str, Any] | None = None) -> None:
-    await asyncio.to_thread(
-        store.put_job,
-        str(job["job_id"]),
-        CAPTION_JOB_KIND,
-        str(job.get("status") or "unknown"),
-        payload,
-        _job_view(job),
-        job.get("error"),
-    )
+async def _persist_job(job: dict[str, Any], payload: dict[str, Any] | None = None) -> bool:
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                store.put_job,
+                str(job["job_id"]),
+                CAPTION_JOB_KIND,
+                str(job.get("status") or "unknown"),
+                payload,
+                _job_view(job),
+                job.get("error"),
+            ),
+            timeout=DURABLE_TIMEOUT_SECONDS,
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Caption job persistence timed out job_id=%s after %ss",
+            job.get("job_id"),
+            DURABLE_TIMEOUT_SECONDS,
+        )
+        return False
+    except Exception as exc:
+        logger.warning("Caption job persistence failed job_id=%s: %s", job.get("job_id"), exc)
+        return False
 
 
 async def _load_durable_job(job_id: str) -> dict[str, Any] | None:
-    row = await asyncio.to_thread(store.get_job, job_id)
+    try:
+        row = await asyncio.wait_for(
+            asyncio.to_thread(store.get_job, job_id),
+            timeout=DURABLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Caption durable-store lookup timed out after {DURABLE_TIMEOUT_SECONDS}s",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Caption durable-store lookup failed: {type(exc).__name__}: {exc}",
+        ) from exc
     if not row or row.get("kind") != CAPTION_JOB_KIND:
         return None
 
@@ -693,6 +749,7 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 else:
                     await asyncio.to_thread(_extract_audio, source, start, duration, audio)
                     words = await _transcribe_faster_whisper(audio, req.language)
+                    await _release_whisper_model()
 
                 preset = json.loads(json.dumps(PRESETS[req.preset]))
                 caption_cfg = preset["caption"]
