@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
+import logging
+
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
@@ -14,6 +17,8 @@ router = APIRouter(prefix="/threads", tags=["threads"])
 _settings: Settings | None = None
 _db: Database | None = None
 _service: ThreadsService | None = None
+_scheduler_task: asyncio.Task | None = None
+logger = logging.getLogger("threads.scheduler")
 
 
 def get_settings() -> Settings:
@@ -42,6 +47,54 @@ def require_internal_key(x_api_key: str | None = Header(default=None, alias="X-A
         raise HTTPException(status_code=503, detail=f"Threads feature is not configured: {exc}") from exc
     if not hmac.compare_digest(x_api_key or "", expected):
         raise HTTPException(status_code=401, detail="Invalid X-API-Key")
+
+
+async def _refresh_scheduler_loop() -> None:
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        # Master/control-plane intentionally may not carry Threads secrets.
+        return
+
+    await asyncio.sleep(settings.refresh_initial_delay_seconds)
+    while True:
+        try:
+            result = await get_service().refresh_all_scheduled()
+            if not result.get("ok"):
+                logger.error("Scheduled Threads refresh sweep had failures: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled Threads token refresh sweep crashed")
+        await asyncio.sleep(settings.refresh_check_interval_seconds)
+
+
+@router.on_event("startup")
+async def start_refresh_scheduler() -> None:
+    global _scheduler_task
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        return
+    if not settings.refresh_scheduler_enabled:
+        logger.info("Threads refresh scheduler disabled")
+        return
+    if _scheduler_task is None or _scheduler_task.done():
+        _scheduler_task = asyncio.create_task(
+            _refresh_scheduler_loop(), name="threads-token-refresh"
+        )
+
+
+@router.on_event("shutdown")
+async def stop_refresh_scheduler() -> None:
+    global _scheduler_task
+    if _scheduler_task is not None:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+        _scheduler_task = None
 
 
 @router.get("/health")
@@ -82,6 +135,12 @@ async def refresh_token(account: str, force: bool = Query(default=False), _: Non
 @router.post("/tokens/refresh-all")
 async def refresh_all(force: bool = Query(default=False), _: None = Depends(require_internal_key)):
     return await get_service().refresh_all(force=force)
+
+
+@router.post("/tokens/refresh-scheduled")
+async def refresh_scheduled(_: None = Depends(require_internal_key)):
+    """Run one production-style refresh sweep under the distributed DB lock."""
+    return await get_service().refresh_all_scheduled()
 
 
 @router.post("/publish/image")

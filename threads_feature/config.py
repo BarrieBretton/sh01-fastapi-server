@@ -81,6 +81,17 @@ class Settings:
     poll_interval_seconds: float = 5.0
     poll_timeout_seconds: int = 300
 
+    # Token-refresh worker. Every SH01 worker may start the loop; a Postgres
+    # advisory lock guarantees only one worker actually performs each sweep.
+    refresh_scheduler_enabled: bool = True
+    refresh_check_interval_seconds: int = 21_600
+    refresh_initial_delay_seconds: int = 30
+    refresh_max_attempts: int = 3
+    refresh_retry_base_seconds: float = 2.0
+    refresh_alert_expiry_days: int = 7
+    refresh_alert_chat_id: str = ""
+    telegram_bot_token: str = ""
+
     @classmethod
     def from_env(cls) -> "Settings":
         # Reuse the SAME effective Postgres runtime settings as n8n.
@@ -167,6 +178,28 @@ class Settings:
             poll_timeout_seconds=int(
                 os.getenv("THREADS_POLL_TIMEOUT_SECONDS", "300")
             ),
+            refresh_scheduler_enabled=_env_bool(
+                "THREADS_REFRESH_SCHEDULER_ENABLED", True
+            ),
+            refresh_check_interval_seconds=max(300, int(
+                os.getenv("THREADS_REFRESH_CHECK_INTERVAL_SECONDS", "21600")
+            )),
+            refresh_initial_delay_seconds=max(0, int(
+                os.getenv("THREADS_REFRESH_INITIAL_DELAY_SECONDS", "30")
+            )),
+            refresh_max_attempts=max(1, min(6, int(
+                os.getenv("THREADS_REFRESH_MAX_ATTEMPTS", "3")
+            ))),
+            refresh_retry_base_seconds=max(0.25, float(
+                os.getenv("THREADS_REFRESH_RETRY_BASE_SECONDS", "2")
+            )),
+            refresh_alert_expiry_days=max(1, int(
+                os.getenv("THREADS_REFRESH_ALERT_EXPIRY_DAYS", "7")
+            )),
+            refresh_alert_chat_id=os.getenv(
+                "THREADS_REFRESH_ALERT_TELEGRAM_CHAT_ID", ""
+            ).strip(),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         )
 
 

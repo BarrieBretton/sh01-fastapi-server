@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,6 +14,33 @@ from .config import ACCOUNT_MAP, Settings
 from .db import Database
 
 TERMINAL_CONTAINER_FAILURES = {"ERROR", "EXPIRED", "FAILED"}
+REFRESH_LOCK_NAME = "threads_token_refresh_scheduler_v1"
+logger = logging.getLogger("threads.refresh")
+
+
+class ThreadsRefreshError(RuntimeError):
+    def __init__(self, status_code: int, code: str, message: str, *, transient: bool = False):
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.transient = transient
+        super().__init__(f"Threads refresh HTTP {status_code} [{code}]: {message}")
+
+
+def _meta_error(response: httpx.Response) -> ThreadsRefreshError:
+    code = str(response.status_code)
+    message = (response.text or "").strip()[:2000] or f"HTTP {response.status_code}"
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            err = payload.get("error", payload)
+            if isinstance(err, dict):
+                code = str(err.get("code") or err.get("error_subcode") or code)
+                message = str(err.get("message") or err.get("error_user_msg") or message)[:2000]
+    except Exception:
+        pass
+    transient = response.status_code == 429 or response.status_code >= 500
+    return ThreadsRefreshError(response.status_code, code, message, transient=transient)
 
 
 def utcnow() -> datetime:
@@ -55,8 +83,10 @@ class ThreadsService:
                 """
                 select account_key, threads_user_id, access_token_encrypted,
                        expires_at, refreshed_at, verified_at, last_refresh_error,
+                       last_refresh_attempt_at, last_refresh_success_at, next_refresh_after,
+                       consecutive_refresh_failures, refresh_error_code, refresh_error_status,
                        created_at, updated_at
-                  from threads_auth
+                  from public.threads_auth
                  where account_key = $1
                 """,
                 key,
@@ -68,8 +98,11 @@ class ThreadsService:
             rows = await conn.fetch(
                 """
                 select account_key, threads_user_id, expires_at, refreshed_at,
-                       verified_at, last_refresh_error, created_at, updated_at
-                  from threads_auth
+                       verified_at, last_refresh_error, last_refresh_attempt_at,
+                       last_refresh_success_at, next_refresh_after,
+                       consecutive_refresh_failures, refresh_error_code, refresh_error_status,
+                       created_at, updated_at
+                  from public.threads_auth
                  order by account_key
                 """
             )
@@ -101,16 +134,19 @@ class ThreadsService:
         lifetime = expires_in or self.settings.assumed_long_lived_lifetime_seconds
         now = utcnow()
         expires_at = now + timedelta(seconds=lifetime)
+        next_refresh_after = expires_at - timedelta(days=self.settings.refresh_threshold_days)
 
         async with self.db.acquire() as conn:
             await conn.execute(
                 """
-                insert into threads_auth (
+                insert into public.threads_auth (
                     account_key, threads_user_id, access_token_encrypted,
                     expires_at, verified_at, refreshed_at,
-                    last_refresh_error, created_at, updated_at
+                    last_refresh_error, last_refresh_attempt_at, last_refresh_success_at,
+                    next_refresh_after, consecutive_refresh_failures,
+                    refresh_error_code, refresh_error_status, created_at, updated_at
                 )
-                values ($1,$2,$3,$4,$5,$6,null,$5,$5)
+                values ($1,$2,$3,$4,$5,$6,null,null,$6,$7,0,null,null,$5,$5)
                 on conflict (account_key) do update set
                     threads_user_id = excluded.threads_user_id,
                     access_token_encrypted = excluded.access_token_encrypted,
@@ -118,9 +154,15 @@ class ThreadsService:
                     verified_at = excluded.verified_at,
                     refreshed_at = excluded.refreshed_at,
                     last_refresh_error = null,
+                    last_refresh_attempt_at = null,
+                    last_refresh_success_at = excluded.last_refresh_success_at,
+                    next_refresh_after = excluded.next_refresh_after,
+                    consecutive_refresh_failures = 0,
+                    refresh_error_code = null,
+                    refresh_error_status = null,
                     updated_at = excluded.updated_at
                 """,
-                key, user_id, self._encrypt(access_token), expires_at, now, now,
+                key, user_id, self._encrypt(access_token), expires_at, now, now, next_refresh_after,
             )
 
         return {
@@ -129,7 +171,57 @@ class ThreadsService:
             "threads_user_id": user_id,
             "username": identity.get("username"),
             "expires_at": expires_at.isoformat(),
+            "next_refresh_after": next_refresh_after.isoformat(),
         }
+
+    async def _record_refresh_failure(
+        self, account: str, exc: Exception, when: datetime, remaining: timedelta
+    ) -> None:
+        status = exc.status_code if isinstance(exc, ThreadsRefreshError) else None
+        code = exc.code if isinstance(exc, ThreadsRefreshError) else exc.__class__.__name__
+        message = str(exc)[:4000]
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                """
+                update public.threads_auth
+                   set last_refresh_error = $2,
+                       refresh_error_code = $3,
+                       refresh_error_status = $4,
+                       consecutive_refresh_failures = consecutive_refresh_failures + 1,
+                       updated_at = $5
+                 where account_key = $1
+                """,
+                account, message, code, status, when,
+            )
+        if remaining <= timedelta(days=self.settings.refresh_alert_expiry_days):
+            await self._send_refresh_alert(account, message, remaining)
+
+    async def _send_refresh_alert(self, account: str, error: str, remaining: timedelta) -> None:
+        chat_id = self.settings.refresh_alert_chat_id
+        bot_token = self.settings.telegram_bot_token
+        if not chat_id or not bot_token:
+            logger.error(
+                "Threads token refresh is inside alert window for @%s but Telegram alerting is not configured",
+                account,
+            )
+            return
+        days = max(0.0, remaining.total_seconds() / 86400)
+        text = (
+            f"THREADS TOKEN REFRESH ALERT\n"
+            f"Account: @{account}\n"
+            f"Days remaining: {days:.2f}\n"
+            f"Error: {error[:1500]}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={"chat_id": chat_id, "text": text},
+                )
+            if response.status_code >= 300:
+                logger.error("Telegram refresh alert failed: HTTP %s %s", response.status_code, response.text[:500])
+        except Exception:
+            logger.exception("Telegram refresh alert crashed")
 
     async def refresh_token(self, account: str, force: bool = False) -> dict[str, Any]:
         key = normalize_account(account)
@@ -137,10 +229,11 @@ class ThreadsService:
         if not row:
             raise RuntimeError(f"No stored Threads token for @{key}")
 
+        now = utcnow()
         expires_at = row["expires_at"]
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        remaining = expires_at - utcnow()
+        remaining = expires_at - now
         threshold = timedelta(days=self.settings.refresh_threshold_days)
 
         if not force and remaining > threshold:
@@ -152,60 +245,120 @@ class ThreadsService:
             }
 
         old_token = self._decrypt(row["access_token_encrypted"])
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(
-                    f"{self.settings.api_base}/refresh_access_token",
-                    params={"grant_type": "th_refresh_token", "access_token": old_token},
-                )
-            response.raise_for_status()
+        reference = row.get("last_refresh_success_at") or row.get("refreshed_at") or row.get("created_at")
+        if reference and reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        token_age = now - reference if reference else timedelta(days=999)
 
-            # Meta's current official collection documents an empty refresh response.
-            # If a JSON token is returned, accept it; otherwise keep the same token.
-            token = old_token
-            lifetime = self.settings.assumed_long_lived_lifetime_seconds
-            if response.content:
-                try:
-                    body = response.json()
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                """
+                update public.threads_auth
+                   set last_refresh_attempt_at = $2, updated_at = $2
+                 where account_key = $1
+                """,
+                key, now,
+            )
+
+        last_exc: Exception | None = None
+        response: httpx.Response | None = None
+        for attempt in range(1, self.settings.refresh_max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(
+                        f"{self.settings.api_base}/refresh_access_token",
+                        params={"grant_type": "th_refresh_token", "access_token": old_token},
+                    )
+                if response.status_code >= 400:
+                    exc = _meta_error(response)
+                    # Fresh long-lived tokens may not yet be refreshable. A forced
+                    # smoke test must not poison health/error counters for that case.
+                    if response.status_code == 400 and token_age < timedelta(hours=24):
+                        retry_at = reference + timedelta(hours=24) if reference else now + timedelta(hours=24)
+                        async with self.db.acquire() as conn:
+                            await conn.execute(
+                                """
+                                update public.threads_auth
+                                   set last_refresh_error = null,
+                                       refresh_error_code = 'token_too_young_to_refresh',
+                                       refresh_error_status = 400,
+                                       consecutive_refresh_failures = 0,
+                                       next_refresh_after = greatest(coalesce(next_refresh_after, $2), $2),
+                                       updated_at = $3
+                                 where account_key = $1
+                                """,
+                                key, retry_at, now,
+                            )
+                        return {
+                            "ok": True, "account": key, "refreshed": False,
+                            "reason": "token_too_young_to_refresh",
+                            "retry_after": retry_at.isoformat(),
+                            "expires_at": expires_at.isoformat(),
+                        }
+                    raise exc
+                last_exc = None
+                break
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_exc = exc
+                transient = True
+            except ThreadsRefreshError as exc:
+                last_exc = exc
+                transient = exc.transient
+
+            if not transient or attempt >= self.settings.refresh_max_attempts:
+                break
+            delay = self.settings.refresh_retry_base_seconds * (2 ** (attempt - 1))
+            await asyncio.sleep(delay)
+
+        if last_exc is not None or response is None:
+            exc = last_exc or RuntimeError("Threads refresh produced no response")
+            await self._record_refresh_failure(key, exc, utcnow(), remaining)
+            raise exc
+
+        # Meta's official collection currently documents a successful refresh
+        # response with no body. If a token/expires_in is returned, use it; if
+        # not, retain the existing token and renew our known lifetime.
+        token = old_token
+        lifetime = self.settings.assumed_long_lived_lifetime_seconds
+        if response.content:
+            try:
+                body = response.json()
+                if isinstance(body, dict):
                     token = str(body.get("access_token") or token)
                     lifetime = int(body.get("expires_in") or lifetime)
-                except (ValueError, TypeError, json.JSONDecodeError):
-                    pass
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
 
-            identity = await self.validate_token(key, token)
-            now = utcnow()
-            new_expiry = now + timedelta(seconds=lifetime)
-            async with self.db.acquire() as conn:
-                await conn.execute(
-                    """
-                    update threads_auth
-                       set access_token_encrypted = $2,
-                           expires_at = $3,
-                           refreshed_at = $4,
-                           verified_at = $4,
-                           last_refresh_error = null,
-                           updated_at = $4
-                     where account_key = $1
-                    """,
-                    key, self._encrypt(token), new_expiry, now,
-                )
-            return {
-                "ok": True, "account": key, "refreshed": True,
-                "threads_user_id": identity.get("id"),
-                "username": identity.get("username"),
-                "expires_at": new_expiry.isoformat(),
-            }
-        except Exception as exc:
-            async with self.db.acquire() as conn:
-                await conn.execute(
-                    """
-                    update threads_auth
-                       set last_refresh_error = $2, updated_at = $3
-                     where account_key = $1
-                    """,
-                    key, str(exc)[:4000], utcnow(),
-                )
-            raise
+        identity = await self.validate_token(key, token)
+        success_at = utcnow()
+        new_expiry = success_at + timedelta(seconds=lifetime)
+        next_refresh_after = new_expiry - threshold
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                """
+                update public.threads_auth
+                   set access_token_encrypted = $2,
+                       expires_at = $3,
+                       refreshed_at = $4,
+                       verified_at = $4,
+                       last_refresh_success_at = $4,
+                       next_refresh_after = $5,
+                       last_refresh_error = null,
+                       refresh_error_code = null,
+                       refresh_error_status = null,
+                       consecutive_refresh_failures = 0,
+                       updated_at = $4
+                 where account_key = $1
+                """,
+                key, self._encrypt(token), new_expiry, success_at, next_refresh_after,
+            )
+        return {
+            "ok": True, "account": key, "refreshed": True,
+            "threads_user_id": identity.get("id"),
+            "username": identity.get("username"),
+            "expires_at": new_expiry.isoformat(),
+            "next_refresh_after": next_refresh_after.isoformat(),
+        }
 
     async def refresh_all(self, force: bool = False) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
@@ -213,8 +366,23 @@ class ThreadsService:
             try:
                 results.append(await self.refresh_token(account, force=force))
             except Exception as exc:
-                results.append({"ok": False, "account": account, "error": str(exc)})
+                results.append({"ok": False, "account": account, "error": str(exc)[:2000]})
         return {"ok": all(x.get("ok") for x in results), "results": results}
+
+    async def refresh_all_scheduled(self) -> dict[str, Any]:
+        # Session-level advisory lock: released automatically if a worker dies.
+        async with self.db.acquire() as lock_conn:
+            locked = await lock_conn.fetchval(
+                "select pg_try_advisory_lock(hashtext($1)::bigint)", REFRESH_LOCK_NAME
+            )
+            if not locked:
+                return {"ok": True, "skipped": True, "reason": "refresh_lock_held_elsewhere"}
+            try:
+                return await self.refresh_all(force=False)
+            finally:
+                await lock_conn.fetchval(
+                    "select pg_advisory_unlock(hashtext($1)::bigint)", REFRESH_LOCK_NAME
+                )
 
     async def get_valid_token(self, account: str) -> str:
         key = normalize_account(account)
@@ -226,11 +394,20 @@ class ThreadsService:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at <= utcnow():
             raise RuntimeError(f"Threads token for @{key} is already expired; fresh OAuth is required.")
+
+        old_token = self._decrypt(row["access_token_encrypted"])
         if expires_at - utcnow() <= timedelta(days=self.settings.refresh_threshold_days):
-            await self.refresh_token(key, force=True)
-            row = await self._token_row(key)
-            assert row is not None
-        return self._decrypt(row["access_token_encrypted"])
+            try:
+                result = await self.refresh_token(key, force=False)
+                if result.get("refreshed"):
+                    row = await self._token_row(key)
+                    assert row is not None
+                    return self._decrypt(row["access_token_encrypted"])
+            except Exception:
+                # Refresh outages should not stop publishing while the existing
+                # token is still valid. The failure is persisted/alerted separately.
+                logger.exception("Threads refresh failed for @%s; using still-valid token", key)
+        return old_token
 
     async def _request_container_status(self, account: str, container_id: str) -> dict[str, Any]:
         token = await self.get_valid_token(account)
@@ -328,7 +505,7 @@ class ThreadsService:
 
         async with self.db.acquire() as conn:
             row = await conn.fetchrow(
-                "select * from threads_publish_jobs where account_key=$1 and idempotency_key=$2",
+                "select * from public.threads_publish_jobs where account_key=$1 and idempotency_key=$2",
                 account, key,
             )
 
@@ -352,7 +529,7 @@ class ThreadsService:
             async with self.db.acquire() as conn:
                 await conn.execute(
                     """
-                    insert into threads_publish_jobs (
+                    insert into public.threads_publish_jobs (
                         account_key,idempotency_key,media_type,media_url,text_body,
                         container_id,status,created_at,updated_at
                     ) values ($1,$2,$3,$4,$5,$6,'container_created',now(),now())
@@ -365,7 +542,7 @@ class ThreadsService:
         async with self.db.acquire() as conn:
             await conn.execute(
                 """
-                update threads_publish_jobs set status='container_ready', last_error=null,
+                update public.threads_publish_jobs set status='container_ready', last_error=null,
                        updated_at=now() where account_key=$1 and idempotency_key=$2
                 """,
                 account, key,
@@ -382,7 +559,7 @@ class ThreadsService:
             async with self.db.acquire() as conn:
                 await conn.execute(
                     """
-                    update threads_publish_jobs set status=$3,last_error=$4,updated_at=now()
+                    update public.threads_publish_jobs set status=$3,last_error=$4,updated_at=now()
                     where account_key=$1 and idempotency_key=$2
                     """,
                     account, key,
@@ -400,7 +577,7 @@ class ThreadsService:
         async with self.db.acquire() as conn:
             await conn.execute(
                 """
-                update threads_publish_jobs set status='published',post_id=$3,permalink=$4,
+                update public.threads_publish_jobs set status='published',post_id=$3,permalink=$4,
                        last_error=null,published_at=now(),updated_at=now()
                 where account_key=$1 and idempotency_key=$2
                 """,
