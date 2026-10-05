@@ -246,22 +246,36 @@ def render_resume(slot: str, role: str) -> dict[str, Any]:
 
 def render_trigger_deploy(slot: str, role: str) -> dict[str, Any]:
     cfg = _service(slot, role)
+
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             f"{RENDER_API_BASE}/services/{cfg['service_id']}/deploys",
             headers=_headers(cfg["api_key"]),
-            json={"deployMode": "deploy_only"},
+            json={
+                "deployMode": "build_and_deploy",
+            },
         )
+
     if response.status_code not in (200, 201, 202):
         raise RuntimeError(
             f"Render deploy trigger failed for {slot}/{role}: "
             f"HTTP {response.status_code} {response.text[:1000]}"
         )
+
     payload = response.json()
     deploy_id = payload.get("id") or payload.get("deploy", {}).get("id")
+
     if not deploy_id:
-        raise RuntimeError(f"Render deploy response did not contain deploy id: {payload}")
-    return {"slot": slot, "role": role, "deploy_id": deploy_id, "raw": payload}
+        raise RuntimeError(
+            f"Render deploy response did not contain deploy id: {payload}"
+        )
+
+    return {
+        "slot": slot,
+        "role": role,
+        "deploy_id": deploy_id,
+        "raw": payload,
+    }
 
 
 def render_wait_for_deploy(
