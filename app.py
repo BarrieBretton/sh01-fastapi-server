@@ -36,6 +36,7 @@ from infra.media_job_store_routes import router as media_job_store_router
 from media_router import router as media_router
 from caption_router import router as caption_router
 from auto_editor import router as auto_editor_router
+from threads_feature.router import router as threads_router
 
 # Add this import at the top with other imports
 from sheets_helper import (
@@ -314,6 +315,7 @@ app.include_router(media_job_store_router)
 app.include_router(media_router)
 app.include_router(caption_router)
 app.include_router(auto_editor_router)
+app.include_router(threads_router)
 
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
