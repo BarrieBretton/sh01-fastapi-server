@@ -357,6 +357,7 @@ def run_failover(
         target_env_may_have_changed["sh01"] = True
         result["phases"]["render_config_sh01"] = render_configure_sh01_runtime(
             target_render,
+            pg_runtime,
             b2_runtime,
         )
 

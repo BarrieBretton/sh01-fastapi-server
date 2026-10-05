@@ -210,7 +210,7 @@ def _expected_runtime_env(slot: str, role: str) -> dict[str, str]:
     expected: dict[str, str] = {}
     db_map, b2_map = _service_env_maps(slot, role)
 
-    if role == "n8n":
+    if role in {"n8n", "sh01"}:
         postgres_slot = active.get("postgres")
         if not postgres_slot:
             raise RuntimeError("No active Postgres slot is configured")

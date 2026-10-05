@@ -323,11 +323,20 @@ def render_configure_n8n_runtime(
 
 def render_configure_sh01_runtime(
     slot: str,
+    postgres_runtime: dict[str, str] | None = None,
     b2_runtime: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     cfg = _service(slot, "sh01")
 
     env: dict[str, str] = {}
+
+    # SH01 now consumes the same active Postgres runtime abstraction as n8n.
+    # This keeps application features such as Threads aligned with the infra
+    # ring without hard-coding any Supabase slot into SH01 itself.
+    if postgres_runtime:
+        for field, env_name in cfg["db_env_map"].items():
+            if field in postgres_runtime:
+                env[env_name] = str(postgres_runtime[field])
 
     if b2_runtime:
         for field, env_name in cfg["b2_env_map"].items():
