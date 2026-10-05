@@ -329,29 +329,47 @@ class ThreadsService:
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
 
-        identity = await self.validate_token(key, token)
-        success_at = utcnow()
-        new_expiry = success_at + timedelta(seconds=lifetime)
-        next_refresh_after = new_expiry - threshold
-        async with self.db.acquire() as conn:
-            await conn.execute(
-                """
-                update public.threads_auth
-                   set access_token_encrypted = $2,
-                       expires_at = $3,
-                       refreshed_at = $4,
-                       verified_at = $4,
-                       last_refresh_success_at = $4,
-                       next_refresh_after = $5,
-                       last_refresh_error = null,
-                       refresh_error_code = null,
-                       refresh_error_status = null,
-                       consecutive_refresh_failures = 0,
-                       updated_at = $4
-                 where account_key = $1
-                """,
-                key, self._encrypt(token), new_expiry, success_at, next_refresh_after,
-            )
+        # Treat post-refresh verification/persistence as part of the refresh
+        # transaction from an observability perspective. A 2xx from Meta is not
+        # considered a completed refresh until the returned/retained token still
+        # resolves to the expected Threads user and the new metadata is persisted.
+        try:
+            identity = await self.validate_token(key, token)
+            success_at = utcnow()
+            new_expiry = success_at + timedelta(seconds=lifetime)
+            next_refresh_after = new_expiry - threshold
+
+            async with self.db.acquire() as conn:
+                await conn.execute(
+                    """
+                    update public.threads_auth
+                       set access_token_encrypted = $2,
+                           expires_at = $3,
+                           refreshed_at = $4,
+                           verified_at = $4,
+                           last_refresh_success_at = $4,
+                           next_refresh_after = $5,
+                           last_refresh_error = null,
+                           refresh_error_code = null,
+                           refresh_error_status = null,
+                           consecutive_refresh_failures = 0,
+                           updated_at = $4
+                     where account_key = $1
+                    """,
+                    key, self._encrypt(token), new_expiry, success_at, next_refresh_after,
+                )
+        except Exception as exc:
+            # Preserve the original exception even if recording telemetry itself
+            # fails (for example, during a simultaneous database outage).
+            try:
+                await self._record_refresh_failure(key, exc, utcnow(), remaining)
+            except Exception:
+                logger.exception(
+                    "Failed to persist Threads post-refresh failure telemetry for @%s",
+                    key,
+                )
+            raise
+
         return {
             "ok": True, "account": key, "refreshed": True,
             "threads_user_id": identity.get("id"),
