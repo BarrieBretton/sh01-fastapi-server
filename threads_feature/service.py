@@ -27,6 +27,24 @@ class ThreadsRefreshError(RuntimeError):
         super().__init__(f"Threads refresh HTTP {status_code} [{code}]: {message}")
 
 
+class ThreadsApiError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        operation: str,
+        account: str,
+        payload: object,
+    ):
+        self.status_code = status_code
+        self.operation = operation
+        self.account = account
+        self.payload = payload
+        super().__init__(
+            f"Threads API HTTP {status_code} during {operation} for @{account}: {payload}"
+        )
+
+
 def _meta_error(response: httpx.Response) -> ThreadsRefreshError:
     code = str(response.status_code)
     message = (response.text or "").strip()[:2000] or f"HTTP {response.status_code}"
@@ -472,7 +490,19 @@ class ThreadsService:
 
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(f"{self.settings.api_base}/me/threads", params=params)
-        response.raise_for_status()
+
+        if response.is_error:
+            try:
+                error_payload: object = response.json()
+            except Exception:
+                error_payload = (response.text or "")[:4000]
+            raise ThreadsApiError(
+                status_code=response.status_code,
+                operation="create_container",
+                account=normalize_account(account),
+                payload=error_payload,
+            )
+
         payload = response.json()
         container_id = str(payload.get("id", "")).strip()
         if not container_id:

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from .config import ACCOUNT_MAP, Settings
 from .db import Database
 from .models import BootstrapTokenRequest, ImagePublishRequest, UnifiedPublishRequest, VideoPublishRequest
-from .service import ThreadsService
+from .service import ThreadsApiError, ThreadsService
 
 router = APIRouter(prefix="/threads", tags=["threads"])
 
@@ -120,6 +120,18 @@ async def token_status(_: None = Depends(require_internal_key)):
 async def bootstrap_token(payload: BootstrapTokenRequest, _: None = Depends(require_internal_key)):
     try:
         return await get_service().bootstrap_token(payload.account, payload.access_token, payload.expires_in)
+    except ThreadsApiError as exc:
+        status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "platform": "threads",
+                "account": exc.account,
+                "operation": exc.operation,
+                "upstream_status": exc.status_code,
+                "meta": exc.payload,
+            },
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
