@@ -188,5 +188,17 @@ async def publish_unified(payload: UnifiedPublishRequest, _: None = Depends(requ
             text=payload.text, alt_text=payload.alt_text, reply_control=payload.reply_control,
             idempotency_key=payload.idempotency_key,
         )
+    except ThreadsApiError as exc:
+        status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "platform": "threads",
+                "account": exc.account,
+                "operation": exc.operation,
+                "upstream_status": exc.status_code,
+                "meta": exc.payload,
+            },
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
