@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 import httpx
 import requests
 from requests_oauthlib import OAuth1
+from PIL import Image, ImageOps
 
 from .config import Settings, credentials_for, normalize_account
 from .db import Database
@@ -89,37 +90,104 @@ class TumblrService:
             )
         return matched
 
-    async def _download_media(self, url: str, media_type: str) -> tuple[Path, str]:
-        suffix = ".mp4" if media_type == "VIDEO" else ".jpg"
+    async def _download_media(
+        self, url: str, media_type: str
+    ) -> tuple[Path, str, int | None, int | None]:
+        suffix = ".mp4" if media_type == "VIDEO" else ".img"
         fd, raw = tempfile.mkstemp(prefix="sh01-tumblr-", suffix=suffix)
         os.close(fd)
         path = Path(raw)
         total = 0
         content_type = ""
+
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=300), follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30, read=300),
+                follow_redirects=True,
+            ) as client:
                 async with client.stream("GET", url) as response:
                     response.raise_for_status()
-                    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                    content_type = (
+                        response.headers.get("content-type") or ""
+                    ).split(";")[0].strip().lower()
+
                     with path.open("wb") as f:
                         async for chunk in response.aiter_bytes(1024 * 1024):
                             total += len(chunk)
                             if total > self.settings.media_max_bytes:
                                 raise RuntimeError(
-                                    f"Tumblr media exceeds TUMBLR_MEDIA_MAX_BYTES={self.settings.media_max_bytes}"
+                                    "Tumblr media exceeds "
+                                    f"TUMBLR_MEDIA_MAX_BYTES={self.settings.media_max_bytes}"
                                 )
                             f.write(chunk)
+
             if total <= 0:
                 raise RuntimeError("Downloaded Tumblr media is empty")
+
+            if media_type == "IMAGE":
+                normalized = path.with_suffix(".jpg")
+                try:
+                    with Image.open(path) as source:
+                        source.load()
+                        source = ImageOps.exif_transpose(source)
+                        width, height = source.size
+                        if width <= 0 or height <= 0:
+                            raise RuntimeError(
+                                f"Decoded Tumblr image has invalid dimensions {source.size}"
+                            )
+
+                        if source.mode in {"RGBA", "LA"} or (
+                            source.mode == "P" and "transparency" in source.info
+                        ):
+                            rgba = source.convert("RGBA")
+                            background = Image.new(
+                                "RGBA", rgba.size, (255, 255, 255, 255)
+                            )
+                            background.alpha_composite(rgba)
+                            output = background.convert("RGB")
+                        elif source.mode != "RGB":
+                            output = source.convert("RGB")
+                        else:
+                            output = source.copy()
+
+                        output.save(
+                            normalized,
+                            format="JPEG",
+                            quality=95,
+                            optimize=True,
+                        )
+                except Exception as exc:
+                    normalized.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Tumblr image normalization failed: {exc}"
+                    ) from exc
+
+                path.unlink(missing_ok=True)
+                path = normalized
+                content_type = "image/jpeg"
+
+                normalized_size = path.stat().st_size
+                if normalized_size <= 0:
+                    raise RuntimeError("Normalized Tumblr JPEG is empty")
+                if normalized_size > self.settings.media_max_bytes:
+                    raise RuntimeError(
+                        "Normalized Tumblr image exceeds "
+                        f"TUMBLR_MEDIA_MAX_BYTES={self.settings.media_max_bytes}"
+                    )
+
+                return path, content_type, width, height
+
             if not content_type:
-                content_type = mimetypes.guess_type(str(path))[0] or (
-                    "video/mp4" if media_type == "VIDEO" else "image/jpeg"
-                )
-            if media_type == "VIDEO" and content_type not in {"video/mp4", "video/quicktime"}:
+                content_type = mimetypes.guess_type(str(path))[0] or "video/mp4"
+
+            if content_type not in {"video/mp4", "video/quicktime"}:
                 raise RuntimeError(
-                    f"Tumblr native video requires MP4/MOV; downloaded content-type={content_type!r}"
+                    "Tumblr native video requires MP4/MOV; "
+                    f"downloaded content-type={content_type!r}"
                 )
-            return path, content_type
+
+            return path, content_type, None, None
+
         except Exception:
             path.unlink(missing_ok=True)
             raise
@@ -139,14 +207,35 @@ class TumblrService:
             )
         return dict(row) if row else None
 
-    async def _create_post(self, *, account: str, media_type: str, path: Path,
-                           content_type: str, text: str, tags: list[str], state: str) -> dict[str, Any]:
+    async def _create_post(
+        self,
+        *,
+        account: str,
+        media_type: str,
+        path: Path,
+        content_type: str,
+        width: int | None,
+        height: int | None,
+        text: str,
+        tags: list[str],
+        state: str,
+    ) -> dict[str, Any]:
         creds = credentials_for(account)
         identifier = "media"
         if media_type == "IMAGE":
-            media_block = {"type": "image", "media": [{"type": content_type, "identifier": identifier}]}
+            media_object: dict[str, Any] = {
+                "type": content_type,
+                "identifier": identifier,
+            }
+            if width is not None and height is not None:
+                media_object["width"] = width
+                media_object["height"] = height
+            media_block = {"type": "image", "media": [media_object]}
         else:
-            media_block = {"type": "video", "media": {"type": content_type, "identifier": identifier}}
+            media_block = {
+                "type": "video",
+                "media": {"type": content_type, "identifier": identifier},
+            }
         content: list[dict[str, Any]] = [media_block]
         if text.strip():
             content.append({"type": "text", "text": text.strip()})
@@ -220,7 +309,9 @@ class TumblrService:
                 )
 
         try:
-            path, content_type = await self._download_media(media_url, media_type)
+            path, content_type, width, height = await self._download_media(
+                media_url, media_type
+            )
         except Exception as exc:
             async with self.db.acquire() as conn:
                 await conn.execute(
@@ -232,8 +323,15 @@ class TumblrService:
         try:
             try:
                 payload = await self._create_post(
-                    account=account, media_type=media_type, path=path, content_type=content_type,
-                    text=text, tags=tags, state=state,
+                    account=account,
+                    media_type=media_type,
+                    path=path,
+                    content_type=content_type,
+                    width=width,
+                    height=height,
+                    text=text,
+                    tags=tags,
+                    state=state,
                 )
             except TumblrApiError as exc:
                 async with self.db.acquire() as conn:
