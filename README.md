@@ -713,7 +713,7 @@ The registry should contain env-var names, not secret values.
 - Both n8n and SH01 belong to one paired Render slot.
 - n8n direct health uses `/healthz/readiness`.
 - SH01 direct health currently uses `/`.
-- Render deploy requests use `deployMode=deploy_only`.
+- Render deploy requests use `deployMode=build_and_deploy` so failover builds the latest commit.
 - `N8N_ENCRYPTION_KEY` is not rewritten by the control plane; keep it identical across n8n slots.
 - B2 comparison distinguishes source completeness from destination-only extras.
 - `prune_extra` is destructive.
@@ -805,3 +805,46 @@ ACTIVE_B2_SLOT=b2-a
 ```
 
 Always verify live state after future failovers rather than assuming this snapshot remains current.
+---
+
+# Social distribution subsystem
+
+SH01 now also provides an authenticated, idempotent, multi-account social-distribution backend.
+
+Current platform state:
+
+```text
+Threads   -> active
+Tumblr    -> active
+X.com     -> backend retained, n8n scaffold only
+TikTok    -> n8n scaffold only
+```
+
+The canonical n8n child workflow accepts a compact item such as:
+
+```json
+{
+  "image_url": "...",
+  "caption": "...",
+  "account": "..."
+}
+```
+
+and maps the canonical account to platform-specific handles before posting sequentially.
+
+Detailed architecture, environment variables, token lifecycle, account onboarding, migrations, idempotency semantics, troubleshooting, and current known limitations are documented in:
+
+```text
+docs/SOCIAL_DISTRIBUTION.md
+```
+
+Important current notes:
+
+- social features use the same active `DB_POSTGRESDB_*` runtime as n8n;
+- Threads tokens are encrypted in Postgres;
+- Threads stored expiry can currently be an assumed lifetime and must not be treated as authoritative live Meta validity;
+- Tumblr uses NPF multipart publishing and normalizes remote images to canonical JPEG before upload;
+- X is intentionally parked because current API access would require opting into the newer paid/pay-per-use enrollment;
+- TikTok is intentionally scaffold-only;
+- static social secrets must exist on every SH01 serving Render slot;
+- Render failover deploys currently use `deployMode=build_and_deploy`.
