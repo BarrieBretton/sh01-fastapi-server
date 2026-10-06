@@ -37,6 +37,7 @@ from media_router import router as media_router
 from caption_router import router as caption_router
 from auto_editor import router as auto_editor_router
 from threads_feature.router import router as threads_router
+from x_feature.router import router as x_router, require_internal_key as require_x_internal_key
 
 # Add this import at the top with other imports
 from sheets_helper import (
@@ -316,6 +317,7 @@ app.include_router(media_router)
 app.include_router(caption_router)
 app.include_router(auto_editor_router)
 app.include_router(threads_router)
+app.include_router(x_router)
 
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
@@ -1691,7 +1693,14 @@ async def post_tumblr_image(body: TumblrPostRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/post_image")
-async def post_image_to_x(image_url: str = Body(...), text: str = Body("")):
+async def post_image_to_x(
+    image_url: str = Body(...),
+    text: str = Body(""),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+):
+    # Legacy compatibility route. New callers should use /x/publish.
+    # It is intentionally protected now; the old route used to be public.
+    require_x_internal_key(x_api_key)
     try:
         img_resp = requests.get(image_url, stream=True, timeout=90)
         img_resp.raise_for_status()
