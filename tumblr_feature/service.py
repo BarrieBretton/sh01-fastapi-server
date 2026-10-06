@@ -246,7 +246,10 @@ class TumblrService:
         def run():
             with path.open("rb") as f:
                 files = {
-                    "json": ("post.json", json.dumps(body), "application/json"),
+                    # Tumblr's NPF multipart contract expects the JSON part as a
+                    # normal form field named "json" (no filename), followed by
+                    # the actual media part whose key matches the NPF identifier.
+                    "json": (None, json.dumps(body), "application/json"),
                     identifier: (path.name, f, content_type),
                 }
                 r = requests.post(
