@@ -37,6 +37,7 @@ from media_router import router as media_router
 from caption_router import router as caption_router
 from auto_editor import router as auto_editor_router
 from threads_feature.router import router as threads_router
+from tumblr_feature.router import router as tumblr_router, require_internal_key as require_tumblr_internal_key
 from x_feature.router import router as x_router, require_internal_key as require_x_internal_key
 
 # Add this import at the top with other imports
@@ -317,6 +318,7 @@ app.include_router(media_router)
 app.include_router(caption_router)
 app.include_router(auto_editor_router)
 app.include_router(threads_router)
+app.include_router(tumblr_router)
 app.include_router(x_router)
 
 def pick_tumblr_account(name: str):
@@ -1670,7 +1672,12 @@ async def activate_selected(workflows: str = Query(None)):
     }
 
 @app.post("/post_tumblr")
-async def post_tumblr_image(body: TumblrPostRequest):
+async def post_tumblr_image(
+    body: TumblrPostRequest,
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+):
+    # Legacy compatibility endpoint. New callers should use /tumblr/publish.
+    require_tumblr_internal_key(x_api_key)
     oauth, blog_id, account = pick_tumblr_account(body.tumblr_account)
     caption = (body.caption or "").strip()
     try:
