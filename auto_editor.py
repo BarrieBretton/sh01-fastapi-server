@@ -46,6 +46,7 @@ from caption_router import (
     _release_whisper_model,
     _run,
     _transcribe_faster_whisper,
+    _copy_local_source,
 )
 
 logger = logging.getLogger("auto_editor")
@@ -105,6 +106,7 @@ class SfxAsset(BaseModel):
 
 
 class AutoEditRequest(BaseModel):
+    source_path: str | None = None
     source_url: str | None = None
     telegram_file_id: str | None = None
     request_id: str | None = Field(default=None, max_length=512)
@@ -149,8 +151,12 @@ class AutoEditRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_request(self):
-        if bool(self.source_url) == bool(self.telegram_file_id):
-            raise ValueError("Provide exactly one of source_url or telegram_file_id")
+        if sum(bool(value) for value in (
+            self.source_url, self.telegram_file_id, self.source_path
+        )) != 1:
+            raise ValueError(
+                "Provide exactly one of source_url, telegram_file_id, or source_path"
+            )
         if self.end_seconds is not None and self.end_seconds <= self.start_seconds:
             raise ValueError("end_seconds must be greater than start_seconds")
         if len(self.overlays) > AUTO_EDIT_ASSET_MAX:
@@ -834,8 +840,10 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 audio = root / "audio.wav"
                 if req.source_url:
                     await _download_url(req.source_url, source)
+                elif req.telegram_file_id:
+                    await _download_telegram(req.telegram_file_id, source)
                 else:
-                    await _download_telegram(str(req.telegram_file_id), source)
+                    await asyncio.to_thread(_copy_local_source, str(req.source_path), source)
 
                 total = await asyncio.to_thread(_ffprobe_duration, source)
                 start = min(req.start_seconds, max(0.0, total - 0.05))

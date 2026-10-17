@@ -211,6 +211,7 @@ class CaptionOverrides(BaseModel):
 
 
 class ClipCaptionRequest(BaseModel):
+    source_path: str | None = None
     source_url: str | None = None
     telegram_file_id: str | None = None
     request_id: str | None = Field(default=None, max_length=512)
@@ -235,8 +236,12 @@ class ClipCaptionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_input(self):
-        if bool(self.source_url) == bool(self.telegram_file_id):
-            raise ValueError("Provide exactly one of source_url or telegram_file_id")
+        if sum(bool(value) for value in (
+            self.source_url, self.telegram_file_id, self.source_path
+        )) != 1:
+            raise ValueError(
+                "Provide exactly one of source_url, telegram_file_id, or source_path"
+            )
         if self.end_seconds is not None:
             if self.end_seconds <= self.start_seconds:
                 raise ValueError("end_seconds must be greater than start_seconds")
@@ -297,6 +302,43 @@ async def _download_url(url: str, dest: Path) -> None:
                         f.write(chunk)
                 return
     raise HTTPException(status_code=400, detail="Too many redirects")
+
+
+def _copy_local_source(source_path: str, dest: Path) -> None:
+    root_setting = os.getenv("MEDIA_LOCAL_SOURCE_DIR", "").strip()
+    if not root_setting:
+        raise HTTPException(
+            status_code=403,
+            detail="Local media input is not enabled on this instance",
+        )
+
+    root = Path(root_setting).expanduser()
+    requested = Path(source_path).expanduser()
+    if not root.is_absolute() or not requested.is_absolute():
+        raise HTTPException(status_code=400, detail="Local media paths must be absolute")
+
+    try:
+        root = root.resolve(strict=True)
+        source = requested.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail="Local media path does not exist") from exc
+
+    if not root.is_dir() or not source.is_relative_to(root) or not source.is_file():
+        raise HTTPException(
+            status_code=403,
+            detail="Local source must be a file inside MEDIA_LOCAL_SOURCE_DIR",
+        )
+
+    if source.stat().st_size > MAX_SOURCE_BYTES:
+        raise HTTPException(status_code=413, detail="Local source is too large")
+
+    total = 0
+    with source.open("rb") as incoming, dest.open("wb") as outgoing:
+        while chunk := incoming.read(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_SOURCE_BYTES:
+                raise HTTPException(status_code=413, detail="Local source is too large")
+            outgoing.write(chunk)
 
 
 async def _telegram_file_path(file_id: str) -> str:
@@ -917,8 +959,10 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
 
                 if req.source_url:
                     await _download_url(req.source_url, source)
+                elif req.telegram_file_id:
+                    await _download_telegram(req.telegram_file_id, source)
                 else:
-                    await _download_telegram(str(req.telegram_file_id), source)
+                    await asyncio.to_thread(_copy_local_source, str(req.source_path), source)
 
                 total_duration = await asyncio.to_thread(_ffprobe_duration, source)
                 start = min(req.start_seconds, max(0.0, total_duration - 0.05))
