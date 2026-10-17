@@ -115,41 +115,6 @@ async def token_status(_: None = Depends(require_internal_key)):
         "tokens": rows,
     }
 
-@router.get("/debug/db-identity")
-async def debug_db_identity(_: None = Depends(require_internal_key)):
-    settings = get_settings()
-
-    async with get_service().db.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            select
-                current_database() as database_name,
-                current_user as current_user,
-                current_schema() as current_schema,
-                current_setting('search_path') as search_path,
-                inet_server_addr()::text as server_addr,
-                inet_server_port() as server_port,
-                (
-                    select count(*)
-                    from public.threads_auth
-                ) as threads_auth_count
-            """
-        )
-
-    from urllib.parse import urlsplit
-
-    parsed = urlsplit(settings.database_url)
-
-    return {
-        "runtime_config": {
-            "host": parsed.hostname,
-            "port": parsed.port,
-            "database": parsed.path.lstrip("/"),
-            "user": parsed.username,
-        },
-        "db_identity": dict(row),
-    }
-
 @router.post("/tokens/bootstrap")
 async def bootstrap_token(payload: BootstrapTokenRequest, _: None = Depends(require_internal_key)):
     try:
