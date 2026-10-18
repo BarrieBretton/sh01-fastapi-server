@@ -54,6 +54,7 @@ router = APIRouter(prefix="/media", tags=["Automatic Video Editor"])
 
 AUTO_EDIT_JOB_KIND = "auto_edit"
 AUTO_EDIT_MAX_OUTPUTS = max(1, min(3, int(os.getenv("AUTO_EDIT_MAX_OUTPUTS", "3"))))
+AUTO_EDIT_MAX_SOURCE_SECONDS = max(180, int(os.getenv("AUTO_EDIT_MAX_SOURCE_SECONDS", "180")))
 AUTO_EDIT_MAX_SEGMENTS = max(2, min(20, int(os.getenv("AUTO_EDIT_MAX_SEGMENTS", "12"))))
 AUTO_EDIT_SCENE_THRESHOLD = float(os.getenv("AUTO_EDIT_SCENE_THRESHOLD", "0.38"))
 AUTO_EDIT_MIN_SEGMENT = float(os.getenv("AUTO_EDIT_MIN_SEGMENT", "0.75"))
@@ -91,6 +92,8 @@ class OverlayAsset(BaseModel):
     position: Literal["center", "top", "bottom", "top_left", "top_right", "bottom_left", "bottom_right"] = "center"
     width: int | None = Field(default=None, ge=96, le=1080)
     opacity: float = Field(default=1.0, ge=0.05, le=1.0)
+    animation: Literal["none", "fade", "slide_up", "slide_left", "float", "reveal"] = "none"
+    animation_seconds: float = Field(default=0.25, ge=0.05, le=1.0)
 
     @model_validator(mode="after")
     def validate_times(self):
@@ -114,11 +117,14 @@ class AutoEditRequest(BaseModel):
     start_seconds: float = Field(default=0.0, ge=0)
     end_seconds: float | None = Field(default=None, gt=0)
     target_seconds: float = Field(default=AUTO_EDIT_DEFAULT_TARGET, ge=5, le=180)
+    max_shot_seconds: float = Field(default=20, ge=3, le=60)
     output_count: int = Field(default=1, ge=1, le=AUTO_EDIT_MAX_OUTPUTS)
 
     preset: Literal["viral_punch", "clean_minimal", "karaoke_glow", "podcast_bold", "cinematic"] = "viral_punch"
     language: str | None = Field(default=None, min_length=2, max_length=10)
     caption_overrides: CaptionOverrides | None = None
+    captions_enabled: bool = True
+    transcription_chunk_seconds: int = Field(default=120, ge=30, le=180)
 
     smart_cut: bool = True
     remove_silence: bool = True
@@ -136,6 +142,9 @@ class AutoEditRequest(BaseModel):
     reframe: Literal["center", "left", "right", "auto"] = "auto"
     transition: Literal["none", "fade", "wipeleft", "slideleft", "smoothleft"] = "fade"
     transition_seconds: float = Field(default=0.18, ge=0, le=0.6)
+    transition_sfx: Literal["none", "click", "pop", "whoosh"] = "none"
+    transition_sfx_volume: float = Field(default=0.45, ge=0, le=2)
+    transition_sfx_offset_seconds: float = Field(default=0, ge=-0.4, le=0.4)
 
     music_url: str | None = None
     music_volume: float = Field(default=0.10, ge=0, le=1.0)
@@ -375,14 +384,47 @@ def _build_segments(words: list[dict[str, Any]], duration: float, req: AutoEditR
     # Merge extremely close segments to avoid hyperactive edits.
     merged: list[dict[str, Any]] = []
     for seg in sorted(segments, key=lambda x: x["start"]):
-        if merged and seg["start"] - merged[-1]["end"] < 0.16:
+        if (merged and seg["start"] - merged[-1]["end"] < 0.16
+                and seg["reason"] != "scene+speech"
+                and merged[-1]["reason"] != "scene+speech"):
             merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
             merged[-1]["word_indexes"].extend(seg["word_indexes"])
             merged[-1]["word_indexes"] = sorted(set(merged[-1]["word_indexes"]))
             merged[-1]["score"] = max(merged[-1]["score"], seg["score"])
         else:
             merged.append(seg)
-    return merged[: max(AUTO_EDIT_MAX_SEGMENTS * 2, AUTO_EDIT_MAX_SEGMENTS)]
+    # Bound continuous monologues into selectable shots and score the entire
+    # source window, including candidates near the end of a long video.
+    bounded: list[dict[str, Any]] = []
+    for seg in merged:
+        indexes = seg["word_indexes"]
+        if seg["end"] - seg["start"] <= req.max_shot_seconds or not indexes:
+            bounded.append(seg)
+            continue
+        start = float(seg["start"])
+        group: list[int] = []
+        for index in indexes:
+            word_end = float(words[index]["end"])
+            if group and word_end - start > req.max_shot_seconds:
+                end = min(float(seg["end"]), float(words[group[-1]]["end"]) + req.cut_padding_seconds)
+                if end - start >= AUTO_EDIT_MIN_SEGMENT:
+                    bounded.append({
+                        "start": start, "end": end, "word_indexes": group,
+                        "reason": "long_speech_split",
+                        "score": _segment_score([words[i] for i in group], start, end),
+                    })
+                start = max(end, float(words[index]["start"]) - req.cut_padding_seconds)
+                group = []
+            group.append(index)
+        if group:
+            end = float(seg["end"])
+            if end - start >= AUTO_EDIT_MIN_SEGMENT:
+                bounded.append({
+                    "start": start, "end": end, "word_indexes": group,
+                    "reason": "long_speech_split",
+                    "score": _segment_score([words[i] for i in group], start, end),
+                })
+    return bounded
 
 
 def _snap_to_beat(t: float, bpm: float | None, max_shift: float = 0.18) -> float:
@@ -443,10 +485,41 @@ def _hook_text(words: list[dict[str, Any]], seg: dict[str, Any]) -> str:
     return text[:72].upper()
 
 
-def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float) -> str:
+def _estimate_focus_x(source: Path, absolute_start: float, duration: float) -> float:
+    """Estimate horizontal visual activity from a tiny midpoint frame; 0.5 is a safe fallback."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return 0.5
+    try:
+        frame = _run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss",
+             f"{absolute_start + duration / 2:.3f}", "-i", str(source),
+             "-frames:v", "1", "-vf", "scale=96:54,format=gray",
+             "-f", "rawvideo", "-"],
+            90, "auto-reframe sample",
+        ).stdout
+        if len(frame) != 96 * 54:
+            return 0.5
+        weights = [0.0] * 96
+        for y in range(1, 53):
+            for x in range(1, 95):
+                i = y * 96 + x
+                weights[x] += abs(frame[i] - frame[i - 1]) + abs(frame[i] - frame[i - 96])
+        if sum(weights) < 100:
+            return 0.5
+        # Suppress edge graphics and favor a stable central subject.
+        weights = [w * (0.6 + 0.4 * (1 - abs(i - 47.5) / 47.5)) for i, w in enumerate(weights)]
+        peak = max(range(8, 88), key=lambda i: sum(weights[i - 7:i + 8]))
+        return max(0.1, min(0.9, peak / 95.0))
+    except Exception as exc:
+        logger.warning("auto-reframe sample failed; using center: %s", exc)
+        return 0.5
+
+
+def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float, focus_x: float = 0.5) -> str:
     w, h = RENDER_WIDTH, RENDER_HEIGHT
     if fit_mode == "crop":
-        base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+        base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}:(iw-ow)*{focus_x:.4f}:(ih-oh)/2"
     elif fit_mode == "fit_black":
         base = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
     else:
@@ -478,10 +551,8 @@ def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int
             xexpr = "0"
         elif reframe == "right":
             xexpr = "iw-iw/zoom"
-        elif reframe == "auto" and index % 3 == 1:
-            xexpr = "0"
-        elif reframe == "auto" and index % 3 == 2:
-            xexpr = "iw-iw/zoom"
+        elif reframe == "auto":
+            xexpr = f"max(0,min(iw-iw/zoom,iw*{focus_x:.4f}-iw/(2*zoom)))"
         else:
             xexpr = "iw/2-(iw/zoom/2)"
         out += f",zoompan=z='{zexpr}':x='{xexpr}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={fps}"
@@ -495,7 +566,10 @@ def _render_segment(source: Path, dest: Path, absolute_start: float, duration: f
     preset = PRESETS[req.preset]
     fit_mode = req.fit_mode or str(preset["fit_mode"])
     effect = req.video_effect or str(preset["video_effect"])
-    vf = _base_filter(fit_mode, effect, req.dynamic_zoom, req.reframe, idx, req.fps, duration)
+    focus_x = _estimate_focus_x(source, absolute_start, duration) if req.reframe == "auto" else {
+        "left": 0.0, "center": 0.5, "right": 1.0
+    }[req.reframe]
+    vf = _base_filter(fit_mode, effect, req.dynamic_zoom, req.reframe, idx, req.fps, duration, focus_x)
 
     cmd = [
         ffmpeg, "-y",
@@ -629,6 +703,21 @@ def _ffprobe_has_video(path: Path) -> bool:
     return bool(r.stdout.decode().strip())
 
 
+def _generate_transition_sfx(style: str, dest: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed")
+    if style == "whoosh":
+        source, fade = "anoisesrc=color=pink:duration=0.28:amplitude=0.45", "afade=t=in:st=0:d=0.03,afade=t=out:st=0.09:d=0.19"
+    else:
+        freq, length = (1500, 0.08) if style == "click" else (340, 0.16)
+        source = f"sine=frequency={freq}:duration={length}"
+        fade = f"afade=t=out:st={length * 0.3:.3f}:d={length * 0.7:.3f}"
+    _run([ffmpeg, "-y", "-f", "lavfi", "-i", source, "-af", fade,
+          "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(dest)],
+         60, "auto-edit transition sound")
+
+
 async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple[OverlayAsset, Path]], Path | None, list[tuple[SfxAsset, Path]]]:
     overlays: list[tuple[OverlayAsset, Path]] = []
     for i, spec in enumerate(req.overlays):
@@ -647,7 +736,7 @@ async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple
     return overlays, music, sfx
 
 
-def _finalize_video(base: Path, ass: Path, output: Path, duration: float, req: AutoEditRequest, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], hook: str) -> None:
+def _finalize_video(base: Path, ass: Path | None, output: Path, duration: float, req: AutoEditRequest, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], hook: str) -> None:
     ffmpeg = shutil.which("ffmpeg")
     cmd = [ffmpeg, "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-i", str(base)]
     input_index = 1
@@ -670,14 +759,38 @@ def _finalize_video(base: Path, ass: Path, output: Path, duration: float, req: A
         sfx_indices.append((spec, input_index))
         input_index += 1
 
-    ass_escaped = str(ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
-    filters: list[str] = [f"[0:v]ass='{ass_escaped}'[v0]"]
+    if ass is not None:
+        ass_escaped = str(ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+        filters: list[str] = [f"[0:v]ass='{ass_escaped}'[v0]"]
+    else:
+        filters = ["[0:v]null[v0]"]
     vlabel = "v0"
     for j, (spec, idx) in enumerate(overlay_indices, 1):
         width = spec.width or (RENDER_WIDTH if spec.kind == "broll" else min(420, int(RENDER_WIDTH * 0.55)))
         x, y = _overlay_position(spec.position)
-        filters.append(f"[{idx}:v]scale={width}:-2,format=rgba,colorchannelmixer=aa={spec.opacity:.3f}[ov{j}]")
-        filters.append(f"[{vlabel}][ov{j}]overlay=x={x}:y={y}:enable='between(t,{spec.start_seconds:.3f},{spec.end_seconds:.3f})'[v{j}]")
+        start, end = spec.start_seconds, min(spec.end_seconds, duration)
+        if start >= end:
+            continue
+        visual = (
+            f"[{idx}:v]scale={width}:-2,format=rgba,"
+            f"colorchannelmixer=aa={spec.opacity:.3f},trim=duration={end-start:.3f},"
+            f"setpts=PTS-STARTPTS+{start:.3f}/TB"
+        )
+        if spec.animation in {"fade", "reveal"}:
+            visual += f",fade=t=in:st={start:.3f}:d={min(spec.animation_seconds,end-start):.3f}:alpha=1"
+        filters.append(visual + f"[ov{j}]")
+        if spec.animation in {"slide_left", "slide_up", "reveal"}:
+            until = start + min(spec.animation_seconds, end - start)
+            if spec.animation in {"slide_left", "reveal"}:
+                x = f"if(lt(t,{until:.3f}),({x})+w*({until:.3f}-t)/{spec.animation_seconds:.3f},({x}))"
+            else:
+                y = f"if(lt(t,{until:.3f}),({y})+h*({until:.3f}-t)/{spec.animation_seconds:.3f},({y}))"
+        elif spec.animation == "float":
+            y = f"({y})+12*sin(2*PI*(t-{start:.3f})/2)"
+        filters.append(
+            f"[{vlabel}][ov{j}]overlay=x='{x}':y='{y}':"
+            f"eof_action=pass:shortest=0:enable='between(t,{start:.3f},{end:.3f})'[v{j}]"
+        )
         vlabel = f"v{j}"
 
     audio_labels: list[str]
@@ -785,16 +898,29 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
             if value is not None:
                 caption_cfg[key] = value
 
-    ass = variant_root / "captions.ass"
-    await asyncio.to_thread(_make_ass, mapped, caption_cfg, ass)
-
     strongest = max(segments, key=lambda s: float(s.get("score", 0)))
     hook = _hook_text(words, strongest) if req.hook_text == "auto" else ""
-    await asyncio.to_thread(_inject_hook_ass, ass, hook)
+    ass = variant_root / "captions.ass" if req.captions_enabled or hook else None
+    if ass is not None:
+        await asyncio.to_thread(_make_ass, mapped if req.captions_enabled else [], caption_cfg, ass)
+        if hook:
+            await asyncio.to_thread(_inject_hook_ass, ass, hook)
+
+    variant_sfx = list(sfx)
+    if req.transition_sfx != "none" and len(segments) > 1:
+        sound = variant_root / "transition_sfx.wav"
+        await asyncio.to_thread(_generate_transition_sfx, req.transition_sfx, sound)
+        for out_start in output_starts[1:]:
+            when = max(0.0, out_start + req.transition_sfx_offset_seconds)
+            variant_sfx.append((
+                SfxAsset(url="generated://transition", at_seconds=when,
+                         volume=req.transition_sfx_volume),
+                sound,
+            ))
 
     final = variant_root / "final.mp4"
     logger.info("auto-edit variant=%s final render start", variant + 1)
-    await asyncio.to_thread(_finalize_video, combined, ass, final, duration, req, overlays, music, sfx, hook)
+    await asyncio.to_thread(_finalize_video, combined, ass, final, duration, req, overlays, music, variant_sfx, hook)
     logger.info("auto-edit variant=%s final render complete bytes=%s", variant + 1, final.stat().st_size if final.exists() else 0)
 
     token = _token(request_id, variant)
@@ -851,13 +977,25 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 duration = end - start
                 if duration <= 0.1:
                     raise RuntimeError("Selected source window has no usable duration")
-                if duration > max(MAX_CLIP_SECONDS, 180):
-                    raise RuntimeError("Auto-edit source window is too long for this deployment")
+                if duration > AUTO_EDIT_MAX_SOURCE_SECONDS:
+                    raise RuntimeError(
+                        f"Auto-edit source window exceeds AUTO_EDIT_MAX_SOURCE_SECONDS={AUTO_EDIT_MAX_SOURCE_SECONDS}"
+                    )
 
                 job.update(stage="transcription", source_start=start, source_end=end, source_duration=duration)
                 await _persist(job, durable_payload)
-                await asyncio.to_thread(_extract_audio, source, start, duration, audio)
-                words = await _transcribe_faster_whisper(audio, req.language)
+                words = []
+                for offset in range(0, int(math.ceil(duration)), req.transcription_chunk_seconds):
+                    chunk_duration = min(req.transcription_chunk_seconds, duration - offset)
+                    if chunk_duration <= 0.05:
+                        break
+                    await asyncio.to_thread(_extract_audio, source, start + offset, chunk_duration, audio)
+                    chunk_words = await _transcribe_faster_whisper(audio, req.language)
+                    for word in chunk_words:
+                        word["start"] = float(word["start"]) + offset
+                        word["end"] = float(word["end"]) + offset
+                    words.extend(chunk_words)
+                    audio.unlink(missing_ok=True)
 
                 if AUTO_EDIT_ASR_DEBUG_TAIL_WORDS:
                     logger.info(
@@ -952,6 +1090,9 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                         "transition": req.transition,
                         "dynamic_zoom": req.dynamic_zoom,
                         "beat_sync": bool(req.beat_sync and req.music_bpm),
+                        "captions_enabled": req.captions_enabled,
+                        "transition_sfx": req.transition_sfx,
+                        "reframe_method": "visual_activity" if req.reframe == "auto" else req.reframe,
                     },
                     error=None,
                 )
@@ -1074,6 +1215,10 @@ async def auto_edit_capabilities(x_api_key: str | None = Header(None, alias="X-A
         "sound_effects": True,
         "multi_output": AUTO_EDIT_MAX_OUTPUTS,
         "face_tracking": False,
-        "face_tracking_note": "True face tracking is intentionally not enabled on the 512 MB deployment; auto reframe uses deterministic center/left/right motion framing.",
+        "face_tracking_note": "Automatic reframe samples visual activity in each selected shot. It does not detect or follow faces.",
+        "animated_overlays": ["none", "fade", "slide_up", "slide_left", "float", "reveal"],
+        "automatic_transition_sfx": ["none", "click", "pop", "whoosh"],
+        "captions_toggle": True,
+        "max_source_seconds": AUTO_EDIT_MAX_SOURCE_SECONDS,
         "render_size": [RENDER_WIDTH, RENDER_HEIGHT],
     }
