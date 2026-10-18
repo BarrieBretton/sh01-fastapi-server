@@ -26,6 +26,7 @@ from media_capacity import (
     HEAVY_MEDIA_CAPACITY,
     reserve_heavy_media_or_raise,
 )
+from media_resources import run_media_command, spawn_media_task, validate_high_resources
 
 
 logger = logging.getLogger("media_renderer")
@@ -122,6 +123,7 @@ _background_tasks: set[asyncio.Task] = set()
 
 
 class AudioImageRenderRequest(BaseModel):
+    unlimited_resources: bool = False
     audio_file_id: str = Field(min_length=1)
     image_url: str = Field(min_length=1)
     queue_id: str = Field(min_length=1, max_length=512)
@@ -577,6 +579,7 @@ def _run_ffmpeg(
         / f"{output_path.stem}_prepared.png"
     )
 
+    width, height = 1080, 1920
     prepare_cmd = [
         ffmpeg,
         "-y",
@@ -586,9 +589,9 @@ def _run_ffmpeg(
 
         "-vf",
         (
-            "scale=1080:1920:"
+            f"scale={width}:{height}:"
             "force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:"
+            f"pad={width}:{height}:"
             "(ow-iw)/2:(oh-ih)/2:black"
         ),
 
@@ -598,13 +601,7 @@ def _run_ffmpeg(
         str(prepared_image),
     ]
 
-    prepare_result = subprocess.run(
-        prepare_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=300,
-        check=False,
-    )
+    prepare_result = run_media_command(prepare_cmd, 300, "image preparation")
 
     if (
         prepare_result.returncode != 0
@@ -693,13 +690,7 @@ def _run_ffmpeg(
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=7200,
-            check=False,
-        )
+        result = run_media_command(cmd, 7200, "audio image render")
 
         if (
             result.returncode != 0
@@ -975,6 +966,7 @@ async def build_audio_image_video(
     _require_media_key(
         x_api_key
     )
+    validate_high_resources(request.unlimited_resources)
 
     if not BACKBLAZE_BUCKET_NAME:
         raise HTTPException(
@@ -1113,11 +1105,11 @@ async def build_audio_image_video(
         _active_job_id = job_id
 
         try:
-            task = asyncio.create_task(
+            task = spawn_media_task(
                 _run_render_job(
                     job_id,
                     request,
-                )
+                ), request.unlimited_resources
             )
 
             _background_tasks.add(

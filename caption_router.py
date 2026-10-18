@@ -30,6 +30,7 @@ from media_capacity import (
     reserve_heavy_media_or_raise,
 )
 from media_job_store import store
+from media_resources import run_media_command, spawn_media_task, validate_high_resources
 
 logger = logging.getLogger("caption_clipper")
 
@@ -211,6 +212,7 @@ class CaptionOverrides(BaseModel):
 
 
 class ClipCaptionRequest(BaseModel):
+    unlimited_resources: bool = False
     source_path: str | None = None
     source_url: str | None = None
     telegram_file_id: str | None = None
@@ -364,7 +366,7 @@ async def _download_telegram(file_id: str, dest: Path) -> None:
 
 
 def _run(cmd: list[str], timeout: int, label: str) -> subprocess.CompletedProcess:
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout)
+    result = run_media_command(cmd, timeout, label)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace")[-10000:]
         logger.error("%s failed: %s", label, err)
@@ -1098,6 +1100,7 @@ async def create_caption_clip(
     x_api_key: str | None = Header(None, alias="X-API-KEY"),
 ):
     _require_key(x_api_key)
+    validate_high_resources(req.unlimited_resources)
     await _prune_jobs()
 
     request_id = (req.request_id or str(uuid.uuid4())).strip()
@@ -1158,7 +1161,7 @@ async def create_caption_clip(
                 },
                 headers={"Retry-After": "5"},
             )
-        task = asyncio.create_task(_execute(job_id, req))
+        task = spawn_media_task(_execute(job_id, req), req.unlimited_resources)
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
     except Exception:

@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 from b2_helper import get_b2_manager
 from media_job_store import store
 from media_capacity import MEDIA_RENDER_LOCK, HEAVY_MEDIA_CAPACITY, reserve_heavy_media_or_raise
+from media_resources import spawn_media_task, validate_high_resources
 from caption_router import (
     BACKBLAZE_BUCKET_NAME,
     B2_PREFIX,
@@ -109,6 +110,7 @@ class SfxAsset(BaseModel):
 
 
 class AutoEditRequest(BaseModel):
+    unlimited_resources: bool = False
     source_path: str | None = None
     source_url: str | None = None
     telegram_file_id: str | None = None
@@ -1112,6 +1114,7 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
 @router.post("/auto-edit")
 async def create_auto_edit(req: AutoEditRequest, x_api_key: str | None = Header(None, alias="X-API-KEY")):
     _require_key(x_api_key)
+    validate_high_resources(req.unlimited_resources)
     await _prune_jobs()
     if not BACKBLAZE_BUCKET_NAME:
         raise HTTPException(status_code=500, detail="BACKBLAZE_BUCKET_NAME is not configured")
@@ -1163,7 +1166,7 @@ async def create_auto_edit(req: AutoEditRequest, x_api_key: str | None = Header(
                 },
                 headers={"Retry-After": "5"},
             )
-        task = asyncio.create_task(_execute(job_id, req))
+        task = spawn_media_task(_execute(job_id, req), req.unlimited_resources)
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
     except Exception:
@@ -1198,6 +1201,7 @@ async def get_auto_edit(job_id: str, x_api_key: str | None = Header(None, alias=
 async def auto_edit_capabilities(x_api_key: str | None = Header(None, alias="X-API-KEY")):
     _require_key(x_api_key)
     return {
+        "unlimited_resources": os.getenv("MEDIA_ALLOW_UNLIMITED_RESOURCES", "false").lower() in {"1", "true", "yes"},
         "smart_cuts": True,
         "silence_removal": True,
         "filler_removal": True,

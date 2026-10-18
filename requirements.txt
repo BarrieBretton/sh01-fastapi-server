@@ -24,3 +24,4 @@ asyncpg>=0.29,<1
 cryptography>=43,<48
 
 faster-whisper
+av<19
