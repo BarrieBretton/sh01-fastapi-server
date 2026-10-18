@@ -6,6 +6,9 @@ import socket
 import threading
 import logging
 import subprocess
+import tempfile
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+from media_admission import heavy_request
 import time
 import shutil
 import sys
@@ -321,6 +324,14 @@ app.include_router(threads_router)
 app.include_router(tumblr_router)
 app.include_router(x_router)
 
+
+@app.on_event("startup")
+async def start_media_queue_consumer():
+    # Control-plane nodes serve the queue API but must never consume jobs.
+    if os.getenv("MEDIA_QUEUE_CONSUMER_ENABLED", "false").lower() in {"1", "true", "yes"}:
+        from media_dispatcher import start
+        start()
+
 def pick_tumblr_account(name: str):
     name = (name or "").lower().strip()
     if name == "vlvt.ave":
@@ -363,7 +374,6 @@ def upload_to_facebook(video_path: Path, description: str = "") -> Dict[str, str
 
     # Open file in binary mode
     with open(video_path, "rb") as f:
-        files = {"source": (video_path.name, f, "video/mp4")}
         data = {
             "access_token": FB_PAGE_ACCESS_TOKEN,
             "description": (description or "Uploaded via API").strip(),
@@ -371,7 +381,11 @@ def upload_to_facebook(video_path: Path, description: str = "") -> Dict[str, str
         }
 
         try:
-            resp = requests.post(url, files=files, data=data, timeout=900)
+            encoder = MultipartEncoder(fields={
+                **data, "source": (video_path.name, f, "video/mp4"),
+            })
+            resp = requests.post(url, data=encoder,
+                                 headers={"Content-Type": encoder.content_type}, timeout=900)
             resp.raise_for_status()
             result = resp.json()
         except requests.exceptions.HTTPError as e:
@@ -623,9 +637,12 @@ def get_streamable_mp4(video_url: str, retries: int = 2) -> Path:
         for cmd in cmd_templates:
             try:
                 logger.info("Running yt-dlp attempt %d: %s", attempt + 1, " ".join(cmd + [video_url]))
-                result = subprocess.run(cmd + [video_url], capture_output=True, text=True)
-                logger.debug("yt-dlp stdout:\n%s", result.stdout)
-                logger.debug("yt-dlp stderr:\n%s", result.stderr)
+                with tempfile.TemporaryFile(mode="w+t") as errors:
+                    result = subprocess.run(cmd + [video_url], stdout=subprocess.DEVNULL,
+                                            stderr=errors, text=True, timeout=1800)
+                    errors.seek(0, 2)
+                    errors.seek(max(0, errors.tell() - 4096))
+                    logger.debug("yt-dlp stderr tail:\n%s", errors.read())
                 if result.returncode != 0:
                     raise RuntimeError(f"yt-dlp exited with code {result.returncode}")
                 if not output_file.exists() or output_file.stat().st_size == 0:
@@ -1548,6 +1565,11 @@ async def video_to_fb(
     video_url: str = Query(...),
     fb_description: str = Query("")
 ) -> Dict[str, Any]:  # FastAPI will convert to the response_model anyway
+    async with heavy_request("video_to_fb"):
+        return await _video_to_fb_work(video_url, fb_description)
+
+
+async def _video_to_fb_work(video_url: str, fb_description: str) -> Dict[str, Any]:
     mp4_path: Path | None = None
     try:
         loop = asyncio.get_running_loop()
@@ -1708,33 +1730,42 @@ async def post_image_to_x(
     # Legacy compatibility route. New callers should use /x/publish.
     # It is intentionally protected now; the old route used to be public.
     require_x_internal_key(x_api_key)
+    async with heavy_request("legacy_x_image"):
+        return await asyncio.to_thread(_post_image_to_x_work, image_url, text)
+
+
+def _post_image_to_x_work(image_url: str, text: str) -> dict:
     try:
-        img_resp = requests.get(image_url, stream=True, timeout=90)
-        img_resp.raise_for_status()
+        with tempfile.TemporaryDirectory(prefix="sh01-x-image-") as folder:
+            path = Path(folder) / "image.bin"
+            with requests.get(image_url, stream=True, timeout=90) as image_response:
+                image_response.raise_for_status()
+                mime = image_response.headers.get("Content-Type", "image/jpeg")
+                total = 0
+                with path.open("wb") as output:
+                    for chunk in image_response.iter_content(chunk_size=65536):
+                        total += len(chunk)
+                        if total > 8 * 1048576:
+                            raise ValueError("X image exceeds 8 MiB input limit")
+                        output.write(chunk)
+            with path.open("rb") as image_file:
+                encoder = MultipartEncoder(fields={
+                    "media_category": "tweet_image",
+                    "media": ("image.jpg", image_file, mime),
+                })
+                upload = requests.post("https://upload.twitter.com/1.1/media/upload.json",
+                    auth=oauth_x, data=encoder,
+                    headers={"Content-Type": encoder.content_type}, timeout=180)
+                upload.raise_for_status()
+                media_id = upload.json()["media_id_string"]
 
-        files = {"media": ("image.jpg", img_resp.raw, img_resp.headers.get("Content-Type", "image/jpeg"))}
-        upload = requests.post(
-            "https://upload.twitter.com/1.1/media/upload.json",
-            auth=oauth_x,
-            files=files,
-            data={"media_category": "tweet_image"},
-            timeout=180,
-        )
-        upload.raise_for_status()
-        media_id = upload.json()["media_id_string"]
-
-        tweet = requests.post(
-            "https://api.x.com/2/tweets",
-            auth=oauth_x,
-            json={"text": text, "media": {"media_ids": [media_id]}},
-            timeout=180,
-        )
+        tweet = requests.post("https://api.x.com/2/tweets", auth=oauth_x,
+            json={"text": text, "media": {"media_ids": [media_id]}}, timeout=180)
         tweet.raise_for_status()
-        logger.info("Posted to X successfully")
         return {"message": "Posted to X", "tweet": tweet.json()}
-    except Exception as e:
+    except Exception as exc:
         logger.exception("X post failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 # Google Sheets Endpoints
 @app.post("/sheets/process_streamables")
@@ -1745,6 +1776,8 @@ async def process_streamables_endpoint(
     max_concurrency: int = Query(2, ge=1, le=5, description="Parallel jobs limit"),
     dry_run: bool = Query(False, description="If true, no download/upload/sheet update"),
 ):
+    if os.getenv("ALLOW_LOCAL_PROCESS_STREAMABLES", "false").lower() not in {"1", "true", "yes"}:
+        raise HTTPException(status_code=403, detail="Process Streamables is local-only; set ALLOW_LOCAL_PROCESS_STREAMABLES=true on the local machine")
     # concurrency helper
     semaphore = asyncio.Semaphore(max_concurrency)
     event_loop = asyncio.get_running_loop()

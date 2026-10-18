@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 from b2_helper import get_b2_manager
 from media_job_store import store
 from media_capacity import MEDIA_RENDER_LOCK, HEAVY_MEDIA_CAPACITY, reserve_heavy_media_or_raise
-from media_resources import spawn_media_task, validate_high_resources
+from media_resources import spawn_media_task, validate_high_resources, validate_video_source, require_memory_headroom
 from caption_router import (
     BACKBLAZE_BUCKET_NAME,
     B2_PREFIX,
@@ -973,6 +973,8 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 else:
                     await asyncio.to_thread(_copy_local_source, str(req.source_path), source)
 
+                await asyncio.to_thread(validate_video_source, source)
+                await asyncio.to_thread(require_memory_headroom, "auto-edit transcription")
                 total = await asyncio.to_thread(_ffprobe_duration, source)
                 start = min(req.start_seconds, max(0.0, total - 0.05))
                 end = min(total, req.end_seconds if req.end_seconds is not None else total)
@@ -1130,51 +1132,22 @@ async def create_auto_edit(req: AutoEditRequest, x_api_key: str | None = Header(
     if durable and durable.get("status") == "complete":
         return JSONResponse(status_code=200, content=_job_view(durable))
 
-    attempt = int((durable or {}).get("attempt") or 0) + 1
-    lease = await reserve_heavy_media_or_raise(
-        kind="auto_edit",
-        job_id=job_id,
-        request_id=request_id,
-        endpoint="/media/auto-edit",
-    )
-    job = {
-        "job_id": job_id,
-        "request_id": request_id,
-        "status": "queued",
-        "stage": "queued",
-        "attempt": attempt,
-        "created_at": _now(),
-        "status_url": f"{PUBLIC_API_BASE}/media/auto-edit-jobs/{job_id}",
-        "outputs": [],
-        "error": None,
-        "_capacity_lease_id": lease.lease_id,
-    }
-    async with _jobs_lock:
-        _jobs[job_id] = job
     try:
-        persisted = await _persist(
-            job,
+        queue_row = await asyncio.to_thread(
+            store.queue_enqueue, job_id, AUTO_EDIT_JOB_KIND,
             {"request_id": request_id, "request": req.model_dump(mode="json")},
         )
-        if not persisted:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "durable_job_registration_failed",
-                    "message": "Auto-edit job was not accepted because durable job registration failed",
-                    "retryable": True,
-                },
-                headers={"Retry-After": "5"},
-            )
-        task = spawn_media_task(_execute(job_id, req), req.unlimited_resources)
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except Exception:
-        async with _jobs_lock:
-            _jobs.pop(job_id, None)
-        await HEAVY_MEDIA_CAPACITY.release(lease.lease_id)
-        raise
-    return JSONResponse(status_code=202, content=_job_view(job))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Canonical media queue unavailable: {exc}") from exc
+    result = queue_row.get("result")
+    if isinstance(result, dict) and queue_row["status"] in {"complete", "failed", "interrupted"}:
+        return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id, "request_id": request_id, "status": queue_row["status"],
+        "stage": queue_row["status"], "attempt": queue_row["attempts"],
+        "status_url": f"{PUBLIC_API_BASE}/media/auto-edit-jobs/{job_id}",
+        "outputs": [], "error": None,
+    })
 
 
 @router.get("/auto-edit-jobs/{job_id}")
@@ -1185,6 +1158,17 @@ async def get_auto_edit(job_id: str, x_api_key: str | None = Header(None, alias=
         local = _jobs.get(job_id)
         if local:
             return _job_view(local)
+    try:
+        queued = await asyncio.to_thread(store.queue_get, job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    if queued:
+        if isinstance(queued.get("result"), dict):
+            return queued["result"]
+        return {
+            "job_id": job_id, "request_id": queued.get("request_id"), "status": queued["status"], "stage": queued["status"],
+            "attempt": queued["attempts"], "outputs": [], "error": queued.get("error"),
+        }
     durable = await _load(job_id)
     if not durable:
         raise HTTPException(status_code=404, detail="Unknown or expired auto-edit job")

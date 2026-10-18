@@ -31,7 +31,7 @@ from media_capacity import (
     reserve_heavy_media_or_raise,
 )
 from media_job_store import store
-from media_resources import run_media_command, spawn_media_task, validate_high_resources
+from media_resources import run_media_command, spawn_media_task, validate_high_resources, validate_video_source, require_memory_headroom
 
 logger = logging.getLogger("caption_clipper")
 
@@ -478,18 +478,15 @@ def _transcribe_faster_whisper_sync(
 def _transcribe_isolated_sync(audio_path: Path, language: str | None) -> list[dict[str, Any]]:
     """Keep CTranslate2/PyAV allocation out of the long-lived Uvicorn process."""
     result_path = audio_path.with_name(f"{audio_path.stem}-{uuid.uuid4().hex}.words.json")
+    require_memory_headroom("Whisper transcription")
     try:
-        with tempfile.TemporaryFile() as errors:
-            result = subprocess.run(
-                [sys.executable, "-m", "media_transcribe", str(audio_path), str(result_path), language or ""],
-                stdout=subprocess.DEVNULL, stderr=errors,
-                check=False, timeout=TRANSCRIBE_TIMEOUT_SECONDS,
-            )
-            if result.returncode != 0:
-                errors.seek(0, 2)
-                errors.seek(max(0, errors.tell() - 4000))
-                detail = errors.read().decode("utf-8", errors="replace")[-2000:]
-                raise RuntimeError(f"Isolated transcription exited {result.returncode}: {detail}")
+        result = run_media_command(
+            [sys.executable, "-m", "media_transcribe", str(audio_path), str(result_path), language or ""],
+            TRANSCRIBE_TIMEOUT_SECONDS, "Whisper transcription",
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"Isolated transcription exited {result.returncode}: {detail}")
         words = json.loads(result_path.read_text(encoding="utf-8"))
         if not isinstance(words, list) or not words:
             raise RuntimeError("Isolated transcription returned no word timestamps")
@@ -993,6 +990,7 @@ async def _execute(job_id: str, req: ClipCaptionRequest) -> None:
                 else:
                     await asyncio.to_thread(_copy_local_source, str(req.source_path), source)
 
+                await asyncio.to_thread(validate_video_source, source)
                 total_duration = await asyncio.to_thread(_ffprobe_duration, source)
                 start = min(req.start_seconds, max(0.0, total_duration - 0.05))
                 end = (
@@ -1147,58 +1145,23 @@ async def create_caption_clip(
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=200, content=_job_view(durable))
 
-    previous_attempt = int((durable or {}).get("attempt") or 0)
-    recovered_from = (durable or {}).get("status")
-
-    lease = await reserve_heavy_media_or_raise(
-        kind="clip_caption",
-        job_id=job_id,
-        request_id=request_id,
-        endpoint="/media/clip-caption",
-    )
-
-    job = {
-        "job_id": job_id,
-        "request_id": request_id,
-        "status": "queued",
-        "stage": "queued",
-        "preset": req.preset,
-        "token": token,
-        "status_url": f"{PUBLIC_API_BASE}/media/clip-caption-jobs/{job_id}",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "video_url": None,
-        "error": None,
-        "attempt": previous_attempt + 1,
-        "recovered_from": recovered_from,
-        "_capacity_lease_id": lease.lease_id,
-    }
-
-    async with _jobs_lock:
-        _jobs[job_id] = job
-
     try:
-        persisted = await _persist_job(job, durable_payload)
-        if not persisted:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "durable_job_registration_failed",
-                    "message": "Caption job was not accepted because durable job registration failed",
-                    "retryable": True,
-                },
-                headers={"Retry-After": "5"},
-            )
-        task = spawn_media_task(_execute(job_id, req), req.unlimited_resources)
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except Exception:
-        async with _jobs_lock:
-            _jobs.pop(job_id, None)
-        await HEAVY_MEDIA_CAPACITY.release(lease.lease_id)
-        raise
+        queued = await asyncio.to_thread(
+            store.queue_enqueue, job_id, CAPTION_JOB_KIND,
+            {"request_id": request_id, "request": req.model_dump(mode="json")},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Canonical media queue unavailable: {exc}") from exc
 
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=202, content=_job_view(job))
+    if isinstance(queued.get("result"), dict) and queued["status"] in {"complete", "failed", "interrupted"}:
+        return JSONResponse(status_code=200, content=queued["result"])
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id, "request_id": request_id, "status": queued["status"],
+        "stage": queued["status"], "preset": req.preset, "token": token,
+        "status_url": f"{PUBLIC_API_BASE}/media/clip-caption-jobs/{job_id}",
+        "video_url": None, "error": None, "attempt": queued["attempts"],
+    })
 
 
 @router.get("/clip-caption-jobs/{job_id}")
@@ -1213,6 +1176,16 @@ async def caption_clip_job(
         local = _jobs.get(job_id)
         if local:
             return _job_view(local)
+
+    try:
+        queued = await asyncio.to_thread(store.queue_get, job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    if queued:
+        if isinstance(queued.get("result"), dict):
+            return queued["result"]
+        return {"job_id": job_id, "request_id": queued.get("request_id"), "status": queued["status"], "stage": queued["status"],
+                "attempt": queued["attempts"], "video_url": None, "error": queued.get("error")}
 
     durable = await _load_durable_job(job_id)
     if not durable:

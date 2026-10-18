@@ -26,7 +26,8 @@ from media_capacity import (
     HEAVY_MEDIA_CAPACITY,
     reserve_heavy_media_or_raise,
 )
-from media_resources import run_media_command, spawn_media_task, validate_high_resources
+from media_resources import run_media_command, spawn_media_task, validate_high_resources, validate_video_source, require_memory_headroom
+from media_job_store import store
 
 
 logger = logging.getLogger("media_renderer")
@@ -808,6 +809,8 @@ async def _run_render_job(
                     job_id,
                     request.queue_id,
                 )
+                await asyncio.to_thread(validate_video_source, image_path, kind="image")
+                await asyncio.to_thread(require_memory_headroom, "audio image render")
 
                 await asyncio.to_thread(
                     _run_ffmpeg,
@@ -941,227 +944,34 @@ async def _run_render_job(
                 await HEAVY_MEDIA_CAPACITY.release(capacity_lease_id)
 
 
-@router.post(
-    "/audio-image-video",
-)
+@router.post("/audio-image-video")
 async def build_audio_image_video(
     request: AudioImageRenderRequest,
-    x_api_key: str | None = Header(
-        default=None,
-        alias="X-API-KEY",
-    ),
+    x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
 ):
-    """
-    Submit ONE asynchronous render job.
-
-    Returns immediately.
-
-    Exactly one different queue item may be active at once.
-
-    Re-submitting the SAME queue_id is idempotent while its
-    retained job exists: the existing job is returned.
-    """
-    global _active_job_id
-
-    _require_media_key(
-        x_api_key
-    )
+    """Register the render durably; the shared queue executes it in FIFO order."""
+    _require_media_key(x_api_key)
     validate_high_resources(request.unlimited_resources)
-
     if not BACKBLAZE_BUCKET_NAME:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "BACKBLAZE_BUCKET_NAME "
-                "is not configured"
-            ),
+        raise HTTPException(status_code=500, detail="BACKBLAZE_BUCKET_NAME is not configured")
+    queue_id = request.queue_id.strip()
+    job_id = "av-" + hashlib.sha256(queue_id.encode("utf-8")).hexdigest()[:32]
+    try:
+        row = await asyncio.to_thread(
+            store.queue_enqueue, job_id, "audio_image_video",
+            {"request_id": queue_id, "request": request.model_dump(mode="json")},
         )
-
-    queue_id = (
-        request.queue_id.strip()
-    )
-
-    async with _render_state_lock:
-        _prune_jobs_locked()
-
-        existing_job_id = (
-            _queue_to_job.get(
-                queue_id
-            )
-        )
-
-        if existing_job_id:
-            existing = (
-                _render_jobs.get(
-                    existing_job_id
-                )
-            )
-
-            if (
-                existing
-                and existing.get("status")
-                != "failed"
-            ):
-                payload = (
-                    _job_payload(existing)
-                )
-
-                payload["ok"] = True
-                payload["existing"] = True
-                payload["status_url"] = (
-                    f"{PUBLIC_API_BASE}"
-                    f"/media/render-jobs/"
-                    f"{existing_job_id}"
-                )
-
-                return JSONResponse(
-                    status_code=(
-                        200
-                        if existing.get(
-                            "status"
-                        )
-                        == "complete"
-                        else 202
-                    ),
-                    content=payload,
-                )
-
-        if _active_job_id:
-            active = _render_jobs.get(
-                _active_job_id,
-                {},
-            )
-
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": (
-                        "renderer_busy"
-                    ),
-                    "message": (
-                        "SH01 renderer is "
-                        "already processing "
-                        "another item"
-                    ),
-                    "active_job_id": (
-                        _active_job_id
-                    ),
-                    "active_queue_id": (
-                        active.get(
-                            "queue_id"
-                        )
-                    ),
-                },
-            )
-
-        job_id = secrets.token_hex(
-            16
-        )
-
-        lease = await reserve_heavy_media_or_raise(
-            kind="audio_image_video",
-            job_id=job_id,
-            request_id=queue_id,
-            endpoint="/media/audio-image-video",
-        )
-
-        token = (
-            _render_token_for_queue(
-                queue_id
-            )
-        )
-
-        job = {
-            "job_id": job_id,
-            "queue_id": queue_id,
-            "status": "accepted",
-            "created_at": (
-                time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ",
-                    time.gmtime(),
-                )
-            ),
-            "started_at": None,
-            "finished_at": None,
-            "token": token,
-            "video_url": None,
-            "b2_file_name": (
-                _render_file_name(token)
-            ),
-            "size_bytes": None,
-            "error": None,
-            "_capacity_lease_id": lease.lease_id,
-        }
-
-        _render_jobs[job_id] = job
-
-        _queue_to_job[
-            queue_id
-        ] = job_id
-
-        # Reserve the renderer BEFORE scheduling the background task.
-        # This closes the race where two simultaneous POSTs both see
-        # an apparently free renderer.
-        _active_job_id = job_id
-
-        try:
-            task = spawn_media_task(
-                _run_render_job(
-                    job_id,
-                    request,
-                ), request.unlimited_resources
-            )
-
-            _background_tasks.add(
-                task
-            )
-
-            task.add_done_callback(
-                _background_tasks.discard
-            )
-
-        except Exception:
-            _active_job_id = None
-
-            _render_jobs.pop(
-                job_id,
-                None,
-            )
-
-            if (
-                _queue_to_job.get(
-                    queue_id
-                )
-                == job_id
-            ):
-                _queue_to_job.pop(
-                    queue_id,
-                    None,
-                )
-
-            await HEAVY_MEDIA_CAPACITY.release(lease.lease_id)
-            raise
-
-        payload = _job_payload(
-            job
-        )
-
-        payload.update(
-            {
-                "ok": True,
-                "existing": False,
-                "status_url": (
-                    f"{PUBLIC_API_BASE}"
-                    f"/media/render-jobs/"
-                    f"{job_id}"
-                ),
-            }
-        )
-
-        return JSONResponse(
-            status_code=202,
-            content=payload,
-        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Canonical media queue unavailable: {exc}") from exc
+    result = row.get("result")
+    if isinstance(result, dict) and row["status"] in {"complete", "failed", "interrupted"}:
+        return JSONResponse(status_code=200, content={"ok": True, "existing": True,
+            "status_url": f"{PUBLIC_API_BASE}/media/render-jobs/{job_id}", **result})
+    return JSONResponse(status_code=202, content={
+        "ok": True, "job_id": job_id, "queue_id": queue_id,
+        "status": row["status"], "existing": row["attempts"] > 0,
+        "status_url": f"{PUBLIC_API_BASE}/media/render-jobs/{job_id}",
+    })
 
 
 @router.get(
@@ -1185,23 +995,19 @@ async def get_render_job(
             job_id
         )
 
-        if not job:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    "Render job not found. "
-                    "SH01 may have restarted "
-                    "or the retained job expired."
-                ),
-            )
+        if job:
+            return {"ok": True, **_job_payload(job)}
 
-        payload = _job_payload(
-            job
-        )
-
-        payload["ok"] = True
-
-        return payload
+    try:
+        queued = await asyncio.to_thread(store.queue_get, job_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {exc}") from exc
+    if not queued:
+        raise HTTPException(status_code=404, detail="Unknown render job")
+    if isinstance(queued.get("result"), dict):
+        return {"ok": True, **queued["result"]}
+    return {"ok": True, "job_id": job_id, "queue_id": queued.get("request_id"), "status": queued["status"],
+            "error": queued.get("error"), "attempt": queued["attempts"]}
 
 
 @router.get(

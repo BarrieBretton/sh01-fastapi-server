@@ -58,7 +58,7 @@ class MediaJobStore:
                         detail = response.json().get("detail")
                     except Exception:
                         detail = None
-                    if detail == "Unknown media job":
+                    if detail in {"Unknown media job", "Unknown queue job"}:
                         return None
                     raise RuntimeError(
                         "Media job store endpoint returned an unexpected 404: "
@@ -133,6 +133,49 @@ class MediaJobStore:
         body = response.json()
         job = body.get("job")
         return job if isinstance(job, dict) else None
+
+    def queue_enqueue(self, job_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_cloudflare_queue()
+        response = self._request("POST", "/internal/media-jobs/queue/enqueue",
+                                 json_body={"job_id": job_id, "kind": kind, "payload": payload})
+        return response.json()["job"]
+
+    def queue_get(self, job_id: str) -> dict[str, Any] | None:
+        self._require_cloudflare_queue()
+        response = self._request("GET", f"/internal/media-jobs/queue/{job_id}", allow_404=True)
+        return response.json()["job"] if response else None
+
+    def queue_claim(self, owner: str, high_capable: bool = False) -> dict[str, Any] | None:
+        self._require_cloudflare_queue()
+        response = self._request("POST", "/internal/media-jobs/queue/claim",
+                                 json_body={"owner": owner, "high_capable": high_capable})
+        return response.json().get("job")
+
+    def queue_heartbeat(self, job_id: str, owner: str, token: str) -> bool:
+        self._require_cloudflare_queue()
+        body = {"job_id": job_id, "owner": owner, "token": token}
+        response = self._request("POST", "/internal/media-jobs/queue/heartbeat", json_body=body)
+        return bool(response.json().get("alive"))
+
+    def queue_finish(self, job_id: str, owner: str, token: str,
+                     status: str, result: dict[str, Any]) -> bool:
+        self._require_cloudflare_queue()
+        body = {"job_id": job_id, "owner": owner, "token": token,
+                "status": status, "result": result}
+        response = self._request("POST", "/internal/media-jobs/queue/finish", json_body=body)
+        return bool(response.json().get("finished"))
+
+    def queue_acquire_external(self, job_id: str, kind: str, owner: str) -> str | None:
+        self._require_cloudflare_queue()
+        body = {"job_id": job_id, "kind": kind, "owner": owner}
+        response = self._request("POST", "/internal/media-jobs/queue/acquire-external",
+                                 json_body=body)
+        return response.json().get("token")
+
+    @staticmethod
+    def _require_cloudflare_queue() -> None:
+        if MODE != "remote":
+            raise RuntimeError("Media queue requires MEDIA_JOB_STORE_MODE=remote and the Cloudflare control-plane proxy")
 
 
 store = MediaJobStore()

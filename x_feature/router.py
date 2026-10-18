@@ -8,6 +8,7 @@ from .config import ACCOUNT_PREFIXES, Settings
 from .db import Database
 from .models import XPublishRequest
 from .service import XApiError, XPublishConflict, XService
+from media_admission import heavy_request
 
 router = APIRouter(prefix="/x", tags=["x"])
 
@@ -50,13 +51,14 @@ async def health(_: None = Depends(require_internal_key)):
 async def publish(payload: XPublishRequest, _: None = Depends(require_internal_key)):
     try:
         media_url = str(payload.image_url) if payload.media_type == "IMAGE" else str(payload.video_url)
-        return await get_service().publish_media(
-            account=payload.account,
-            media_type=payload.media_type,
-            media_url=media_url,
-            text=payload.text,
-            idempotency_key=payload.idempotency_key,
-        )
+        async with heavy_request("x_publish"):
+            return await get_service().publish_media(
+                account=payload.account,
+                media_type=payload.media_type,
+                media_url=media_url,
+                text=payload.text,
+                idempotency_key=payload.idempotency_key,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except XPublishConflict as exc:

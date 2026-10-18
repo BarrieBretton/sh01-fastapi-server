@@ -1,6 +1,7 @@
 # image_templating.py
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import os
@@ -15,6 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from media_admission import heavy_request
 
 
 router = APIRouter(tags=["image-templating"])
@@ -390,13 +392,22 @@ def _imagekit_upload(file_bytes: bytes, file_name: str) -> dict:
 async def _fetch_image(url: str) -> Image.Image:
     try:
         async with httpx.AsyncClient(timeout=25) as client:
-            r = await client.get(url, follow_redirects=True)
-            r.raise_for_status()
-            content_type = (r.headers.get("content-type") or "").lower()
+            async with client.stream("GET", url, follow_redirects=True) as r:
+                r.raise_for_status()
+                content_type = (r.headers.get("content-type") or "").lower()
+                limit = max(1024, int(os.getenv("MEDIA_TEMPLATE_MAX_IMAGE_BYTES", str(8 * 1048576))))
+                data = bytearray()
+                async for chunk in r.aiter_bytes(65536):
+                    if len(data) + len(chunk) > limit:
+                        raise ValueError("Input image exceeds configured byte limit")
+                    data.extend(chunk)
             if "image" not in content_type and not url.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                 # still allow if server doesn't set content-type properly, but attempt open
                 pass
-            img = Image.open(io.BytesIO(r.content))
+            img = Image.open(io.BytesIO(data))
+            max_pixels = max(1, int(os.getenv("MEDIA_TEMPLATE_MAX_INPUT_PIXELS", "2073600")))
+            if img.width * img.height > max_pixels:
+                raise ValueError(f"Input image {img.width}x{img.height} exceeds {max_pixels} pixels")
             img.load()
             return img.convert("RGBA")
     except Exception as e:
@@ -909,6 +920,9 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
         canvas.save(out, format="PNG", optimize=True)
         mime = "image/png"
 
+    maximum = max(1024, int(os.getenv("MEDIA_TEMPLATE_MAX_OUTPUT_BYTES", str(12 * 1048576))))
+    if out.tell() > maximum:
+        raise HTTPException(status_code=413, detail=f"Rendered image exceeds {maximum} bytes")
     return out.getvalue(), mime
 
 # ----------------------------
@@ -923,11 +937,16 @@ async def render_endpoint(body: RenderTemplateRequest):
         eff_wdth = _clamp(body.font_width, 50, 200, CFG.font_wdth)
         return JSONResponse(_font_debug_info(eff_wght, eff_wdth))
 
+    async with heavy_request("image_template"):
+        return await _render_endpoint_guarded(body)
+
+
+async def _render_endpoint_guarded(body: RenderTemplateRequest):
     img_bytes, mime = await render_template(body)
 
     if body.upload_to_imagekit:
         try:
-            uploaded = _imagekit_upload(img_bytes, body.upload_file_name)
+            uploaded = await asyncio.to_thread(_imagekit_upload, img_bytes, body.upload_file_name)
             return {
                 "uploaded": True,
                 "url": uploaded.get("url"),

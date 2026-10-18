@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import os
+import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -41,7 +43,7 @@ def _rss_bytes(pid: int) -> int:
 
 
 def _cgroup_pressure() -> tuple[int, int] | None:
-    """Return active cgroup bytes and effective memory limit on cgroup v2 hosts."""
+    """Return container usage and limit on Linux cgroup v2 or v1."""
     try:
         root = Path("/sys/fs/cgroup")
         maximum = (root / "memory.max").read_text().strip()
@@ -51,7 +53,64 @@ def _cgroup_pressure() -> tuple[int, int] | None:
         stats = dict(line.split() for line in (root / "memory.stat").read_text().splitlines())
         return max(0, used - int(stats.get("inactive_file", "0"))), int(maximum)
     except (OSError, ValueError):
-        return None
+        try:
+            root = Path("/sys/fs/cgroup/memory")
+            maximum = int((root / "memory.limit_in_bytes").read_text())
+            if maximum >= 1 << 60:
+                return None
+            used = int((root / "memory.usage_in_bytes").read_text())
+            stats = dict(line.split() for line in (root / "memory.stat").read_text().splitlines())
+            return max(0, used - int(stats.get("total_inactive_file", "0"))), maximum
+        except (OSError, ValueError):
+            return None
+
+
+def require_memory_headroom(stage: str, *, minimum_mb: int = 176) -> None:
+    """Admission check before a large allocation; never treat a missing limit as unlimited."""
+    if high_resources_enabled():
+        return
+    pressure = _cgroup_pressure()
+    if pressure is None:
+        if os.getenv("MEDIA_REQUIRE_CGROUP", "false").lower() in {"1", "true", "yes"}:
+            raise RuntimeError(f"{stage}: cgroup memory limit unavailable; refusing resource-limited work")
+        return
+    used, limit = pressure
+    reserve = max(32, int(os.getenv("MEDIA_CGROUP_RESERVE_MB", "128"))) * 1048576
+    minimum = max(64, int(os.getenv("MEDIA_MIN_START_HEADROOM_MB", str(minimum_mb)))) * 1048576
+    if limit - used - reserve < minimum:
+        mb = 1048576
+        raise RuntimeError(
+            f"{stage}: insufficient memory before starting "
+            f"(active={used // mb} MiB, limit={limit // mb} MiB, "
+            f"reserved={reserve // mb} MiB, required_free={minimum // mb} MiB)"
+        )
+
+
+def validate_video_source(path: Path, *, kind: str = "video") -> None:
+    """Reject unusually large decoded input frames before FFmpeg/Whisper is launched."""
+    if high_resources_enabled():
+        return
+    probe = shutil.which("ffprobe")
+    if not probe:
+        raise RuntimeError("ffprobe is required for media admission")
+    result = subprocess.run(
+        [probe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "json", str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("Could not probe input video dimensions")
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise RuntimeError("Source contains no video track")
+    width, height = int(streams[0]["width"]), int(streams[0]["height"])
+    setting = "MEDIA_MAX_IMAGE_PIXELS" if kind == "image" else "MEDIA_MAX_INPUT_PIXELS"
+    maximum = max(1, int(os.getenv(setting, "2073600")))
+    if width <= 0 or height <= 0 or width * height > maximum:
+        raise RuntimeError(
+            f"Input {kind} {width}x{height} exceeds small-host decoded-pixel "
+            f"admission limit {maximum}; submit to the high-resource host"
+        )
 
 
 def _tuned_command(command: list[str], high: bool) -> list[str]:
@@ -65,7 +124,8 @@ def _tuned_command(command: list[str], high: bool) -> list[str]:
                 if command[i] == flag and command[i + 1] == "1":
                     command[i + 1] = "0"
     else:
-        command[1:1] = ["-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1"]
+        command[1:1] = ["-max_alloc", str(64 * 1048576),
+                         "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "1"]
     return command
 
 
@@ -77,7 +137,10 @@ def run_media_command(command: list[str], timeout: int, label: str) -> subproces
     """
     high = _HIGH.get()
     command = _tuned_command(command, high)
-    rss_limit = max(96, int(os.getenv("MEDIA_FFMPEG_MAX_RSS_MB", "256"))) * 1048576
+    if not high:
+        require_memory_headroom(label)
+    rss_budget = "MEDIA_WHISPER_MAX_RSS_MB" if "media_transcribe" in command else "MEDIA_FFMPEG_MAX_RSS_MB"
+    rss_limit = max(96, int(os.getenv(rss_budget, "256"))) * 1048576
     reserve = max(32, int(os.getenv("MEDIA_CGROUP_RESERVE_MB", "128"))) * 1048576
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         process = subprocess.Popen(command, stdout=out, stderr=err)
@@ -91,7 +154,7 @@ def run_media_command(command: list[str], timeout: int, label: str) -> subproces
                 if not high:
                     rss = _rss_bytes(process.pid)
                     if rss > rss_limit:
-                        reason = f"{label} exceeded FFmpeg RSS budget ({rss // 1048576} MiB)"
+                        reason = f"{label} exceeded subprocess RSS budget ({rss // 1048576} MiB)"
                         break
                     pressure = _cgroup_pressure()
                     if pressure and pressure[0] > pressure[1] - reserve:

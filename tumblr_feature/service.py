@@ -12,6 +12,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 from requests_oauthlib import OAuth1
 from PIL import Image, ImageOps
 
@@ -128,6 +129,9 @@ class TumblrService:
                 normalized = path.with_suffix(".jpg")
                 try:
                     with Image.open(path) as source:
+                        max_pixels = max(1, int(os.getenv("TUMBLR_MAX_INPUT_PIXELS", "2073600")))
+                        if source.width * source.height > max_pixels:
+                            raise RuntimeError(f"Tumblr image exceeds {max_pixels} decoded pixels")
                         source.load()
                         source = ImageOps.exif_transpose(source)
                         width, height = source.size
@@ -245,16 +249,17 @@ class TumblrService:
         endpoint = f"{self.settings.api_base}/v2/blog/{quote(creds.blog_identifier, safe='')}/posts"
         def run():
             with path.open("rb") as f:
-                files = {
+                fields = {
                     # Tumblr's NPF multipart contract expects the JSON part as a
                     # normal form field named "json" (no filename), followed by
                     # the actual media part whose key matches the NPF identifier.
                     "json": (None, json.dumps(body), "application/json"),
                     identifier: (path.name, f, content_type),
                 }
-                r = requests.post(
-                    endpoint, auth=self._oauth(account), headers=self._headers(), files=files, timeout=600,
-                )
+                encoder = MultipartEncoder(fields=fields)
+                r = requests.post(endpoint, auth=self._oauth(account),
+                                  headers={**self._headers(), "Content-Type": encoder.content_type},
+                                  data=encoder, timeout=600)
             self._raise_tumblr(r)
             return r.json()
         return await asyncio.to_thread(run)

@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 from requests_oauthlib import OAuth1
 
 from .config import Settings, credentials_for, normalize_account
@@ -115,11 +116,15 @@ class XService:
     async def _upload_image(self, account: str, path: Path, content_type: str) -> str:
         def run():
             with path.open("rb") as f:
+                encoder = MultipartEncoder(fields={
+                    "media_category": "tweet_image",
+                    "media": (path.name, f, content_type),
+                })
                 r = requests.post(
                     self.settings.upload_base,
                     auth=self._oauth(account),
-                    files={"media": (path.name, f, content_type)},
-                    data={"media_category": "tweet_image"},
+                    data=encoder,
+                    headers={"Content-Type": encoder.content_type},
                     timeout=180,
                 )
             self._raise_x(r)
