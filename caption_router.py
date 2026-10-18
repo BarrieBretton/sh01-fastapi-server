@@ -12,6 +12,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -65,6 +66,7 @@ DURABLE_TIMEOUT_SECONDS = max(2, int(os.getenv("MEDIA_CLIP_DURABLE_TIMEOUT_SECON
 UNLOAD_WHISPER_BEFORE_RENDER = os.getenv(
     "MEDIA_CLIP_UNLOAD_WHISPER_BEFORE_RENDER", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
+ISOLATE_WHISPER = os.getenv("MEDIA_CLIP_ISOLATE_WHISPER", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 _whisper_model = None
 _whisper_model_lock = asyncio.Lock()
@@ -473,12 +475,37 @@ def _transcribe_faster_whisper_sync(
     return out
 
 
+def _transcribe_isolated_sync(audio_path: Path, language: str | None) -> list[dict[str, Any]]:
+    """Keep CTranslate2/PyAV allocation out of the long-lived Uvicorn process."""
+    result_path = audio_path.with_name(f"{audio_path.stem}-{uuid.uuid4().hex}.words.json")
+    try:
+        with tempfile.TemporaryFile() as errors:
+            result = subprocess.run(
+                [sys.executable, "-m", "media_transcribe", str(audio_path), str(result_path), language or ""],
+                stdout=subprocess.DEVNULL, stderr=errors,
+                check=False, timeout=TRANSCRIBE_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                errors.seek(0, 2)
+                errors.seek(max(0, errors.tell() - 4000))
+                detail = errors.read().decode("utf-8", errors="replace")[-2000:]
+                raise RuntimeError(f"Isolated transcription exited {result.returncode}: {detail}")
+        words = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(words, list) or not words:
+            raise RuntimeError("Isolated transcription returned no word timestamps")
+        return words
+    finally:
+        result_path.unlink(missing_ok=True)
+
+
 async def _transcribe_faster_whisper(
     audio_path: Path,
     language: str | None,
 ) -> list[dict[str, Any]]:
     async with _whisper_model_lock:
         try:
+            if ISOLATE_WHISPER:
+                return await asyncio.to_thread(_transcribe_isolated_sync, audio_path, language)
             return await asyncio.wait_for(
                 asyncio.to_thread(
                     _transcribe_faster_whisper_sync,

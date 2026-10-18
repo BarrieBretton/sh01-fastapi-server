@@ -95,7 +95,13 @@ def run_media_command(command: list[str], timeout: int, label: str) -> subproces
                         break
                     pressure = _cgroup_pressure()
                     if pressure and pressure[0] > pressure[1] - reserve:
-                        reason = f"{label} stopped before cgroup memory exhaustion"
+                        mb = 1048576
+                        reason = (
+                            f"{label} stopped before cgroup memory exhaustion "
+                            f"(active={pressure[0] // mb} MiB, limit={pressure[1] // mb} MiB, "
+                            f"reserved={reserve // mb} MiB, ffmpeg_rss={rss // mb} MiB, "
+                            f"api_rss={_rss_bytes(os.getpid()) // mb} MiB)"
+                        )
                         break
                 time.sleep(0.1)
             if reason:
@@ -116,5 +122,5 @@ def run_media_command(command: list[str], timeout: int, label: str) -> subproces
         err.seek(max(0, err.tell() - 16384))
         result = subprocess.CompletedProcess(command, process.returncode, out.read(), err.read())
         if reason:
-            raise RuntimeError(reason + "; reduce resolution/effects or run on an opted-in high-resource host")
+            raise RuntimeError(reason + "; use the memory figures to adjust the workload or host")
         return result
