@@ -553,14 +553,15 @@ def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int
     }
     out = base + effects.get(effect, "")
     if zoom != "off":
-        amount = 0.035 if zoom == "subtle" else 0.07
-        direction = -1 if index % 2 else 1
-        z0 = 1.0 + (amount if direction < 0 else 0.0)
-        dz = amount / max(1.0, duration * fps)
-        if direction > 0:
-            zexpr = f"min(zoom+{dz:.7f},{1.0+amount:.4f})"
+        amount = 0.035 if zoom == "subtle" else 0.12
+        # zoompan emits one output frame per input frame (d=1). Its `zoom`
+        # variable starts again for each input frame, so use the output frame
+        # index to animate consistently across the entire shot instead.
+        ramp_frames = max(1, round(min(duration, 8.0) * fps))
+        if index % 2 == 0:
+            zexpr = f"min({1.0+amount:.4f},1.0+{amount:.4f}*on/{ramp_frames})"
         else:
-            zexpr = f"max(zoom-{dz:.7f},1.0)"
+            zexpr = f"max(1.0,{1.0+amount:.4f}-{amount:.4f}*on/{ramp_frames})"
         if reframe == "left":
             xexpr = "0"
         elif reframe == "right":
@@ -569,7 +570,7 @@ def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int
             xexpr = f"max(0,min(iw-iw/zoom,iw*{focus_x:.4f}-iw/(2*zoom)))"
         else:
             xexpr = "iw/2-(iw/zoom/2)"
-        out += f",zoompan=z='{zexpr}':x='{xexpr}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={fps}"
+        out += f",fps={fps},zoompan=z='{zexpr}':x='{xexpr}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps={fps}"
     return out
 
 
