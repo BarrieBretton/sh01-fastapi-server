@@ -142,6 +142,11 @@ class AutoEditRequest(BaseModel):
     video_effect: Literal["none", "crisp", "punchy", "cinematic", "warm"] | None = None
     dynamic_zoom: Literal["off", "subtle", "punchy"] = "subtle"
     reframe: Literal["center", "left", "right", "auto"] = "auto"
+    # Coordinates on the scaled source, before the final crop/zoom.
+    # Omit either coordinate to keep the existing horizontal/vertical framing.
+    crop_x_px: int | None = Field(default=None, ge=0)
+    crop_y_px: int | None = Field(default=None, ge=0)
+    crop_scale: float = Field(default=1.0, ge=1.0, le=2.0)
     transition: Literal["none", "fade", "wipeleft", "slideleft", "smoothleft"] = "fade"
     transition_seconds: float = Field(default=0.18, ge=0, le=0.6)
     transition_sfx: Literal["none", "click", "pop", "whoosh"] = "none"
@@ -518,10 +523,17 @@ def _estimate_focus_x(source: Path, absolute_start: float, duration: float) -> f
         return 0.5
 
 
-def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float, focus_x: float = 0.5) -> str:
+def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float, focus_x: float = 0.5, *, crop_x_px: int | None = None, crop_y_px: int | None = None, crop_scale: float = 1.0) -> str:
     w, h = RENDER_WIDTH, RENDER_HEIGHT
     if fit_mode == "crop":
-        base = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}:(iw-ow)*{focus_x:.4f}:(ih-oh)/2"
+        scaled_w = math.ceil(w * crop_scale)
+        scaled_h = math.ceil(h * crop_scale)
+        x = str(crop_x_px) if crop_x_px is not None else f"(iw-ow)*{focus_x:.4f}"
+        y = str(crop_y_px) if crop_y_px is not None else "(ih-oh)/2"
+        base = (
+            f"scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase:force_divisible_by=2,"
+            f"crop={w}:{h}:{x}:{y}:exact=1"
+        )
     elif fit_mode == "fit_black":
         base = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
     else:
@@ -561,17 +573,62 @@ def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int
     return out
 
 
+def _validate_pixel_crop(source: Path, req: AutoEditRequest) -> None:
+    """Reject coordinates outside the scaled source rather than silently shifting them."""
+    if req.fit_mode != "crop" or (req.crop_x_px is None and req.crop_y_px is None):
+        return
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required for pixel crop admission")
+    probe = _run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height,sample_aspect_ratio", "-of", "json", str(source)],
+        30, "pixel crop source probe",
+    )
+    streams = json.loads(probe.stdout).get("streams", [])
+    if not streams:
+        raise ValueError("Cannot determine source dimensions for pixel crop")
+    stream = streams[0]
+    src_w, src_h = int(stream["width"]), int(stream["height"])
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("Invalid source dimensions for pixel crop")
+    sar = stream.get("sample_aspect_ratio", "1:1")
+    if sar not in (None, "1:1"):
+        raise ValueError("Pixel crop requires square source pixels (sample_aspect_ratio=1:1)")
+    w, h = RENDER_WIDTH, RENDER_HEIGHT
+    target_w, target_h = math.ceil(w * req.crop_scale), math.ceil(h * req.crop_scale)
+    factor = max(target_w / src_w, target_h / src_h)
+    scaled_w = math.ceil(src_w * factor / 2) * 2
+    scaled_h = math.ceil(src_h * factor / 2) * 2
+    max_x, max_y = scaled_w - w, scaled_h - h
+    if (req.crop_x_px is not None and req.crop_x_px > max_x) or (req.crop_y_px is not None and req.crop_y_px > max_y):
+        raise ValueError(
+            f"Pixel crop position out of bounds: x must be 0..{max_x}, y must be 0..{max_y}; "
+            f"increase crop_scale to create more vertical or horizontal travel"
+        )
+
+
 def _render_segment(source: Path, dest: Path, absolute_start: float, duration: float, req: AutoEditRequest, idx: int) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not installed")
     preset = PRESETS[req.preset]
     fit_mode = req.fit_mode or str(preset["fit_mode"])
+    if req.crop_x_px is not None or req.crop_y_px is not None:
+        if fit_mode != "crop":
+            raise ValueError("crop_x_px and crop_y_px require fit_mode=crop")
+        _validate_pixel_crop(source, req)
     effect = req.video_effect or str(preset["video_effect"])
     focus_x = _estimate_focus_x(source, absolute_start, duration) if req.reframe == "auto" else {
         "left": 0.0, "center": 0.5, "right": 1.0
     }[req.reframe]
-    vf = _base_filter(fit_mode, effect, req.dynamic_zoom, req.reframe, idx, req.fps, duration, focus_x)
+    # A numeric position locates the crop window; subsequent animated zoom
+    # remains centered inside that window instead of snapping to left/right.
+    zoom_reframe = "center" if req.crop_x_px is not None or req.crop_y_px is not None else req.reframe
+    vf = _base_filter(
+        fit_mode, effect, req.dynamic_zoom, zoom_reframe, idx, req.fps, duration, focus_x,
+        crop_x_px=req.crop_x_px, crop_y_px=req.crop_y_px, crop_scale=req.crop_scale,
+    )
 
     cmd = [
         ffmpeg, "-y",
