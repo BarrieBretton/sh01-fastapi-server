@@ -228,13 +228,20 @@ def animated_ass(branding: Branding, path: Path, width: int, height: int,
         advance = spec.font_size_px * 0.64
         speed = spec.speed_px_per_second
         repeats = math.ceil(duration * speed / cursor) + 1 if spec.mode == "loop" else 1
+        # ASS emits separate glyph events. On left/top/right in the forward
+        # direction (and on bottom in reverse), the direction of travel is
+        # also the direction in which upright/inward-facing text is read.
+        # Start the last glyph first so the populated marquee reads naturally.
+        # The opposite directions already read naturally in input order.
+        reads_with_travel = (spec.direction == "forward") != (edges[0] == "bottom")
         alpha = round((1 - spec.opacity) * 255)
         color = spec.color[5:7] + spec.color[3:5] + spec.color[1:3]
         for cycle in range(repeats):
             for index, char in enumerate(spec.text):
                 if char.isspace():
                     continue
-                offset = cycle * cursor + index * advance
+                glyph_order = (len(spec.text) - 1 - index) if reads_with_travel else index
+                offset = cycle * cursor + glyph_order * advance
                 for leg_index, (begin, end, a, b, angle) in enumerate(legs):
                     first, last = (offset + begin) / speed, (offset + end) / speed
                     if first >= duration:
