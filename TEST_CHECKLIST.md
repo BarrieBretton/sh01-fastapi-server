@@ -1,5 +1,7 @@
 # Control Plane Test Checklist
 
+> Current public control-plane base: `https://infra-control.vivojaymail.workers.dev`. For current D1 queue and external settings, read [the living handbook](docs/PROJECT_HANDBOOK.md). The router sources and example JSONC files can be configured through Cloudflare's dashboard; Wrangler is optional.
+
 Use this checklist after the paired Render control-plane code is deployed and the two Cloudflare Workers have:
 
 - the current Worker code,
@@ -116,7 +118,7 @@ sh01 -> https://sh01-fastapi-server.onrender.com
 Set:
 
 ```powershell
-$BASE = "https://sh01-fastapi-server-mtwu.onrender.com"
+$BASE = "https://infra-control.vivojaymail.workers.dev"
 $KEY = "<CONTROL_PLANE_API_KEY>"
 ```
 

@@ -1,5 +1,7 @@
 # SH01 Control Plane Setup
 
+> Current public control-plane base: `https://infra-control.vivojaymail.workers.dev`. For current D1 queue and external settings, read [the living handbook](docs/PROJECT_HANDBOOK.md). The router sources and example JSONC files can be configured through Cloudflare's dashboard; Wrangler is optional.
+
 This document describes the **current paired Render-slot control-plane architecture**.
 
 > Historical note: an earlier version modeled n8n and SH01 as independent Render rings. That model is obsolete. The authoritative model is now:
@@ -553,7 +555,7 @@ both Workers maintenance ON
 Set:
 
 ```powershell
-$BASE = "https://sh01-fastapi-server-mtwu.onrender.com"
+$BASE = "https://infra-control.vivojaymail.workers.dev"
 $KEY = "<CONTROL_PLANE_API_KEY>"
 ```
 

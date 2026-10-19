@@ -69,7 +69,7 @@ For Docker, build with `docker build -t sh01 .` and supply environment variables
 
 Useful optional media settings include `MEDIA_CLIP_WHISPER_MODEL`, `MEDIA_CLIP_WHISPER_VAD`, `MEDIA_CLIP_RENDER_WIDTH`, `MEDIA_CLIP_RENDER_HEIGHT`, `MEDIA_CGROUP_RESERVE_MB`, `MEDIA_FFMPEG_MAX_RSS_MB`, `MEDIA_WHISPER_MAX_RSS_MB`, `MEDIA_MAX_INPUT_PIXELS`, `MEDIA_QUEUE_POLL_SECONDS`, and `AUTO_EDIT_MAX_SEGMENTS`. Defaults and bounds live in `caption_router.py`, `media_resources.py`, `media_dispatcher.py`, and `auto_editor.py`. On free or small instances, an accepted request can still fail at a memory admission check; the controls are safeguards, not a guarantee that every input fits.
 
-The media queue requires `MEDIA_JOB_STORE_MODE=remote` on consumers and access to the deployed Cloudflare queue API. It is **not selected by `MEDIA_QUEUE_POSTGRES_SLOT`**, nor does it automatically switch to the currently active Supabase slot. Infrastructure state and other workloads still use the configured Postgres ring. `MEDIA_JOB_STORE_SETUP.md` describes an earlier media-store topology; use the D1 queue settings above for this deployment.
+The media queue requires `MEDIA_JOB_STORE_MODE=remote` on consumers and access to the deployed Cloudflare queue API. It is **not selected by `MEDIA_QUEUE_POSTGRES_SLOT`**, nor does it automatically switch to the currently active Supabase slot. Infrastructure state and other workloads still use the configured Postgres ring. See `MEDIA_JOB_STORE_SETUP.md` for this D1 queue deployment.
 
 ## Main API surfaces
 
@@ -193,3 +193,7 @@ For n8n integrations, submit to the appropriate **stable SH01 Cloudflare URL** a
 | `scripts/`, `docs/` | Operational scripts and detailed integration documentation |
 
 Never commit credentials, exported browser cookies, real customer media, local `.env` files, or logs. Keep values in the relevant Render or Cloudflare secret settings and your local secret store.
+
+## Living project handbook
+
+For a new engineer or AI session, start with [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md) and [`AGENTS.md`](AGENTS.md). The handbook tracks code, externally configured infrastructure, n8n workflow and credential inventories, verified observations, and open gaps. The working high-resource media regression notebook is [`notebooks/sh01_kaggle_branding_endpoint_test.ipynb`](notebooks/sh01_kaggle_branding_endpoint_test.ipynb). Update the handbook alongside changes to deployment, bindings, schedules, workflow exports, and API contracts.
