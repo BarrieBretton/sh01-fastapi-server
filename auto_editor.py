@@ -1095,7 +1095,7 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
     await asyncio.to_thread(manager.upload_file, final, BACKBLAZE_BUCKET_NAME, b2_name, "video/mp4", 1)
 
     edl_segments = []
-    for seg, out_start in zip(segments, output_starts):
+    for shot_idx, (seg, out_start) in enumerate(zip(segments, output_starts)):
         edl_segments.append({
             "source_start": round(base_start + float(seg["start"]), 3),
             "source_end": round(base_start + float(seg["end"]), 3),
@@ -1103,7 +1103,7 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
             "duration": round(float(seg["end"]) - float(seg["start"]), 3),
             "score": seg.get("score"),
             "reason": seg.get("reason"),
-            "zoom": _shot_zoom(req, idx, float(seg["end"]) - float(seg["start"])),
+            "zoom": _shot_zoom(req, shot_idx, float(seg["end"]) - float(seg["start"])),
         })
     return {
         "variant": variant + 1,
