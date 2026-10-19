@@ -13,6 +13,7 @@ from .render_provider import (
     render_get_env,
     render_health,
     render_service_status,
+    render_resume_blocker,
     render_suspend,
 )
 from .router_client import (
@@ -289,6 +290,10 @@ def _promote_live_candidate(previous_active: str, candidate: str) -> dict[str, A
         role: render_base_url(previous_active, role)
         for role in ("n8n", "sh01")
     }
+    previous_maintenance = {
+        role: bool(router_status(role).get("maintenance"))
+        for role in ("n8n", "sh01")
+    }
     maintenance_on = {"n8n": False, "sh01": False}
     state_changed = False
     phases: dict[str, Any] = {}
@@ -359,11 +364,11 @@ def _promote_live_candidate(previous_active: str, candidate: str) -> dict[str, A
                 rollback[f"{role}_preferred_error"] = str(exc)
 
         for role in ("n8n", "sh01"):
-            if maintenance_on[role]:
+            if maintenance_on[role] or previous_maintenance[role]:
                 try:
                     rollback[f"{role}_maintenance_off"] = router_set_maintenance(
                         role,
-                        False,
+                        previous_maintenance[role],
                     )
                 except Exception as exc:
                     rollback[f"{role}_maintenance_off_error"] = str(exc)
@@ -376,15 +381,11 @@ def _promote_live_candidate(previous_active: str, candidate: str) -> dict[str, A
 
 
 def _hard_stop_render_ring(reason: str) -> dict[str, Any]:
-    """Put the public stack into maintenance after the Render ring is exhausted.
-
-    This is deliberately terminal for automatic operation. Once every registered
-    Render candidate has failed, a human has to add/fix a ring member and then
-    clear router maintenance before retrying an SLA tick. That is appropriate
-    because creating a new provider account/service is inherently an operator
-    action.
-    """
-    actions: dict[str, Any] = {"routers": {}, "render": {}}
+    """Freeze ingress, but leave Render running so a recovered pair can be detected."""
+    actions: dict[str, Any] = {
+        "routers": {},
+        "render": {"action": "left_running_for_recovery"},
+    }
 
     for role in ("n8n", "sh01"):
         try:
@@ -392,28 +393,95 @@ def _hard_stop_render_ring(reason: str) -> dict[str, Any]:
         except Exception as exc:
             actions["routers"][role] = {"error": str(exc)}
 
-    for slot in registry.render_slots():
-        slot_actions: dict[str, Any] = {}
-        for role in ("n8n", "sh01"):
-            try:
-                status = render_service_status(slot, role)
-                if status.get("suspended") == "not_suspended":
-                    slot_actions[role] = render_suspend(slot, role)
-                else:
-                    slot_actions[role] = {
-                        "changed": False,
-                        "status": "already_not_running",
-                    }
-            except Exception as exc:
-                slot_actions[role] = {
-                    "changed": False,
-                    "status": "hard_stop_suspend_failed",
-                    "error": str(exc),
-                }
-        actions["render"][slot] = slot_actions
-
     actions["reason"] = reason
     return actions
+
+
+def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
+                       dry_run: bool) -> dict[str, Any]:
+    """Recheck a hard stop on every tick; reopen only a healthy, aligned pair."""
+    pair = _active_pair_state(active)
+    candidate = active if pair["healthy"] else None
+    inspected: dict[str, Any] = {}
+
+    if candidate is None:
+        for slot in _render_slots_in_rotation(active):
+            try:
+                candidate_pair = _active_pair_state(slot)
+                inspected[slot] = {"healthy": candidate_pair["healthy"]}
+                if candidate_pair["healthy"]:
+                    runtime = _candidate_runtime_matches(slot)
+                    inspected[slot]["runtime_match"] = bool(runtime["match"])
+                    if runtime["match"]:
+                        candidate = slot
+                        break
+            except Exception as exc:
+                inspected[slot] = {"error": str(exc)}
+
+    if dry_run:
+        return {
+            "ok": candidate is not None,
+            "action": "would_recover_hard_stop" if candidate else "recovery_pending",
+            "active_render": active,
+            "recovery_target": candidate,
+            "pair": pair,
+            "candidates": inspected,
+            "dry_run": True,
+        }
+
+    if candidate is None:
+        _save_monitor_state({**monitor, "last_checked_at": _now()}, revision + 1)
+        return {
+            "ok": False,
+            "action": "recovery_pending",
+            "active_render": active,
+            "pair": pair,
+            "candidates": inspected,
+        }
+
+    try:
+        if candidate != active:
+            promotion = _promote_live_candidate(active, candidate)
+        else:
+            promotion = {"router_actions": _align_routers(active)}
+            try:
+                for role in ("n8n", "sh01"):
+                    router_set_maintenance(role, False)
+            except Exception:
+                # Opening only one public entry point breaks paired routing.
+                for role in ("n8n", "sh01"):
+                    try:
+                        router_set_maintenance(role, True)
+                    except Exception:
+                        logger.exception("Could not restore %s router maintenance", role)
+                raise
+
+        _save_monitor_state({
+            **monitor,
+            "consecutive_failures": 0,
+            "last_reason": None,
+            "last_checked_at": _now(),
+            "hard_stop": False,
+            **({"last_failover_at": _now(), "last_failover_from": active,
+                "last_failover_to": candidate,
+                "last_failover_mode": "fast_promote_live_candidate"}
+               if candidate != active else {}),
+        }, revision + 1)
+        return {
+            "ok": True,
+            "action": "recovered_hard_stop",
+            "active_render": candidate,
+            "mode": "fast_promote_live_candidate" if candidate != active else "reopen_active",
+            "result": promotion,
+        }
+    except Exception as exc:
+        logger.exception("SLA hard-stop recovery failed")
+        return {
+            "ok": False,
+            "action": "recovery_failed",
+            "active_render": active,
+            "error": str(exc),
+        }
 
 def sla_status() -> dict[str, Any]:
     monitor, revision = _load_monitor_state()
@@ -441,6 +509,9 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
             raise RuntimeError(f"Active Render slot is missing or unknown: {active}")
 
         routers = _routers_in_maintenance()
+        monitor, revision = _load_monitor_state()
+        if monitor.get("hard_stop"):
+            return _recover_hard_stop(active, monitor, revision, dry_run)
         if routers["maintenance"]:
             return {
                 "ok": True,
@@ -450,7 +521,6 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
             }
 
         pair = _active_pair_state(active)
-        monitor, revision = _load_monitor_state()
         threshold = _env_int("INFRA_SLA_FAILURE_THRESHOLD", 2)
 
         if pair["healthy"]:
@@ -591,6 +661,15 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
                             "result": result,
                         }
 
+                # Do not quiesce the source for a candidate Render will refuse
+                # to resume. The full failover engine also checks this preflight.
+                for role in ("n8n", "sh01"):
+                    blocker = render_resume_blocker(candidate_pair[role]["status"])
+                    if blocker:
+                        raise RuntimeError(
+                            f"Render candidate {candidate}/{role} cannot resume: {blocker}"
+                        )
+
                 # Candidate is not already healthy+correctly-configured.
                 # Use the existing full failover engine. It will configure,
                 # resume/deploy, verify, route, persist, and roll back on failure.
@@ -640,10 +719,29 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
                 )
                 errors[candidate] = str(exc)
 
-        # Every registered alternative failed. The Render ring is exhausted.
-        # Freeze public ingress and best-effort suspend every controllable Render
-        # service. Recovery now requires an operator to repair/add a ring member,
-        # clear router maintenance, and trigger another SLA tick.
+        # A transient database/readiness failure can clear during a failed
+        # standby promotion. Keep the original healthy pair online in that case.
+        refreshed_pair = _active_pair_state(active)
+        if refreshed_pair["healthy"]:
+            router_actions = _align_routers(active)
+            _save_monitor_state({
+                **next_monitor,
+                "consecutive_failures": 0,
+                "last_reason": None,
+                "last_checked_at": _now(),
+                "hard_stop": False,
+            }, revision + 2)
+            return {
+                "ok": True,
+                "action": "active_pair_recovered_after_failed_failover",
+                "active_render": active,
+                "pair": refreshed_pair,
+                "candidate_errors": errors,
+                "router_actions": router_actions,
+            }
+
+        # No alternative could be promoted. Keep serving processes alive and
+        # recheck the pair on subsequent ticks while the routers are frozen.
         hard_stop_actions = _hard_stop_render_ring(reason)
         monitor_after, revision_after = _load_monitor_state()
         halted = {

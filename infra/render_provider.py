@@ -220,11 +220,27 @@ def render_suspend(slot: str, role: str) -> dict[str, Any]:
     raise TimeoutError(f"Timed out waiting for Render service {slot}/{role} to suspend")
 
 
+def render_resume_blocker(status: dict[str, Any]) -> str | None:
+    """Explain why Render's user-only resume API cannot start this service."""
+    if status.get("suspended") == "not_suspended":
+        return None
+    suspenders = (status.get("raw") or {}).get("suspenders") or []
+    if status.get("suspended") == "suspended" and set(suspenders) == {"user"}:
+        return None
+    return f"state={status.get('suspended')}, suspenders={suspenders}"
+
+
 def render_resume(slot: str, role: str) -> dict[str, Any]:
     cfg = _service(slot, role)
     before = render_service_status(slot, role)
     if before.get("suspended") == "not_suspended":
         return {"slot": slot, "role": role, "changed": False, "status": "already_running"}
+    blocker = render_resume_blocker(before)
+    if blocker:
+        raise RuntimeError(
+            f"Render service {slot}/{role} cannot be resumed via the user-only "
+            f"resume API ({blocker})"
+        )
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             f"{RENDER_API_BASE}/services/{cfg['service_id']}/resume",

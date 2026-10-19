@@ -501,6 +501,7 @@ A live paired failover performs:
 preflight
 -> verify source/target Postgres
 -> snapshot all n8n and SH01 Render service states
+-> reject a target whose Render suspension reason prevents an API resume
 -> snapshot target runtime env
 -> verify both Cloudflare router-control states
 -> refuse to start if either router is already in maintenance
