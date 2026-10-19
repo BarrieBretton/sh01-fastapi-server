@@ -17,6 +17,7 @@ from .render_provider import (
     render_service_status,
     render_suspend,
     render_resume,
+    render_resume_blocker,
 )
 from .router_client import router_set_maintenance, router_set_preferred, router_status
 from .runtime_config import postgres_runtime_config, safe_runtime_summary
@@ -242,6 +243,7 @@ def run_failover(
         "n8n": False,
         "sh01": False,
     }
+    mutations_started = False
 
     try:
         source_pg_health = postgres_health(source_postgres)
@@ -254,6 +256,16 @@ def run_failover(
         for role in ("n8n", "sh01"):
             snapshots[role] = _service_snapshot(role)
             running_before[role] = _running_slots(snapshots[role])
+
+        # Check the candidate before quiescing the serving pair. Render rejects
+        # POST /resume for platform/billing-suspended services (HTTP 400).
+        for role in ("n8n", "sh01"):
+            blocker = render_resume_blocker(snapshots[role][target_render])
+            if blocker:
+                raise RuntimeError(
+                    f"Render candidate {target_render}/{role} is not resumable: "
+                    f"{blocker}; leaving the serving pair untouched"
+                )
 
         target_env_before["n8n"] = render_get_env(
             target_render,
@@ -290,6 +302,7 @@ def run_failover(
                     )
 
         result["phases"]["preflight"] = preflight
+        mutations_started = True
 
         if plan["switch_router"]:
             result["phases"]["n8n_router_maintenance_on"] = router_set_maintenance("n8n", True)
@@ -396,6 +409,11 @@ def run_failover(
         return result
 
     except Exception:
+        if not mutations_started:
+            # A rejected preflight has not touched ingress, services or state.
+            # The rollback below would otherwise suspend the healthy source.
+            logger.warning("Infrastructure failover preflight failed; no changes to roll back")
+            raise
         logger.exception("Infrastructure failover failed; attempting rollback")
 
         # Freeze both public entry points before manipulating services/config.

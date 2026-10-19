@@ -24,8 +24,15 @@ async function triggerTick(env, dryRun = false) {
   if (!response.ok) {
     throw new Error(`SLA tick failed HTTP ${response.status}: ${text.slice(0, 1000)}`);
   }
-  try { return JSON.parse(text); }
-  catch { return { raw: text }; }
+  let result;
+  try { result = JSON.parse(text); }
+  catch { throw new Error("SLA tick returned invalid JSON"); }
+  // The control plane returns HTTP 200 for both an unsuccessful tick and a
+  // maintenance skip. Surface these in Worker logs and manual /tick responses.
+  if (result?.ok !== true || (result.skipped && result.reason !== "another_sla_tick_is_running")) {
+    throw new Error(`SLA tick ${String(result?.action || result?.reason || "failed")}`);
+  }
+  return result;
 }
 
 export default {
