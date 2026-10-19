@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Literal
+from PIL import Image
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ from b2_helper import get_b2_manager
 from media_job_store import store
 from media_capacity import MEDIA_RENDER_LOCK, HEAVY_MEDIA_CAPACITY, reserve_heavy_media_or_raise
 from media_resources import spawn_media_task, validate_high_resources, validate_video_source, require_memory_headroom
+from media_branding import Branding, animated_ass, composite_static, preset_branding
 from caption_router import (
     BACKBLAZE_BUCKET_NAME,
     B2_PREFIX,
@@ -56,7 +58,7 @@ router = APIRouter(prefix="/media", tags=["Automatic Video Editor"])
 AUTO_EDIT_JOB_KIND = "auto_edit"
 AUTO_EDIT_MAX_OUTPUTS = max(1, min(3, int(os.getenv("AUTO_EDIT_MAX_OUTPUTS", "3"))))
 AUTO_EDIT_MAX_SOURCE_SECONDS = max(180, int(os.getenv("AUTO_EDIT_MAX_SOURCE_SECONDS", "180")))
-AUTO_EDIT_MAX_SEGMENTS = max(2, min(20, int(os.getenv("AUTO_EDIT_MAX_SEGMENTS", "12"))))
+AUTO_EDIT_MAX_SEGMENTS = max(2, min(20, int(os.getenv("AUTO_EDIT_MAX_SEGMENTS", "20"))))
 AUTO_EDIT_SCENE_THRESHOLD = float(os.getenv("AUTO_EDIT_SCENE_THRESHOLD", "0.38"))
 AUTO_EDIT_MIN_SEGMENT = float(os.getenv("AUTO_EDIT_MIN_SEGMENT", "0.75"))
 AUTO_EDIT_DEFAULT_TARGET = float(os.getenv("AUTO_EDIT_DEFAULT_TARGET_SECONDS", "45"))
@@ -69,6 +71,21 @@ AUTO_EDIT_FILTER_LOW_CONFIDENCE_WORDS = os.getenv(
 AUTO_EDIT_ASR_DEBUG_TAIL_WORDS = max(
     0, min(50, int(os.getenv("AUTO_EDIT_ASR_DEBUG_TAIL_WORDS", "12")))
 )
+
+# Presets are only starting values. Every field explicitly supplied in the
+# request wins, including false, zero, off, and an empty selected-shot list.
+AUTO_EDIT_PRESET_EDITS: dict[str, dict[str, Any]] = {
+    "viral_punch": {"max_shot_seconds": 12, "silence_gap_seconds": 0.55,
+                    "dynamic_zoom": "punchy", "transition": "none", "captions_enabled": True},
+    "karaoke_glow": {"max_shot_seconds": 16, "dynamic_zoom": "subtle",
+                     "transition": "none", "captions_enabled": True},
+    "podcast_bold": {"max_shot_seconds": 20, "dynamic_zoom": "subtle",
+                     "transition": "none", "captions_enabled": True},
+    "cinematic": {"max_shot_seconds": 20, "dynamic_zoom": "subtle",
+                  "transition": "fade", "captions_enabled": True},
+    "clean_minimal": {"max_shot_seconds": 20, "dynamic_zoom": "off",
+                      "transition": "none", "captions_enabled": True},
+}
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
@@ -109,6 +126,15 @@ class SfxAsset(BaseModel):
     volume: float = Field(default=0.75, ge=0, le=2.0)
 
 
+class ZoomShotOverride(BaseModel):
+    """Override one selected shot (1-based output order, after silence cuts)."""
+
+    shot: int = Field(ge=1, le=AUTO_EDIT_MAX_SEGMENTS)
+    direction: Literal["in", "out", "off"] = "in"
+    amount: float | None = Field(default=None, ge=0, le=0.3)
+    ramp_seconds: float | None = Field(default=None, ge=0.5, le=30)
+
+
 class AutoEditRequest(BaseModel):
     unlimited_resources: bool = False
     source_path: str | None = None
@@ -116,8 +142,8 @@ class AutoEditRequest(BaseModel):
     telegram_file_id: str | None = None
     request_id: str | None = Field(default=None, max_length=512)
 
-    start_seconds: float = Field(default=0.0, ge=0)
-    end_seconds: float | None = Field(default=None, gt=0)
+    start_seconds: float = Field(default=0.0, ge=0, description="Inclusive source offset in seconds. Example: 4170 for 01:09:30.")
+    end_seconds: float | None = Field(default=None, gt=0, description="Exclusive source offset in seconds; null means source end.")
     target_seconds: float = Field(default=AUTO_EDIT_DEFAULT_TARGET, ge=5, le=180)
     max_shot_seconds: float = Field(default=20, ge=3, le=60)
     output_count: int = Field(default=1, ge=1, le=AUTO_EDIT_MAX_OUTPUTS)
@@ -125,7 +151,7 @@ class AutoEditRequest(BaseModel):
     preset: Literal["viral_punch", "clean_minimal", "karaoke_glow", "podcast_bold", "cinematic"] = "viral_punch"
     language: str | None = Field(default=None, min_length=2, max_length=10)
     caption_overrides: CaptionOverrides | None = None
-    captions_enabled: bool = True
+    captions_enabled: bool = Field(default=True, description="False suppresses generated subtitles; transcript can still drive silence cuts.")
     transcription_chunk_seconds: int = Field(default=120, ge=30, le=180)
 
     smart_cut: bool = True
@@ -140,7 +166,12 @@ class AutoEditRequest(BaseModel):
 
     fit_mode: Literal["blur", "crop", "fit_black"] | None = None
     video_effect: Literal["none", "crisp", "punchy", "cinematic", "warm"] | None = None
-    dynamic_zoom: Literal["off", "subtle", "punchy"] = "subtle"
+    dynamic_zoom: Literal["off", "subtle", "punchy"] = Field(default="subtle", description="Global master zoom toggle/style; off disables even per-shot overrides.")
+    zoom_amount: float | None = Field(default=None, ge=0, le=0.3, description="Zoom fraction, e.g. 0.12 is 12%; defaults: subtle 0.035, punchy 0.12")
+    zoom_ramp_seconds: float = Field(default=8, ge=0.5, le=30, description="Seconds to reach the requested zoom; limited by shot length")
+    zoom_shots: list[int] | None = Field(default=None, max_length=AUTO_EDIT_MAX_SEGMENTS,
+        description="1-based selected shot numbers receiving zoom; null=all, []=none")
+    zoom_overrides: list[ZoomShotOverride] = Field(default_factory=list, max_length=AUTO_EDIT_MAX_SEGMENTS)
     reframe: Literal["center", "left", "right", "auto"] = "auto"
     # Coordinates on the scaled source, before the final crop/zoom.
     # Omit either coordinate to keep the existing horizontal/vertical framing.
@@ -160,6 +191,7 @@ class AutoEditRequest(BaseModel):
     duck_music: bool = True
     sound_effects: list[SfxAsset] = Field(default_factory=list)
     overlays: list[OverlayAsset] = Field(default_factory=list)
+    branding: Branding | None = Field(default=None, description="Edge gradients, corner logos, and static/animated edge text; null uses preset default; enabled=false hides branding")
 
     fps: Literal[24, 25, 30, 60] = 30
     crf: int = Field(default=21, ge=16, le=30)
@@ -167,6 +199,9 @@ class AutoEditRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_request(self):
+        for field, value in AUTO_EDIT_PRESET_EDITS[self.preset].items():
+            if field not in self.model_fields_set:
+                setattr(self, field, value)
         if sum(bool(value) for value in (
             self.source_url, self.telegram_file_id, self.source_path
         )) != 1:
@@ -179,6 +214,12 @@ class AutoEditRequest(BaseModel):
             raise ValueError(f"At most {AUTO_EDIT_ASSET_MAX} overlay assets are allowed")
         if len(self.sound_effects) > AUTO_EDIT_ASSET_MAX:
             raise ValueError(f"At most {AUTO_EDIT_ASSET_MAX} sound effects are allowed")
+        if self.zoom_shots is not None and len(set(self.zoom_shots)) != len(self.zoom_shots):
+            raise ValueError("zoom_shots must contain distinct shot numbers")
+        if self.zoom_shots is not None and any(n < 1 or n > AUTO_EDIT_MAX_SEGMENTS for n in self.zoom_shots):
+            raise ValueError(f"zoom_shots must be between 1 and {AUTO_EDIT_MAX_SEGMENTS}")
+        if len({o.shot for o in self.zoom_overrides}) != len(self.zoom_overrides):
+            raise ValueError("At most one zoom override is allowed per shot")
         return self
 
 
@@ -523,7 +564,7 @@ def _estimate_focus_x(source: Path, absolute_start: float, duration: float) -> f
         return 0.5
 
 
-def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float, focus_x: float = 0.5, *, crop_x_px: int | None = None, crop_y_px: int | None = None, crop_scale: float = 1.0) -> str:
+def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int, fps: int, duration: float, focus_x: float = 0.5, *, crop_x_px: int | None = None, crop_y_px: int | None = None, crop_scale: float = 1.0, zoom_amount: float | None = None, zoom_ramp_seconds: float = 8, zoom_direction: str | None = None) -> str:
     w, h = RENDER_WIDTH, RENDER_HEIGHT
     if fit_mode == "crop":
         scaled_w = math.ceil(w * crop_scale)
@@ -552,13 +593,16 @@ def _base_filter(fit_mode: str, effect: str, zoom: str, reframe: str, index: int
         "warm": ",eq=contrast=1.04:saturation=1.08:gamma_r=1.03:gamma_b=0.97",
     }
     out = base + effects.get(effect, "")
-    if zoom != "off":
-        amount = 0.035 if zoom == "subtle" else 0.12
+    if zoom != "off" and zoom_direction != "off":
+        amount = zoom_amount if zoom_amount is not None else (0.035 if zoom == "subtle" else 0.12)
+        if amount == 0:
+            return out
         # zoompan emits one output frame per input frame (d=1). Its `zoom`
         # variable starts again for each input frame, so use the output frame
         # index to animate consistently across the entire shot instead.
-        ramp_frames = max(1, round(min(duration, 8.0) * fps))
-        if index % 2 == 0:
+        ramp_frames = max(1, round(min(duration, zoom_ramp_seconds) * fps))
+        direction = zoom_direction or ("in" if index % 2 == 0 else "out")
+        if direction == "in":
             zexpr = f"min({1.0+amount:.4f},1.0+{amount:.4f}*on/{ramp_frames})"
         else:
             zexpr = f"max(1.0,{1.0+amount:.4f}-{amount:.4f}*on/{ramp_frames})"
@@ -609,6 +653,24 @@ def _validate_pixel_crop(source: Path, req: AutoEditRequest) -> None:
         )
 
 
+def _shot_zoom(req: AutoEditRequest, idx: int, duration: float) -> dict[str, Any]:
+    """Resolve defaults, selected-shot list and a 1-based per-shot override."""
+    shot_number = idx + 1
+    override = next((item for item in req.zoom_overrides if item.shot == shot_number), None)
+    selected = req.zoom_shots is None or shot_number in req.zoom_shots
+    direction = override.direction if override else ("in" if idx % 2 == 0 else "out")
+    if req.dynamic_zoom == "off" or (not selected and override is None):
+        direction = "off"
+    amount = override.amount if override and override.amount is not None else req.zoom_amount
+    if amount is None:
+        amount = 0.035 if req.dynamic_zoom == "subtle" else 0.12
+    if amount == 0:
+        direction = "off"
+    ramp = override.ramp_seconds if override and override.ramp_seconds is not None else req.zoom_ramp_seconds
+    return {"direction": direction, "amount": amount if direction != "off" else 0.0,
+            "ramp_seconds": min(duration, ramp) if direction != "off" else 0.0}
+
+
 def _render_segment(source: Path, dest: Path, absolute_start: float, duration: float, req: AutoEditRequest, idx: int) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -626,9 +688,12 @@ def _render_segment(source: Path, dest: Path, absolute_start: float, duration: f
     # A numeric position locates the crop window; subsequent animated zoom
     # remains centered inside that window instead of snapping to left/right.
     zoom_reframe = "center" if req.crop_x_px is not None or req.crop_y_px is not None else req.reframe
+    zoom = _shot_zoom(req, idx, duration)
     vf = _base_filter(
         fit_mode, effect, req.dynamic_zoom, zoom_reframe, idx, req.fps, duration, focus_x,
         crop_x_px=req.crop_x_px, crop_y_px=req.crop_y_px, crop_scale=req.crop_scale,
+        zoom_amount=zoom["amount"], zoom_ramp_seconds=zoom["ramp_seconds"] or req.zoom_ramp_seconds,
+        zoom_direction=zoom["direction"],
     )
 
     cmd = [
@@ -728,7 +793,7 @@ def _combine_segments(paths: list[Path], root: Path, req: AutoEditRequest) -> tu
 
 def _remap_words(words: list[dict[str, Any]], segments: list[dict[str, Any]], output_starts: list[float]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for seg, out_start in zip(segments, output_starts):
+    for idx, (seg, out_start) in enumerate(zip(segments, output_starts)):
         for idx in seg.get("word_indexes", []):
             w = words[idx]
             midpoint = (float(w["start"]) + float(w["end"])) / 2
@@ -778,7 +843,7 @@ def _generate_transition_sfx(style: str, dest: Path) -> None:
          60, "auto-edit transition sound")
 
 
-async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple[OverlayAsset, Path]], Path | None, list[tuple[SfxAsset, Path]]]:
+async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple[OverlayAsset, Path]], Path | None, list[tuple[SfxAsset, Path]], list[Path]]:
     overlays: list[tuple[OverlayAsset, Path]] = []
     for i, spec in enumerate(req.overlays):
         p = root / f"overlay_{i}.bin"
@@ -793,10 +858,19 @@ async def _download_assets(req: AutoEditRequest, root: Path) -> tuple[list[tuple
         p = root / f"sfx_{i}.bin"
         await _download_url(spec.url, p)
         sfx.append((spec, p))
-    return overlays, music, sfx
+    branding = req.branding if req.branding is not None else preset_branding(req.preset)
+    logos: list[Path] = []
+    if branding.enabled:
+        for i, spec in enumerate(branding.logos):
+            p = root / f"brand_logo_{i}.bin"
+            await _download_url(spec.url, p)
+            if p.stat().st_size > 8 * 1048576:
+                raise ValueError("Brand logo exceeds the 8 MiB input limit")
+            logos.append(p)
+    return overlays, music, sfx, logos
 
 
-def _finalize_video(base: Path, ass: Path | None, output: Path, duration: float, req: AutoEditRequest, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], hook: str) -> None:
+def _finalize_video(base: Path, ass: Path | None, output: Path, duration: float, req: AutoEditRequest, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], hook: str, branding_png: Path | None = None, edge_ass: Path | None = None) -> None:
     ffmpeg = shutil.which("ffmpeg")
     cmd = [ffmpeg, "-y", "-filter_threads", "1", "-filter_complex_threads", "1", "-i", str(base)]
     input_index = 1
@@ -818,6 +892,10 @@ def _finalize_video(base: Path, ass: Path | None, output: Path, duration: float,
         cmd += ["-i", str(path)]
         sfx_indices.append((spec, input_index))
         input_index += 1
+    brand_index = None
+    if branding_png is not None:
+        cmd += ["-loop", "1", "-i", str(branding_png)]
+        brand_index = input_index
 
     if ass is not None:
         ass_escaped = str(ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
@@ -852,6 +930,15 @@ def _finalize_video(base: Path, ass: Path | None, output: Path, duration: float,
             f"eof_action=pass:shortest=0:enable='between(t,{start:.3f},{end:.3f})'[v{j}]"
         )
         vlabel = f"v{j}"
+
+    if brand_index is not None:
+        filters.append(f"[{brand_index}:v]format=rgba[brand_img]")
+        filters.append(f"[{vlabel}][brand_img]overlay=0:0:shortest=0:eof_action=pass[vbrand]")
+        vlabel = "vbrand"
+    if edge_ass is not None:
+        escaped = str(edge_ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+        filters.append(f"[{vlabel}]ass='{escaped}'[vedge]")
+        vlabel = "vedge"
 
     audio_labels: list[str]
     if music_index is not None and req.duck_music:
@@ -936,7 +1023,7 @@ def _inject_hook_ass(path: Path, hook: str) -> None:
     path.write_text(raw, encoding="utf-8")
 
 
-async def _render_variant(source: Path, base_start: float, words: list[dict[str, Any]], segments: list[dict[str, Any]], req: AutoEditRequest, root: Path, variant: int, request_id: str, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]]) -> dict[str, Any]:
+async def _render_variant(source: Path, base_start: float, words: list[dict[str, Any]], segments: list[dict[str, Any]], req: AutoEditRequest, root: Path, variant: int, request_id: str, overlays: list[tuple[OverlayAsset, Path]], music: Path | None, sfx: list[tuple[SfxAsset, Path]], brand_logos: list[Path] | None = None) -> dict[str, Any]:
     variant_root = root / f"variant_{variant}"
     variant_root.mkdir(parents=True, exist_ok=True)
     segment_paths: list[Path] = []
@@ -967,6 +1054,25 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
             await asyncio.to_thread(_inject_hook_ass, ass, hook)
 
     variant_sfx = list(sfx)
+    branding = req.branding if req.branding is not None else preset_branding(req.preset)
+    branding_png = None
+    edge_ass = None
+    if branding.enabled:
+        if branding.gradients or branding.logos or any(t.mode == "static" for t in branding.edge_text):
+            canvas = Image.new("RGBA", (RENDER_WIDTH, RENDER_HEIGHT))
+            loaded = []
+            for spec, path in zip(branding.logos, brand_logos or []):
+                with Image.open(path) as raw:
+                    if raw.width * raw.height > 4_000_000:
+                        raise ValueError("Brand logo exceeds four million decoded pixels")
+                    raw.load()
+                    loaded.append((spec, raw.copy()))
+            await asyncio.to_thread(composite_static, canvas, branding, loaded)
+            branding_png = variant_root / "brand.png"
+            await asyncio.to_thread(canvas.save, branding_png)
+        candidate = variant_root / "edge-text.ass"
+        if await asyncio.to_thread(animated_ass, branding, candidate, RENDER_WIDTH, RENDER_HEIGHT, duration):
+            edge_ass = candidate
     if req.transition_sfx != "none" and len(segments) > 1:
         sound = variant_root / "transition_sfx.wav"
         await asyncio.to_thread(_generate_transition_sfx, req.transition_sfx, sound)
@@ -980,7 +1086,7 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
 
     final = variant_root / "final.mp4"
     logger.info("auto-edit variant=%s final render start", variant + 1)
-    await asyncio.to_thread(_finalize_video, combined, ass, final, duration, req, overlays, music, variant_sfx, hook)
+    await asyncio.to_thread(_finalize_video, combined, ass, final, duration, req, overlays, music, variant_sfx, hook, branding_png, edge_ass)
     logger.info("auto-edit variant=%s final render complete bytes=%s", variant + 1, final.stat().st_size if final.exists() else 0)
 
     token = _token(request_id, variant)
@@ -997,6 +1103,7 @@ async def _render_variant(source: Path, base_start: float, words: list[dict[str,
             "duration": round(float(seg["end"]) - float(seg["start"]), 3),
             "score": seg.get("score"),
             "reason": seg.get("reason"),
+            "zoom": _shot_zoom(req, idx, float(seg["end"]) - float(seg["start"])),
         })
     return {
         "variant": variant + 1,
@@ -1126,13 +1233,13 @@ async def _execute(job_id: str, req: AutoEditRequest) -> None:
                 if not base_segments:
                     raise RuntimeError("Auto-editor could not produce any usable edit segments")
 
-                overlays, music, sfx = await _download_assets(req, root)
+                overlays, music, sfx, brand_logos = await _download_assets(req, root)
                 results = []
                 for variant in range(req.output_count):
                     job.update(stage=f"render_variant_{variant + 1}", current_variant=variant + 1, planned_segments=len(base_segments))
                     await _persist(job, durable_payload)
                     selected = _select_segments(base_segments, req, variant)
-                    result = await _render_variant(source, start, words, selected, req, root, variant, request_id, overlays, music, sfx)
+                    result = await _render_variant(source, start, words, selected, req, root, variant, request_id, overlays, music, sfx, brand_logos)
                     results.append(result)
 
                 job.update(
@@ -1263,8 +1370,32 @@ async def auto_edit_capabilities(x_api_key: str | None = Header(None, alias="X-A
         "face_tracking": False,
         "face_tracking_note": "Automatic reframe samples visual activity in each selected shot. It does not detect or follow faces.",
         "animated_overlays": ["none", "fade", "slide_up", "slide_left", "float", "reveal"],
+        "captioning_toggle": "captions_enabled=false",
+        "caption_colors": ["caption_overrides.primary", "caption_overrides.highlight"],
+        "source_window": ["start_seconds", "end_seconds"],
+        "zoom_controls": ["dynamic_zoom", "zoom_amount", "zoom_ramp_seconds", "zoom_shots", "zoom_overrides"],
+        "branding": ["branding.gradients", "branding.logos", "branding.edge_text"],
         "automatic_transition_sfx": ["none", "click", "pop", "whoosh"],
         "captions_toggle": True,
         "max_source_seconds": AUTO_EDIT_MAX_SOURCE_SECONDS,
         "render_size": [RENDER_WIDTH, RENDER_HEIGHT],
     }
+
+
+@router.get("/auto-edit-presets", summary="List effective video-edit preset starting values")
+async def auto_edit_presets(x_api_key: str | None = Header(None, alias="X-API-KEY")):
+    """Expose ready-to-use templates for UI/n8n selection.
+
+    The caller sends `preset` to /media/auto-edit and can override any field.
+    The caption, image fit, effect and branding values shown here are applied
+    by the renderer; edit defaults are applied at request validation.
+    """
+    _require_key(x_api_key)
+    return {"presets": {
+        name: {"caption": data["caption"], "fit_mode": data["fit_mode"],
+               "video_effect": data["video_effect"],
+               "edit_defaults": {"smart_cut": True, "remove_silence": True,
+                                 **AUTO_EDIT_PRESET_EDITS[name]},
+               "branding": preset_branding(name).model_dump(mode="json")}
+        for name, data in PRESETS.items()
+    }, "overrides": "Explicit request fields override preset defaults, including branding.enabled=false."}

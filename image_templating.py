@@ -10,13 +10,14 @@ import random
 
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from media_admission import heavy_request
+from media_branding import Branding, composite_static, preset_branding
 
 
 router = APIRouter(tags=["image-templating"])
@@ -313,6 +314,10 @@ class RenderTemplateRequest(BaseModel):
     font_weight: Optional[int] = Field(None, description="Overrides FONT_WGHT (200..900).")
     debug: bool = Field(False, description="If true, return JSON debug info instead of rendering/uploading image.")
     enable_highlights: bool = Field(False, description="Enable inline color tags like [yellow]...[/yellow] or [#FF5733]...[ /#FF5733 ]")
+    text_color: str = Field("#FFFFFF", pattern=r"^#[0-9a-fA-F]{6}$", description="Default body text RGB color; inline highlights still override it")
+    text_font_size_px: Optional[int] = Field(None, ge=24, le=200, description="Maximum text size; long text can shrink to fit")
+    branding: Optional[Branding] = Field(None, description="Optional two-stop edge gradients, corner logos and static edge labels; omit to retain the classic bottom fade")
+    style_preset: Optional[Literal["viral_punch", "clean_minimal", "karaoke_glow", "podcast_bold", "cinematic"]] = Field(None, description="Optional shared bottom-gradient style; explicit branding wins")
 
     keep_subject_in_frame: bool = Field(
         False,
@@ -679,6 +684,8 @@ def _draw_text_with_shadow_bottom_anchored(
     weight: Optional[int] = None,
     width: Optional[int] = None,
     enable_highlights: bool = False,
+    default_rgba: tuple[int, int, int, int] = (255, 255, 255, 255),
+    font_size_px: Optional[int] = None,
 ) -> None:
     draw = ImageDraw.Draw(base)
     max_text_w = CFG.width - (CFG.text_side_margin * 2)
@@ -687,16 +694,18 @@ def _draw_text_with_shadow_bottom_anchored(
     plain = re.sub(r"\[/?[#a-zA-Z0-9]+\]", "", text) if enable_highlights else text
 
     font, _lines_plain, _bw, block_h, line_h = _fit_font_for_wrapped_text(
-        draw, plain, max_text_w, weight=weight, width=width
+        draw, plain, max_text_w, weight=weight, width=width,
+        start_size=font_size_px or CFG.font_start_size,
+        min_size=min(CFG.font_min_size, font_size_px or CFG.font_start_size),
     )
 
     # build colored lines
     if enable_highlights:
-        spans = _parse_highlight_spans(text, default_rgba=(255, 255, 255, 255))
+        spans = _parse_highlight_spans(text, default_rgba=default_rgba)
         lines = _wrap_spans(draw, spans, font, max_text_w)  # list of span-lines
     else:
         # fallback: single-color spans
-        spans = [(text, (255, 255, 255, 255))]
+        spans = [(text, default_rgba)]
         lines = _wrap_spans(draw, spans, font, max_text_w)
 
     # recompute block height based on actual wrapped lines
@@ -893,7 +902,14 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
     elif fl2:
         _place_flourishes(canvas, fl2, fl2, rng=rng)
 
-    _add_bottom_fade_overlay(canvas)
+    branding = req.branding if req.branding is not None else (preset_branding(req.style_preset) if req.style_preset else None)
+    if branding is None:
+        _add_bottom_fade_overlay(canvas)
+    elif branding.enabled:
+        if any(label.mode != "static" for label in branding.edge_text):
+            raise HTTPException(status_code=422, detail="Image edge_text supports static mode only")
+        fetched = [(spec, await _fetch_image(spec.url)) for spec in branding.logos]
+        await asyncio.to_thread(composite_static, canvas, branding, fetched)
 
     # Use SAME effective values for dial + text
     _draw_dial(canvas, label="PGP", width=eff_wdth, weight=eff_wght)
@@ -906,6 +922,8 @@ async def render_template(req: RenderTemplateRequest) -> Tuple[bytes, str]:
         weight=eff_wght,
         width=eff_wdth,
         enable_highlights=req.enable_highlights,
+        default_rgba=tuple(bytes.fromhex(req.text_color[1:])) + (255,),
+        font_size_px=req.text_font_size_px,
     )
 
     out = io.BytesIO()
