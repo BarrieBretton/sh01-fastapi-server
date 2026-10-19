@@ -1,850 +1,195 @@
-# sh01-fastapi-server
+# SH01 FastAPI server
 
-FastAPI application plus a registry-driven infrastructure control plane for running the SH01 stack across multiple infrastructure providers.
+SH01 is a FastAPI service for media production, Telegram-backed media storage, Google Sheets utilities, and publishing integrations. The same repository also contains an infrastructure control plane that coordinates paired n8n and SH01 Render services, Postgres slots, Backblaze B2 slots, and Cloudflare routers.
 
-The control plane is designed so that new **paired Render slots**, **Supabase/Postgres slots**, and **Backblaze B2 slots** can be added mostly by configuration: create the provider resource, add environment variables, add a registry entry, update Cloudflare `BACKENDS` for new Render origins, redeploy, and run the smoke test.
+This README describes the code on `main` and the Cloudflare dashboard setup used with it. It does not contain credentials. Treat the live router and control-plane status APIs as the source of truth for the **currently active** Render, Postgres, and B2 slots.
 
-`A` and `B` are only the slots that exist today; the control plane is intended to scale to `C`, `D`, and beyond without A/B-specific code.
+## Entry points and topology
 
----
+| Address | Purpose | Credential for protected endpoints |
+| --- | --- | --- |
+| `https://sh01.vivojaymail.workers.dev` | Stable public SH01 API proxy | Endpoint-specific SH01 key; media editing generally uses `MEDIA_CLIP_API_KEY` as `X-API-KEY` |
+| `https://n8n-prod-1.vivojaymail.workers.dev` | Stable n8n proxy | n8n's own authentication |
+| `https://infra-control.vivojaymail.workers.dev` | Stable control-plane proxy and shared media queue API | `/infra/*`: `CONTROL_PLANE_API_KEY` as `X-API-KEY`; `/internal/media-jobs/*`: `MEDIA_JOB_STORE_API_KEY` as `X-MEDIA-JOB-KEY` |
+| `http://127.0.0.1:5000` | Local Docker/Uvicorn API | Same application keys as appropriate |
 
-## Current architecture
+The Cloudflare SH01 and n8n Workers each have a list of Render origins and a preferred origin persisted in their **separate** `ROUTER_STATE` KV namespaces. Paired Render slots are `render-a` (one n8n service plus one SH01 service) and `render-b` (another n8n service plus another SH01 service). Postgres and B2 selections are independent of the Render pair. The registry in `infra_registry.example.json` shows the environment-variable references needed to register additional slots.
 
-Render is modeled as **paired infrastructure slots**:
-
-```text
-render-a
-├── n8n-a   -> https://n8n-fbal.onrender.com
-└── sh01-a  -> https://sh01-fastapi-server.onrender.com
-
-render-b
-├── n8n-b   -> https://n8n-hbek.onrender.com
-└── sh01-b  -> https://sh01.onrender.com
+```mermaid
+flowchart TD
+    Client["n8n, clients, Pulsetic"] --> SH["SH01 Cloudflare Worker"]
+    Client --> N8["n8n Cloudflare Worker"]
+    Operator["Operator or SLA watchdog"] --> CP["infra-control Worker"]
+    SH --> RA["SH01 Render A or B"]
+    N8 --> NA["n8n Render A or B"]
+    CP --> Master["Control-plane Render service"]
+    RA --> Queue["Shared D1 media queue via infra-control"]
+    RA --> B2["Backblaze B2"]
+    Master --> DB["Registered Supabase Postgres slot"]
+    Master --> SH
+    Master --> N8
 ```
 
-A future slot follows the same shape:
+`infra-control` Worker deployment and its D1 binding currently live in the **Cloudflare dashboard**; its source is not checked into this repository. The repository does include `cloudflare/sh01-worker.js`, `cloudflare/n8n-prod-1-worker.js`, and `cloudflare/infra-sla-watchdog-worker.js`. The adjacent `wrangler.*.example.jsonc` files are reference configurations; dashboard users can enter their variables, secrets, KV bindings, and schedules in the Cloudflare UI without running Wrangler.
 
-```text
-render-c
-├── n8n-c
-└── sh01-c
+### Router behavior
+
+The SH01 and n8n router control endpoints are `GET /__control/status`, `POST /__control/preferred`, and `POST /__control/maintenance`; send `X-ROUTER-KEY` matching that Worker's `ROUTER_CONTROL_KEY`. Preferred backends must appear in that Worker's `BACKENDS` list. `ALLOW_FALLBACK=false` means a preferred origin failure **does not** automatically try the other origin at the router; set it according to your intended routing policy. The control plane also has SLA tick and explicit failover routes. A healthy proxy response proves which origin served **that request** via `x-backend-used`; it does not prove both standbys are available.
+
+Pulsetic is an external pinger in this deployment. Configure and check its individual monitors in Pulsetic; the repository does not manage them. Pinging one proxy URL repeatedly generally tests the preferred origin, not each configured Render origin independently. If the operational goal is to keep each free Render service awake, verify that every monitor reaches its intended origin.
+
+## Run the application
+
+The Docker image includes Python 3.11, FFmpeg/ffprobe, and `postgresql-client`; its default command starts one Uvicorn worker on port 5000. Locally, install FFmpeg/ffprobe separately if not using Docker. Features require their own credentials and external services; simply starting the API does not configure them.
+
+```bash
+git clone https://github.com/BarrieBretton/sh01-fastapi-server.git
+cd sh01-fastapi-server
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+uvicorn app:app --host 127.0.0.1 --port 5000 --workers 1
 ```
 
-A Render failover changes the **whole pair** together. Durable state stores one Render slot:
-
-```json
-{
-  "render": "render-a",
-  "postgres": "supabase-b",
-  "b2": "b2-a"
-}
-```
-
-Render, Postgres, and B2 slots are independent. The letters do not need to match across providers.
-
----
-
-## Traffic flow
-
-Two Cloudflare Workers front the Render services:
-
-```text
-Public n8n traffic
-    |
-    v
-n8n-prod-1.vivojaymail.workers.dev
-    |
-    +--> preferred n8n Render backend
-    +--> fallback n8n Render backends
-
-Public SH01 traffic
-    |
-    v
-sh01.vivojaymail.workers.dev
-    |
-    +--> preferred SH01 Render backend
-    +--> fallback SH01 Render backends
-```
-
-Each Worker preserves the existing proxy/failover behavior and exposes a protected control API:
-
-```text
-GET  /__control/status
-POST /__control/preferred
-POST /__control/maintenance
-```
-
-Each Worker has:
-
-```text
-ROUTER_CONTROL_KEY   # Worker secret
-ROUTER_STATE         # KV binding
-```
-
-Use separate KV namespaces for the n8n and SH01 Workers.
-
-The master control plane uses:
-
-```text
-N8N_ROUTER_CONTROL_KEY
-SH01_ROUTER_CONTROL_KEY
-```
-
-Each value must exactly match the corresponding Worker's `ROUTER_CONTROL_KEY`.
-
----
-
-## Current Cloudflare configuration
-
-### n8n Worker
-
-```text
-Worker: https://n8n-prod-1.vivojaymail.workers.dev
-
-BACKENDS=https://n8n-fbal.onrender.com,https://n8n-hbek.onrender.com
-ROUTER_CONTROL_KEY=<secret>
-ROUTER_STATE=<dedicated n8n KV namespace binding>
-```
-
-### SH01 Worker
-
-```text
-Worker: https://sh01.vivojaymail.workers.dev
-
-BACKENDS=https://sh01-fastapi-server.onrender.com,https://sh01.onrender.com
-TIMEOUT_MS=90000
-ROUTER_CONTROL_KEY=<different secret>
-ROUTER_STATE=<dedicated SH01 KV namespace binding>
-```
-
-Do not reuse the same KV namespace for both Workers.
-
-`POST /__control/preferred` only accepts origins already present in that Worker's `BACKENDS` list.
-
----
-
-## Master control-plane environment variables
-
-### Control-plane authentication
-
-```text
-CONTROL_PLANE_API_KEY=<strong secret>
-```
-
-Requests to `/infra/*` use:
-
-```text
-X-API-KEY: <CONTROL_PLANE_API_KEY>
-```
-
-### Bootstrap state
-
-The current Workers were verified to be routing to the A Render pair, so the current bootstrap values are:
-
-```text
-ACTIVE_RENDER_SLOT=render-a
-ACTIVE_POSTGRES_SLOT=supabase-b
-ACTIVE_B2_SLOT=b2-a
-```
-
-These are bootstrap/fallback values. Successful failovers persist authoritative durable state, so `ACTIVE_RENDER_SLOT` should not be manually changed after every failover.
-
-### Render API access
-
-Use one Render account/workspace API key:
-
-```text
-RENDER_API_KEY=<Render API key>
-```
-
-Current paired service variables:
-
-```text
-RENDER_A_N8N_SERVICE_ID=<srv-...>
-RENDER_A_N8N_BASE_URL=https://n8n-fbal.onrender.com
-RENDER_A_SH01_SERVICE_ID=<srv-...>
-RENDER_A_SH01_BASE_URL=https://sh01-fastapi-server.onrender.com
-
-RENDER_B_N8N_SERVICE_ID=<srv-...>
-RENDER_B_N8N_BASE_URL=https://n8n-hbek.onrender.com
-RENDER_B_SH01_SERVICE_ID=<srv-...>
-RENDER_B_SH01_BASE_URL=https://sh01.onrender.com
-```
-
-A Render API key is account/workspace-level; it is not an n8n-specific or SH01-specific key. The `srv-...` service ID identifies the specific Render service to control.
-
-### Router control
-
-```text
-N8N_ROUTER_CONTROL_BASE_URL=https://n8n-prod-1.vivojaymail.workers.dev
-N8N_ROUTER_CONTROL_KEY=<same value as n8n Worker ROUTER_CONTROL_KEY>
-
-SH01_ROUTER_CONTROL_BASE_URL=https://sh01.vivojaymail.workers.dev
-SH01_ROUTER_CONTROL_KEY=<same value as SH01 Worker ROUTER_CONTROL_KEY>
-```
-
-### Supabase/Postgres migration connections
-
-The control plane uses port `5432` for migration tooling:
-
-```text
-SUPABASE_A_HOST=...
-SUPABASE_A_PORT=5432
-SUPABASE_A_USER=...
-SUPABASE_A_DB=postgres
-SUPABASE_A_PASSWORD=...
-
-SUPABASE_B_HOST=...
-SUPABASE_B_PORT=5432
-SUPABASE_B_USER=...
-SUPABASE_B_DB=postgres
-SUPABASE_B_PASSWORD=...
-```
-
-n8n runtime uses the Supabase Transaction Pooler port `6543`, configured through each registry entry's:
-
-```json
-"runtime_port": 6543
-```
-
-So:
-
-```text
-control-plane migration tooling -> 5432
-n8n runtime                    -> 6543
-```
-
-### Backblaze B2
-
-Current B2 A slot:
-
-```text
-BACKBLAZE_KEY_ID=...
-BACKBLAZE_APPLICATION_KEY=...
-BACKBLAZE_BUCKET_NAME=...
-```
-
-Optional future B2 B slot:
-
-```text
-B2_B_KEY_ID=...
-B2_B_APPLICATION_KEY=...
-B2_B_BUCKET_NAME=...
-```
-
-Do not register a B2 slot in `INFRA_REGISTRY_JSON` until all required credentials for it actually exist.
-
----
-
-## `INFRA_REGISTRY_JSON`
-
-The registry stores **environment-variable names**, not secret values.
-
-Current shape:
-
-```json
-{
-  "render": {
-    "render-a": {
-      "api_key_env": "RENDER_API_KEY",
-      "n8n": {
-        "service_id_env": "RENDER_A_N8N_SERVICE_ID",
-        "base_url_env": "RENDER_A_N8N_BASE_URL",
-        "health_path": "/healthz/readiness"
-      },
-      "sh01": {
-        "service_id_env": "RENDER_A_SH01_SERVICE_ID",
-        "base_url_env": "RENDER_A_SH01_BASE_URL",
-        "health_path": "/"
-      }
+For Docker, build with `docker build -t sh01 .` and supply environment variables when starting the container. See `Dockerfile`; `render.yaml` is a historical Render export, **not** a complete specification of current Cloudflare bindings or the D1 queue. FastAPI's local OpenAPI schema is at `http://127.0.0.1:5000/openapi.json` and interactive docs at `/docs`.
+
+### Key configuration by role
+
+| Role | Important settings | What they do |
+| --- | --- | --- |
+| SH01 media worker | `MEDIA_CLIP_API_KEY`, `BACKBLAZE_KEY_ID`, `BACKBLAZE_APPLICATION_KEY`, `BACKBLAZE_BUCKET_NAME`, `MEDIA_JOB_STORE_MODE=remote`, `MEDIA_JOB_STORE_API_KEY`, `CONTROL_PLANE_BASE_URL=https://infra-control.vivojaymail.workers.dev`, `MEDIA_QUEUE_CONSUMER_ENABLED=true` | Authenticate media requests, store rendered videos, enqueue/claim jobs through the shared queue. |
+| Limited Render media worker | `MEDIA_ALLOW_UNLIMITED_RESOURCES=false` | Reject `unlimited_resources=true` requests; apply the resource-limited path. |
+| High-resource local/Kaggle worker | `MEDIA_ALLOW_UNLIMITED_RESOURCES=true`, `MEDIA_QUEUE_CONSUMER_ENABLED=true`, `MEDIA_LOCAL_SOURCE_DIR=<readable input directory>` | Permit explicitly requested high-resource jobs and local `source_path` inputs. The job must execute on a host that can read that path. |
+| Control-plane application | `CONTROL_PLANE_API_KEY`, `INFRA_REGISTRY_JSON`, `ACTIVE_RENDER_SLOT`, `ACTIVE_POSTGRES_SLOT`, `ACTIVE_B2_SLOT`, provider credentials, router base URLs and router keys; `MEDIA_QUEUE_CONSUMER_ENABLED=false` | Manage paired slots and infrastructure state; do not consume media jobs. |
+| Cloudflare SH01/n8n routers | `BACKENDS`, `ALLOW_FALLBACK`, `ROUTER_CONTROL_KEY` secret, dedicated `ROUTER_STATE` KV binding | Route requests and persist preferred origin and maintenance state. |
+| Cloudflare infra-control Worker | Dedicated D1 binding and matching media queue key, configured in Cloudflare UI | Serve the canonical media queue at `/internal/media-jobs/queue/*`; configure according to the version actually deployed in the dashboard. |
+| SLA watchdog Worker | `CONTROL_PLANE_BASE_URL`, `CONTROL_PLANE_API_KEY`, optional `WATCHDOG_MANUAL_KEY`, scheduled trigger | Call `POST /infra/sla/tick` on a schedule; `/health` is a separate health check. |
+
+`CONTROL_PLANE_API_KEY`, `MEDIA_CLIP_API_KEY`, `MEDIA_JOB_STORE_API_KEY`, and `ROUTER_CONTROL_KEY` have **different purposes**. Do not substitute one for another merely because several endpoints use an API-key header. Set secrets separately on each service that needs them. Set `PUBLIC_API_BASE=https://sh01.vivojaymail.workers.dev` on SH01 instances if generated status/media URLs should use the public proxy.
+
+Useful optional media settings include `MEDIA_CLIP_WHISPER_MODEL`, `MEDIA_CLIP_WHISPER_VAD`, `MEDIA_CLIP_RENDER_WIDTH`, `MEDIA_CLIP_RENDER_HEIGHT`, `MEDIA_CGROUP_RESERVE_MB`, `MEDIA_FFMPEG_MAX_RSS_MB`, `MEDIA_WHISPER_MAX_RSS_MB`, `MEDIA_MAX_INPUT_PIXELS`, `MEDIA_QUEUE_POLL_SECONDS`, and `AUTO_EDIT_MAX_SEGMENTS`. Defaults and bounds live in `caption_router.py`, `media_resources.py`, `media_dispatcher.py`, and `auto_editor.py`. On free or small instances, an accepted request can still fail at a memory admission check; the controls are safeguards, not a guarantee that every input fits.
+
+The media queue requires `MEDIA_JOB_STORE_MODE=remote` on consumers and access to the deployed Cloudflare queue API. It is **not selected by `MEDIA_QUEUE_POSTGRES_SLOT`**, nor does it automatically switch to the currently active Supabase slot. Infrastructure state and other workloads still use the configured Postgres ring. `MEDIA_JOB_STORE_SETUP.md` describes an earlier media-store topology; use the D1 queue settings above for this deployment.
+
+## Main API surfaces
+
+| Routes | What they do | Notes |
+| --- | --- | --- |
+| `POST /media/auto-edit`, `GET /media/auto-edit-jobs/{job_id}` | Automatic cuts, transcription, captions, effects, branding, and render status | Async queue; send media `X-API-KEY`. |
+| `GET /media/auto-edit-capabilities`, `GET /media/auto-edit-presets` | Discover enabled settings and preset starting values | Send media `X-API-KEY`; advertised render size comes from the serving instance. |
+| `POST /media/clip-caption`, `GET /media/clip-caption-jobs/{job_id}`, `GET /media/clip-caption-presets` | Caption a video clip | Separate media job type; shared queue. |
+| `POST /media/audio-image-video`, `GET /media/render-jobs/{job_id}` | Render Telegram audio with a supplied image | Shared queue; uses `queue_id` for idempotency. |
+| `GET /media/rendered/{token}` | Redirect to a temporary B2 download URL | Public output URL; deletion requires authentication. |
+| `POST /img/render` | Render a still image template with text, gradients, logos, and static edge text | Input background is a URL. Moving text is video-only. |
+| `/telegram/*`, `/b2/*`, `/yt/videos`, `/sheets/process_streamables`, `/kite/*` | Telegram media index, B2, YouTube metadata, Sheets/Streamables, and Kite integrations | Read the route and its auth requirements before use. Streamables is gated for local use by `ALLOW_LOCAL_PROCESS_STREAMABLES=true`. |
+| `/threads/*`, `/tumblr/*`, `/x/*` | Social publishing backends | See `docs/SOCIAL_DISTRIBUTION.md` for account mappings and operational status. |
+| `/infra/*` | Control-plane health, registry, status, migration, router checks, SLA, and failover | Send `X-API-KEY: <CONTROL_PLANE_API_KEY>`. |
+
+This route list is an overview; the generated OpenAPI schema and request models provide the exact fields. In particular, `/yt/videos` lists YouTube metadata; it is **not** a general endpoint for downloading a timed YouTube video excerpt.
+
+### Automatic editing example
+
+Send exactly one of `source_url`, `telegram_file_id`, or `source_path`. `source_path` must be inside `MEDIA_LOCAL_SOURCE_DIR` **on the worker that claims the job**; a path on a caller's laptop is not a path on Render. For a remote n8n workflow, use a reachable URL or Telegram file ID. `start_seconds` and `end_seconds` select a window on the supplied source. `target_seconds` is an edit target, not an exact final duration.
+
+```bash
+BASE='https://sh01.vivojaymail.workers.dev'
+: "${MEDIA_CLIP_API_KEY:?Set the media key locally}"
+
+curl -fsS "$BASE/media/auto-edit-presets" \
+  -H "X-API-KEY: $MEDIA_CLIP_API_KEY"
+
+curl -fsS "$BASE/media/auto-edit" \
+  -H "X-API-KEY: $MEDIA_CLIP_API_KEY" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{
+    "source_url": "https://example.com/source.mp4",
+    "request_id": "my-video-001",
+    "start_seconds": 30,
+    "end_seconds": 90,
+    "target_seconds": 50,
+    "output_count": 1,
+    "preset": "viral_punch",
+    "captions_enabled": true,
+    "remove_silence": true,
+    "fit_mode": "crop",
+    "dynamic_zoom": "punchy",
+    "zoom_shots": [1, 3],
+    "zoom_ramp_seconds": 4,
+    "zoom_overrides": [{"shot": 3, "direction": "out", "amount": 0.08}],
+    "caption_overrides": {
+      "animation": "bounce",
+      "animation_scope": "phrase",
+      "grouping": "phrase",
+      "highlight_mode": "word",
+      "primary": "&H00FFFFFF",
+      "highlight": "&H00FFFF00"
     },
-    "render-b": {
-      "api_key_env": "RENDER_API_KEY",
-      "n8n": {
-        "service_id_env": "RENDER_B_N8N_SERVICE_ID",
-        "base_url_env": "RENDER_B_N8N_BASE_URL",
-        "health_path": "/healthz/readiness"
-      },
-      "sh01": {
-        "service_id_env": "RENDER_B_SH01_SERVICE_ID",
-        "base_url_env": "RENDER_B_SH01_BASE_URL",
-        "health_path": "/"
-      }
-    }
-  },
-  "postgres": {
-    "supabase-a": {
-      "host_env": "SUPABASE_A_HOST",
-      "port_env": "SUPABASE_A_PORT",
-      "user_env": "SUPABASE_A_USER",
-      "database_env": "SUPABASE_A_DB",
-      "password_env": "SUPABASE_A_PASSWORD",
-      "runtime_port": 6543
-    },
-    "supabase-b": {
-      "host_env": "SUPABASE_B_HOST",
-      "port_env": "SUPABASE_B_PORT",
-      "user_env": "SUPABASE_B_USER",
-      "database_env": "SUPABASE_B_DB",
-      "password_env": "SUPABASE_B_PASSWORD",
-      "runtime_port": 6543
-    }
-  },
-  "b2": {
-    "b2-a": {
-      "key_id_env": "BACKBLAZE_KEY_ID",
-      "application_key_env": "BACKBLAZE_APPLICATION_KEY",
-      "bucket_name_env": "BACKBLAZE_BUCKET_NAME"
-    }
-  }
-}
+    "unlimited_resources": false
+  }'
 ```
 
-In the Render dashboard, store JSON directly. Do **not** wrap the value in literal single quotes.
+The POST normally returns a `job_id` and a `status_url`; poll `GET /media/auto-edit-jobs/{job_id}` with the same header until `complete` or `failed`. A completed job returns `outputs` containing `video_url`, duration, and an `edit_decision_list` with source/output intervals and per-shot zoom details. Captions use ASS color notation (`&HAABBGGRR`), so `&H00FFFF00` represents cyan. Setting `captions_enabled=false` suppresses generated captions while allowing transcript-driven cuts. Select `zoom_shots=[]` to suppress all selected-shot zooms or `dynamic_zoom="off"` to disable the effect globally. Shot numbers refer to **final selected shot order**, not source timestamps.
 
----
+`crop_x_px`, `crop_y_px`, and `crop_scale` optionally position a fixed crop over the scaled source. They use final-render pixel coordinates after source scaling, rather than CSS positions; omit `crop_x_px`/`crop_y_px` for automatic framing. `MEDIA_CLIP_RENDER_WIDTH` and `MEDIA_CLIP_RENDER_HEIGHT` configure output dimensions for an instance; do not assume every instance renders 1080 × 1920. `reframe="auto"` samples visual activity and does not track faces.
 
-# Adding new infrastructure
+Video preset names are `viral_punch`, `clean_minimal`, `karaoke_glow`, `podcast_bold`, and `cinematic`. A preset supplies default cut, effect, caption, and subtle branding values; explicitly supplied request fields override edit defaults. `branding` accepts up to one two-stop gradient per edge, one logo per corner, and four edge-text entries. Gradient colors use `#RRGGBB` with independent 0–1 opacities; logos use public image URLs, size, margin, and opacity. Edge text can be `static`, single-edge `marquee`, connected-edge `path`, or four-edge `loop`. Set `"branding":{"enabled":false}` to suppress preset branding. See the models and docstrings in `media_branding.py` for the validation rules and exact payload schema.
 
-The control plane is intended to make expansion configuration-driven.
+### Verify routers and the queue (PowerShell)
 
-## Add a new paired Render slot
-
-Example: `render-c = [n8n-c, sh01-c]`.
-
-### 1. Create both Render services
-
-Create the n8n and SH01 services, then record their `srv-...` IDs and public base URLs.
-
-### 2. Add four master environment variables
-
-```text
-RENDER_C_N8N_SERVICE_ID=<srv-...>
-RENDER_C_N8N_BASE_URL=https://<n8n-c>.onrender.com
-RENDER_C_SH01_SERVICE_ID=<srv-...>
-RENDER_C_SH01_BASE_URL=https://<sh01-c>.onrender.com
-```
-
-No new Render API key is needed if the existing `RENDER_API_KEY` can manage the new services.
-
-### 3. Add one registry entry
-
-```json
-"render-c": {
-  "api_key_env": "RENDER_API_KEY",
-  "n8n": {
-    "service_id_env": "RENDER_C_N8N_SERVICE_ID",
-    "base_url_env": "RENDER_C_N8N_BASE_URL",
-    "health_path": "/healthz/readiness"
-  },
-  "sh01": {
-    "service_id_env": "RENDER_C_SH01_SERVICE_ID",
-    "base_url_env": "RENDER_C_SH01_BASE_URL",
-    "health_path": "/"
-  }
-}
-```
-
-### 4. Add both origins to Cloudflare
-
-Append the new n8n origin to the n8n Worker `BACKENDS` list and the new SH01 origin to the SH01 Worker `BACKENDS` list.
-
-This is required because the preferred-backend endpoint refuses arbitrary origins.
-
-### 5. Redeploy and validate
-
-Redeploy/restart the master, run health/status checks, then run the non-destructive smoke test before any live cutover.
-
----
-
-## Add a new Supabase/Postgres slot
-
-Example: `supabase-c`.
-
-### 1. Add env vars
-
-```text
-SUPABASE_C_HOST=...
-SUPABASE_C_PORT=5432
-SUPABASE_C_USER=...
-SUPABASE_C_DB=postgres
-SUPABASE_C_PASSWORD=...
-```
-
-### 2. Add the registry entry
-
-```json
-"supabase-c": {
-  "host_env": "SUPABASE_C_HOST",
-  "port_env": "SUPABASE_C_PORT",
-  "user_env": "SUPABASE_C_USER",
-  "database_env": "SUPABASE_C_DB",
-  "password_env": "SUPABASE_C_PASSWORD",
-  "runtime_port": 6543
-}
-```
-
-### 3. Validate before failover
-
-The migration connection must work on `5432`. n8n will use `6543` after cutover.
-
-The current migration policy copies/verifies the `public` schema. If future workloads depend on additional schemas, define and test that migration policy first.
-
----
-
-## Add a new Backblaze B2 slot
-
-Example: `b2-c`.
-
-### 1. Add credentials
-
-```text
-B2_C_KEY_ID=...
-B2_C_APPLICATION_KEY=...
-B2_C_BUCKET_NAME=...
-```
-
-### 2. Add the registry entry
-
-```json
-"b2-c": {
-  "key_id_env": "B2_C_KEY_ID",
-  "application_key_env": "B2_C_APPLICATION_KEY",
-  "bucket_name_env": "B2_C_BUCKET_NAME"
-}
-```
-
-### 3. Validate permissions
-
-```text
-source      -> list/read
-destination -> list/read/write
-```
-
-If `prune_extra=true` is used, destination also needs delete permission.
-
-`prune_extra` is destructive; do not enable it unless destination-only objects are intentionally disposable.
-
----
-
-## Quick-reference expansion checklist
-
-| Provider | Create | Add env vars | Add registry entry | Other required update |
-|---|---|---|---|---|
-| Render | paired n8n + SH01 services | service ID + base URL for each service | one `render-x` entry containing both services | append both origins to Worker `BACKENDS` |
-| Supabase | new project/database | host/port/user/db/password | one `supabase-x` entry | migration port 5432, runtime port 6543 |
-| B2 | new account/bucket | key ID/application key/bucket | one `b2-x` entry | validate permissions |
-
-After any addition:
-
-```text
-1. update provider resources
-2. add env vars
-3. update INFRA_REGISTRY_JSON
-4. update Worker BACKENDS if a Render slot was added
-5. redeploy/restart master
-6. GET /infra/health
-7. GET /infra/status
-8. check both router status endpoints
-9. run non-destructive smoke test
-10. inspect output
-11. only then perform a live failover
-```
-
----
-
-# Paired failover sequence
-
-A full paired failover runs approximately as follows:
-
-```text
-PRE-FLIGHT
-    |
-    +--> verify source + target Postgres health
-    +--> snapshot every registered n8n service
-    +--> snapshot every registered SH01 service
-    +--> snapshot target runtime env
-    +--> verify both router states
-    +--> refuse to begin if either router is already in maintenance
-
-FREEZE INGRESS
-    |
-    +--> n8n Worker maintenance ON
-    +--> SH01 Worker maintenance ON
-
-QUIESCE
-    |
-    +--> suspend every running n8n Render service
-    +--> verify zero registered n8n services remain running
-    +--> suspend every running SH01 Render service
-    +--> verify zero registered SH01 services remain running
-
-DATA
-    |
-    +--> migrate + compare Postgres if changing slots
-    +--> compare or mirror B2 if configured
-
-TARGET CONFIGURATION
-    |
-    +--> configure target n8n DB runtime
-    +--> configure target n8n B2 runtime
-    +--> configure target SH01 B2 runtime
-
-START TARGET PAIR
-    |
-    +--> resume/deploy/health-check target n8n
-    +--> resume/deploy/health-check target SH01
-
-ROUTER CUTOVER
-    |
-    +--> n8n Worker preferred -> target n8n origin
-    +--> SH01 Worker preferred -> target SH01 origin
-
-COMMIT
-    |
-    +--> persist one active Render slot
-    +--> persist target Postgres
-    +--> persist target B2
-
-OPEN INGRESS LAST
-    |
-    +--> n8n maintenance OFF
-    +--> SH01 maintenance OFF
-```
-
-Important invariants:
-
-```text
-render-a = [n8n-a, sh01-a]
-render-b = [n8n-b, sh01-b]
-render-c = [n8n-c, sh01-c]
-```
-
-Changing paired Render slots requires router switching.
-
-Changing Postgres slots requires quiescing the source.
-
----
-
-## Rollback behavior
-
-If execution fails, rollback attempts to:
-
-1. place both Workers into maintenance,
-2. suspend currently running n8n and SH01 services,
-3. restore target n8n runtime env,
-4. restore target SH01 runtime env,
-5. redeploy restored target services if they were running before failover,
-6. restore the exact pre-failover n8n running/suspended topology,
-7. restore the exact pre-failover SH01 running/suspended topology,
-8. restore both Worker preferred backends to the previous paired Render slot,
-9. restore durable control-plane state if it had already changed,
-10. disable maintenance after rollback completes.
-
-Target environment values are snapshotted before mutation so rollback can restore them.
-
----
-
-# Durable state
-
-Current state shape:
-
-```json
-{
-  "render": "render-a",
-  "postgres": "supabase-b",
-  "b2": "b2-a"
-}
-```
-
-Legacy state such as:
-
-```json
-{
-  "render": {
-    "n8n": "render-b",
-    "sh01": "sh01-a"
-  }
-}
-```
-
-is normalized to one paired Render slot for compatibility.
-
-`ACTIVE_RENDER_SLOT`, `ACTIVE_POSTGRES_SLOT`, and `ACTIVE_B2_SLOT` are bootstrap defaults, not a manual failover ledger.
-
----
-
-# Control-plane API and validation
-
-Set:
+Set key variables from your secret manager; do not place their values in a committed script.
 
 ```powershell
-$BASE = "https://sh01-fastapi-server-mtwu.onrender.com"
-$KEY = "<CONTROL_PLANE_API_KEY>"
+$Control = 'https://infra-control.vivojaymail.workers.dev'
+$Sh01 = 'https://sh01.vivojaymail.workers.dev'
+
+Invoke-RestMethod "$Control/infra/health" `
+  -Headers @{ 'X-API-KEY' = $ControlPlaneApiKey } -UseBasicParsing
+
+Invoke-RestMethod "$Control/internal/media-jobs/queue/health" `
+  -Headers @{ 'X-MEDIA-JOB-KEY' = $MediaJobStoreApiKey } -UseBasicParsing
+
+Invoke-RestMethod "$Sh01/__control/status" `
+  -Headers @{ 'X-ROUTER-KEY' = $Sh01RouterKey } -UseBasicParsing
+
+Invoke-RestMethod "$Sh01/media/auto-edit-capabilities" `
+  -Headers @{ 'X-API-KEY' = $MediaClipApiKey } -UseBasicParsing
 ```
 
-## Health
+The router response shows `preferred`, `effective_order`, `allow_fallback`, `maintenance`, and `persistence_available`. To see the backend that actually handled a proxied call, use `Invoke-WebRequest -UseBasicParsing` and read `$response.Headers['x-backend-used']`. In Windows PowerShell, `-UseBasicParsing` also avoids the legacy HTML parsing warning. If a request succeeds through a proxy, it does not by itself validate the other Render origins or the security keys for another route.
 
-```powershell
-Invoke-RestMethod `
-  -Method GET `
-  -Uri "$BASE/infra/health" `
-  -Headers @{ "X-API-KEY" = $KEY } |
-  ConvertTo-Json -Depth 20
-```
+## Media queue and resource boundaries
 
-## Full status
+`media_job_store.py` submits queue requests to the infra-control URL. The Cloudflare D1 queue holds job status and claims; `media_dispatcher.py` runs only where `MEDIA_QUEUE_CONSUMER_ENABLED=true`. It claims one heavy job at a time through `media_capacity.py` and uses heartbeat/lease ownership. A dedicated high-resource consumer is required for `unlimited_resources=true` jobs. `media_admission.py` coordinates other heavy request paths against the same queue; those paths may return a busy response instead of enqueueing.
 
-```powershell
-Invoke-RestMethod `
-  -Method GET `
-  -Uri "$BASE/infra/status" `
-  -Headers @{ "X-API-KEY" = $KEY } |
-  ConvertTo-Json -Depth 20
-```
+Small-host handling uses FFmpeg thread limits, bounded subprocess RSS checks, cgroup headroom admission, pixel limits, and isolated Whisper transcription. A process can be refused or stopped to protect a limited host; video decode, complex filters, and concurrent unrelated processes still require capacity. Keep `MEDIA_ALLOW_UNLIMITED_RESOURCES=false` on small Render instances. A shared queue coordinates **jobs** across SH01 instances; it does not make an unreachable `source_path` accessible on another host, and it does not promise that every source can be rendered within a 512 MiB container.
 
-## n8n router status
+When troubleshooting a job, save its `job_id`, last `status`, `stage`, `error`, and `outputs`. For render quality, compare the input and output stream start times with `ffprobe`, inspect the returned edit decision list to see which spans were removed, and view the output itself. Whisper VAD and speech timestamps drive speech-oriented silence cuts; background noise and subject motion mean a cut decision still needs review.
 
-```powershell
-Invoke-RestMethod `
-  -Method GET `
-  -Uri "$BASE/infra/router/n8n/status" `
-  -Headers @{ "X-API-KEY" = $KEY } |
-  ConvertTo-Json -Depth 20
-```
+## Control plane and operations
 
-Expected important fields include:
+The control-plane API is implemented in `infra/` and exposed under `/infra` with `CONTROL_PLANE_API_KEY`. `GET /infra/health` returns the selected state; `GET /infra/status` lists active and available slots; `GET /infra/router/status` checks the routers; `GET /infra/sla/status` reports SLA tracking. Mutating operations include `/infra/failover`, `/infra/select/*`, and `/infra/sla/tick`. Use the provided `scripts/infra_smoke.ps1` for controlled validation; read its parameters before any live failover. `scripts/infra_sla_test.ps1` covers the SLA path.
 
-```text
-persistence_available=true
-maintenance=false
-```
+The watchdog Worker calls `POST /infra/sla/tick` using the control-plane key. Its code includes a scheduled handler and `/health`, plus a separately protected manual `POST /tick`. A Cloudflare scheduled trigger must be configured for automatic ticks. `infra/sla.py` implements readiness checks and paired Render-slot promotion; its lock is local to the control-plane process. Running multiple independent control-plane instances does **not** create a distributed control-plane election or automatically synchronize concurrent mutations. Treat the control-plane proxy as a stable address and verify its own backend routing and the shared durable state when changing the deployment.
 
-## SH01 router status
+Database migration and service environment changes are operationally sensitive; follow `CONTROL_PLANE_SETUP.md`, `PAIRED_RENDER_MIGRATION.md`, and `TEST_CHECKLIST.md`. In the registry examples, Postgres migration tooling uses port 5432 and n8n runtime configuration can use the transaction pooler port 6543. The migration code currently targets the `public` schema. B2 destination pruning is destructive and opt-in.
 
-```powershell
-Invoke-RestMethod `
-  -Method GET `
-  -Uri "$BASE/infra/router/sh01/status" `
-  -Headers @{ "X-API-KEY" = $KEY } |
-  ConvertTo-Json -Depth 20
-```
+## Social distribution
 
-Expected important fields include:
+`threads_feature/`, `tumblr_feature/`, and `x_feature/` implement platform backends. Consult `docs/SOCIAL_DISTRIBUTION.md` for account mapping, API-key resolution, token storage, migrations in `sql/`, and the actual production status of each network. The checked-in documentation describes Threads and Tumblr paths as active, X as parked, and TikTok as workflow scaffold only. This repository does not expose a production TikTok publishing endpoint. Meta/Facebook publishing and Google Sheets/Telegram helpers remain in `app.py` and related modules.
 
-```text
-persistence_available=true
-maintenance=false
-```
+For n8n integrations, submit to the appropriate **stable SH01 Cloudflare URL** and set an HTTP Header Auth credential with the key expected by that endpoint. The control-plane key is for `/infra/*`, not the SH01 media editor. Job completion is asynchronous: submit, poll the returned job ID, then consume the output URL. Store request IDs in n8n for idempotent retries.
 
----
+## Repository map
 
-# Testing
+| Path | Responsibility |
+| --- | --- |
+| `app.py` | FastAPI assembly; Telegram, B2, Sheets, Kite, YouTube metadata, legacy social handlers |
+| `auto_editor.py`, `caption_router.py`, `media_router.py`, `media_branding.py` | Media jobs, captions, effects, templates, branded video layers |
+| `image_templating.py` | Still-image rendering at `/img/*` |
+| `media_dispatcher.py`, `media_job_store.py`, `media_capacity.py`, `media_admission.py`, `media_resources.py` | Durable queue client, one-job admission, limited-host resource controls |
+| `infra/`, `infra_registry.example.json` | Infrastructure state, registry, provider checks, migration, SLA and failover |
+| `cloudflare/` | Tracked SH01/n8n proxy code, watchdog, and configuration examples |
+| `threads_feature/`, `tumblr_feature/`, `x_feature/`, `sql/` | Social publishing and database migrations |
+| `scripts/`, `docs/` | Operational scripts and detailed integration documentation |
 
-## Syntax/import checks
-
-```powershell
-python -m compileall .\infra
-python -c "import infra.orchestrator; print('orchestrator import OK')"
-```
-
-Expected:
-
-```text
-orchestrator import OK
-```
-
-## Non-destructive smoke test
-
-```powershell
-.\scripts\infra_smoke.ps1 -Base $BASE -Key $KEY
-```
-
-Run this before the first live failover of any newly added infrastructure slot.
-
-Suspended standby Render services can fail direct HTTP health checks because they are intentionally suspended; service-state checks should still identify their Render suspension state.
-
-## Live failover
-
-Only after the smoke/dry-run output is correct:
-
-```powershell
-.\scripts\infra_smoke.ps1 `
-  -Base $BASE `
-  -Key $KEY `
-  -ExecuteFailover `
-  -SyncB2
-```
-
-Do not add:
-
-```text
--PruneB2Extra
-```
-
-unless deleting destination-only B2 objects is explicitly intended.
-
----
-
-# Security rules
-
-Never commit real values for:
-
-```text
-CONTROL_PLANE_API_KEY
-RENDER_API_KEY
-N8N_ROUTER_CONTROL_KEY
-SH01_ROUTER_CONTROL_KEY
-SUPABASE_*_PASSWORD
-BACKBLAZE_APPLICATION_KEY
-B2_*_APPLICATION_KEY
-```
-
-The registry should contain env-var names, not secret values.
-
-`ROUTER_CONTROL_KEY` must be a Cloudflare Worker **Secret**, not a plaintext Worker variable.
-
----
-
-# Important implementation details
-
-- One Render API key can be used across all Render services in the permitted account/workspace.
-- Render service IDs (`srv-...`) identify specific services.
-- Both n8n and SH01 belong to one paired Render slot.
-- n8n direct health uses `/healthz/readiness`.
-- SH01 direct health currently uses `/`.
-- Render deploy requests use `deployMode=build_and_deploy` so failover builds the latest commit.
-- `N8N_ENCRYPTION_KEY` is not rewritten by the control plane; keep it identical across n8n slots.
-- B2 comparison distinguishes source completeness from destination-only extras.
-- `prune_extra` is destructive.
-- Postgres migration currently targets the `public` schema.
-- Workers KV is eventually consistent; it is not the sole database write-safety barrier.
-- The hard migration barrier is that registered n8n writers are suspended and verified before the database copy.
-
----
-
-# Known limitations
-
-1. The failover lock is process-local. A multi-process deployment or overlapping restart would need a distributed/advisory lock.
-2. Standalone mutation jobs and a full failover do not yet share one global distributed mutation lock.
-3. Durable-state initialization can perform network/database work during startup.
-4. Some state/job reads could become stale if multiple control-plane processes were introduced.
-5. Render suspension-state handling assumes the API reports the expected `suspended` / `not_suspended` values.
-6. Workers KV is eventually consistent.
-7. `prune_extra` can delete destination-only B2 objects.
-8. SH01 `/` must continue returning a public 2xx for direct health checks.
-9. Postgres migration currently covers only the `public` schema.
-10. Target n8n can begin executing workloads once resumed/deployed, before public Worker cutover. Other registered n8n services remain suspended during migration/cutover.
-
----
-
-# Relevant repository files
-
-```text
-infra/
-├── models.py
-├── routes.py
-├── state.py
-├── registry.py
-├── persistence.py
-├── jobs.py
-├── runtime_config.py
-├── render_provider.py
-├── postgres.py
-├── b2ring.py
-├── router_client.py
-└── orchestrator.py
-
-cloudflare/
-├── n8n-prod-1-worker.js
-├── sh01-worker.js
-├── wrangler.n8n.example.jsonc
-└── wrangler.sh01.example.jsonc
-
-scripts/
-└── infra_smoke.ps1
-
-infra_registry.example.json
-```
-
-`infra/postgres.py` contains the already-proven Postgres migration logic.
-
----
-
-# Historical migration note
-
-The control plane originally modeled n8n and SH01 as independent Render rings. That is no longer the current architecture.
-
-```text
-OLD
-render.n8n  -> independent n8n slot
-render.sh01 -> independent SH01 slot
-
-CURRENT
-render-a -> [n8n-a, sh01-a]
-render-b -> [n8n-b, sh01-b]
-```
-
-The paired model in this README is authoritative.
-
-Older documentation that describes independent n8n/SH01 active Render slots should be treated as historical until updated.
-
----
-
-## Current bootstrap snapshot
-
-At the time the paired migration was configured:
-
-```text
-n8n Worker  -> https://n8n-fbal.onrender.com
-SH01 Worker -> https://sh01-fastapi-server.onrender.com
-
-ACTIVE_RENDER_SLOT=render-a
-ACTIVE_POSTGRES_SLOT=supabase-b
-ACTIVE_B2_SLOT=b2-a
-```
-
-Always verify live state after future failovers rather than assuming this snapshot remains current.
----
-
-# Social distribution subsystem
-
-SH01 now also provides an authenticated, idempotent, multi-account social-distribution backend.
-
-Current platform state:
-
-```text
-Threads   -> active
-Tumblr    -> active
-X.com     -> backend retained, n8n scaffold only
-TikTok    -> n8n scaffold only
-```
-
-The canonical n8n child workflow accepts a compact item such as:
-
-```json
-{
-  "image_url": "...",
-  "caption": "...",
-  "account": "..."
-}
-```
-
-and maps the canonical account to platform-specific handles before posting sequentially.
-
-Detailed architecture, environment variables, token lifecycle, account onboarding, migrations, idempotency semantics, troubleshooting, and current known limitations are documented in:
-
-```text
-docs/SOCIAL_DISTRIBUTION.md
-```
-
-Important current notes:
-
-- social features use the same active `DB_POSTGRESDB_*` runtime as n8n;
-- Threads tokens are encrypted in Postgres;
-- Threads stored expiry can currently be an assumed lifetime and must not be treated as authoritative live Meta validity;
-- Tumblr uses NPF multipart publishing and normalizes remote images to canonical JPEG before upload;
-- X is intentionally parked because current API access would require opting into the newer paid/pay-per-use enrollment;
-- TikTok is intentionally scaffold-only;
-- static social secrets must exist on every SH01 serving Render slot;
-- Render failover deploys currently use `deployMode=build_and_deploy`.
+Never commit credentials, exported browser cookies, real customer media, local `.env` files, or logs. Keep values in the relevant Render or Cloudflare secret settings and your local secret store.
