@@ -4,6 +4,8 @@ import subprocess
 from fastapi import APIRouter, Depends, HTTPException
 
 from .auth import require_control_plane_key
+from . import coordination
+from .pg_replica import inspect_replica
 from .b2ring import b2_compare, b2_health, b2_migrate
 from .jobs import jobs
 from .models import (
@@ -38,11 +40,15 @@ def _require_slot(kind: str, slot: str) -> None:
 
 @router.get("/health")
 async def infra_health():
+    if coordination.enabled():
+        state.refresh_authoritative()
     return {"ok": True, "service": "infra-control-plane", "state": state.snapshot()}
 
 
 @router.get("/status", response_model=InfraStatusResponse)
 async def infra_status():
+    if coordination.enabled():
+        state.refresh_authoritative()
     return InfraStatusResponse(
         active=ActiveInfrastructure(**state.all()),
         available={
@@ -73,8 +79,22 @@ def select_slot(infra_type: str, request: SlotSelectionRequest):
             "dry_run": True,
             "changed": False,
         }
-    result = state.set_active(infra_type, request.slot, persist=True)
-    return {**result, "dry_run": False, "changed": True}
+    if current == request.slot:
+        return {
+            "infra_type": infra_type,
+            "previous": current,
+            "target": current,
+            "dry_run": False,
+            "changed": False,
+        }
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot change the active {infra_type} slot with /infra/select: "
+            "this only changes controller metadata, not the serving services. "
+            "Use /infra/failover with an explicit target and verified data instead."
+        ),
+    )
 
 
 @router.post("/select/render")
@@ -91,8 +111,22 @@ async def select_render(request: RenderSlotSelectionRequest):
             "dry_run": True,
             "changed": False,
         }
-    result = state.set_active("render", request.slot, persist=True)
-    return {**result, "dry_run": False, "changed": True}
+    if current == request.slot:
+        return {
+            "infra_type": "render",
+            "previous": current,
+            "target": current,
+            "dry_run": False,
+            "changed": False,
+        }
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot change the active Render slot with /infra/select: "
+            "this only changes controller metadata, not the routers or services. "
+            "Use /infra/failover with an explicit paired Render target instead."
+        ),
+    )
 
 
 @router.post("/select/postgres")
@@ -156,31 +190,19 @@ async def compare_postgres(source: str, destination: str):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/postgres/replica-status")
+async def postgres_replica_status(source: str, destination: str):
+    _require_slot("postgres", source)
+    _require_slot("postgres", destination)
+    return inspect_replica(source, destination)
+
+
 @router.post("/postgres/migrate")
 async def migrate_postgres(request: PostgresMigrationRequest):
-    _require_slot("postgres", request.source)
-    _require_slot("postgres", request.destination)
-    if request.source == request.destination:
-        raise HTTPException(status_code=400, detail="Source and destination Postgres slots must differ")
-    if request.dry_run:
-        return {
-            "source": request.source,
-            "destination": request.destination,
-            "dry_run": True,
-            "would_migrate": True,
-        }
-    try:
-        source_health = postgres_health(request.source)
-        destination_health = postgres_health(request.destination)
-        if not source_health["healthy"]:
-            raise RuntimeError("Source database is not healthy: " + source_health.get("stderr", ""))
-        if not destination_health["healthy"]:
-            raise RuntimeError("Destination database is not healthy: " + destination_health.get("stderr", ""))
-        migration = postgres_migrate(request.source, request.destination)
-        verification = postgres_verify(request.destination)
-        return {"dry_run": False, "migration": migration, "verification": verification}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    raise HTTPException(status_code=409, detail=(
+        "Destructive dump/restore is disabled; use the standby bootstrap "
+        "runbook and /infra/failover after replication is healthy"
+    ))
 
 
 @router.get("/render/{slot}/{role}/health")
@@ -226,6 +248,10 @@ async def migrate_b2(request: B2MigrationRequest):
     _require_slot("b2", request.destination)
     if request.source == request.destination:
         raise HTTPException(status_code=400, detail="Source and destination B2 slots must differ")
+    if coordination.enabled():
+        current = state.refresh_authoritative()["b2"]
+        if request.destination == current or request.source != current:
+            raise HTTPException(status_code=409, detail="B2 migration must copy from the active bucket to an inactive destination")
     if request.dry_run:
         return {
             "source": request.source,

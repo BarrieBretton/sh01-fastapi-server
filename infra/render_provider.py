@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from .registry import registry
+from .coordination import require_lease
 
 logger = logging.getLogger("infra.render")
 RENDER_API_BASE = "https://api.render.com/v1"
@@ -115,6 +116,7 @@ def render_health(slot: str, role: str, timeout: float = 20.0) -> dict[str, Any]
 
 
 def render_update_env(slot: str, role: str, values: dict[str, str]) -> dict[str, Any]:
+    require_lease()
     cfg = _service(slot, role)
     changed: list[str] = []
     with httpx.Client(timeout=30.0) as client:
@@ -165,6 +167,7 @@ def render_get_env(slot: str, role: str, keys: list[str]) -> dict[str, str | Non
 
 
 def render_restore_env(slot: str, role: str, values: dict[str, str | None]) -> dict[str, Any]:
+    require_lease()
     cfg = _service(slot, role)
     restored: list[str] = []
     deleted: list[str] = []
@@ -197,6 +200,7 @@ def render_restore_env(slot: str, role: str, values: dict[str, str | None]) -> d
 
 
 def render_suspend(slot: str, role: str) -> dict[str, Any]:
+    require_lease()
     cfg = _service(slot, role)
     before = render_service_status(slot, role)
     if before.get("suspended") == "suspended":
@@ -231,6 +235,7 @@ def render_resume_blocker(status: dict[str, Any]) -> str | None:
 
 
 def render_resume(slot: str, role: str) -> dict[str, Any]:
+    require_lease()
     cfg = _service(slot, role)
     before = render_service_status(slot, role)
     if before.get("suspended") == "not_suspended":
@@ -261,6 +266,7 @@ def render_resume(slot: str, role: str) -> dict[str, Any]:
 
 
 def render_trigger_deploy(slot: str, role: str) -> dict[str, Any]:
+    require_lease()
     cfg = _service(slot, role)
 
     with httpx.Client(timeout=30.0) as client:

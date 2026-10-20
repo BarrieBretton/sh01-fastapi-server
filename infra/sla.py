@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .b2ring import b2_runtime_config
+from . import coordination
 from .orchestrator import run_failover
 from .persistence import store
 from .registry import registry
@@ -286,6 +287,19 @@ def _promote_live_candidate(previous_active: str, candidate: str) -> dict[str, A
             "changed": False,
         }
 
+    # A healthy candidate cannot become the sole n8n writer while any other
+    # n8n process is still running, even if its readiness probe failed.
+    for slot in registry.render_slots():
+        if slot == candidate:
+            continue
+        for role in ("n8n", "sh01"):
+            status = render_service_status(slot, role)
+            if status.get("suspended") != "suspended":
+                raise RuntimeError(
+                    f"Fast promotion refused: {slot}/{role} is not confirmed suspended; "
+                    "use the quiescing full failover path"
+                )
+
     previous_urls = {
         role: render_base_url(previous_active, role)
         for role in ("n8n", "sh01")
@@ -484,6 +498,8 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
         }
 
 def sla_status() -> dict[str, Any]:
+    if coordination.enabled():
+        state.refresh_authoritative()
     monitor, revision = _load_monitor_state()
     active = state.get_active("render")
     return {
@@ -495,6 +511,7 @@ def sla_status() -> dict[str, Any]:
     }
 
 
+@coordination.coordinated
 def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
     if not _SLA_LOCK.acquire(blocking=False):
         return {
@@ -632,7 +649,12 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
 
                 if candidate_pair["healthy"]:
                     runtime = _candidate_runtime_matches(candidate)
-                    if runtime.get("match"):
+                    sole_writer = all(
+                        render_service_status(slot, role).get("suspended") == "suspended"
+                        for slot in registry.render_slots() if slot != candidate
+                        for role in ("n8n", "sh01")
+                    )
+                    if runtime.get("match") and sole_writer:
                         result = _promote_live_candidate(active, candidate)
 
                         monitor_after, revision_after = _load_monitor_state()

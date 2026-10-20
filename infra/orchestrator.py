@@ -3,6 +3,11 @@ import threading
 from typing import Any
 
 from .b2ring import b2_compare, b2_health, b2_migrate, b2_runtime_config
+from . import coordination
+from .pg_replica import (
+    assert_matching_schema, inspect_replica, prepare_standby_for_writes,
+    replicate_barrier,
+)
 from .postgres import postgres_compare, postgres_health, postgres_migrate
 from .registry import registry
 from .render_provider import (
@@ -27,17 +32,6 @@ logger = logging.getLogger("infra.orchestrator")
 _FAILOVER_LOCK = threading.Lock()
 
 
-def _next_slot(kind: str, current: str | None) -> str | None:
-    slots = registry.render_slots() if kind == "render" else registry.slots(kind)
-    if not slots:
-        return None
-    if current not in slots:
-        return slots[0]
-    if len(slots) == 1:
-        return current
-    return slots[(slots.index(current) + 1) % len(slots)]
-
-
 def _service_snapshot(role: str) -> dict[str, dict[str, Any]]:
     return {slot: render_service_status(slot, role) for slot in registry.render_slots()}
 
@@ -51,12 +45,17 @@ def _running_slots(snapshot: dict[str, dict[str, Any]]) -> list[str]:
 
 
 def _suspend_all_running(role: str, snapshot: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    unknown = [slot for slot, status in snapshot.items()
+               if status.get("suspended") not in {"suspended", "not_suspended"}]
+    if unknown:
+        raise RuntimeError(f"Cannot prove {role} writer state: {', '.join(unknown)}")
     running_before = _running_slots(snapshot)
     results: dict[str, Any] = {}
     for slot in running_before:
         results[slot] = render_suspend(slot, role)
     after = _service_snapshot(role)
-    still_running = _running_slots(after)
+    still_running = [slot for slot, status in after.items()
+                     if status.get("suspended") != "suspended"]
     if still_running:
         raise RuntimeError(
             f"Failed to suspend all {role} Render services; still running: "
@@ -108,10 +107,12 @@ def build_failover_plan(
     switch_router: bool = True,
     quiesce_source: bool = True,
 ) -> dict[str, Any]:
-    current = state.all()
-    target_postgres = target_postgres or _next_slot("postgres", current.get("postgres"))
-    target_render = target_render or _next_slot("render", current.get("render"))
-    target_b2 = target_b2 or _next_slot("b2", current.get("b2"))
+    current = state.refresh_authoritative()
+    # The rings are independent. An omitted target retains its current slot;
+    # advancing it would move traffic to an unreplicated database or bucket.
+    target_postgres = target_postgres or current.get("postgres")
+    target_render = target_render or current.get("render")
+    target_b2 = target_b2 or current.get("b2")
     current_render = current.get("render")
     current_postgres = current.get("postgres")
 
@@ -159,7 +160,7 @@ def build_failover_plan(
             "suspend_all_running_sh01",
         ])
     steps.extend([
-        "postgres_migrate_and_compare",
+        "postgres_replica_barrier_and_promotion",
         "b2_sync_or_compare" if target_b2 else "b2_skipped",
         "configure_target_n8n",
         "configure_target_sh01",
@@ -193,6 +194,7 @@ def build_failover_plan(
     }
 
 
+@coordination.coordinated
 def run_failover(
     target_postgres: str | None = None,
     target_render: str | None = None,
@@ -202,6 +204,11 @@ def run_failover(
     switch_router: bool = True,
     quiesce_source: bool = True,
 ) -> dict[str, Any]:
+    if not any((target_postgres, target_render, target_b2)):
+        raise RuntimeError(
+            "A live failover requires an explicit target; an empty request "
+            "must not quiesce and redeploy the serving Render pair"
+        )
     if not _FAILOVER_LOCK.acquire(blocking=False):
         raise RuntimeError("Another infrastructure failover is already running")
 
@@ -244,6 +251,7 @@ def run_failover(
         "sh01": False,
     }
     mutations_started = False
+    postgres_promotion_started = False
 
     try:
         source_pg_health = postgres_health(source_postgres)
@@ -252,6 +260,22 @@ def run_failover(
             raise RuntimeError(f"Source Postgres unhealthy: {source_pg_health}")
         if not target_pg_health.get("healthy"):
             raise RuntimeError(f"Target Postgres unhealthy: {target_pg_health}")
+        if source_postgres != target["postgres"] and coordination.enabled():
+            if not (plan["switch_router"] and plan["quiesce_source"]):
+                raise RuntimeError("A replicated Postgres switch must quiesce all writers and close ingress")
+            replica = inspect_replica(source_postgres, target["postgres"])
+            unacceptable = set(replica["reasons"]) - {"replication_not_caught_up"}
+            if unacceptable:
+                raise RuntimeError("Replica preflight failed: " + ", ".join(sorted(unacceptable)))
+            assert_matching_schema(source_postgres, target["postgres"])
+
+        target_b2 = target.get("b2")
+        if target_b2:
+            target_b2_health = b2_health(target_b2)
+            if not target_b2_health.get("healthy"):
+                raise RuntimeError(f"Target B2 unhealthy: {target_b2_health}")
+            if source_b2 and source_b2 != target_b2 and not b2_health(source_b2).get("healthy"):
+                raise RuntimeError("Source B2 unavailable; cannot safely switch buckets")
 
         for role in ("n8n", "sh01"):
             snapshots[role] = _service_snapshot(role)
@@ -321,41 +345,32 @@ def run_failover(
                 snapshots["sh01"],
             )
 
-        if source_postgres != target["postgres"]:
-            migration = postgres_migrate(source_postgres, target["postgres"])
-            comparison = postgres_compare(source_postgres, target["postgres"])
-            if not comparison.get("match"):
-                raise RuntimeError(f"Postgres comparison failed after migration: {comparison}")
-        else:
-            migration = {"skipped": True, "reason": "source equals target"}
-            comparison = {"match": True, "skipped": True, "reason": "source equals target"}
-        result["phases"]["postgres"] = {"migration": migration, "comparison": comparison}
-
-        target_b2 = target.get("b2")
         if target_b2:
-            target_b2_health = b2_health(target_b2)
-            if not target_b2_health.get("healthy"):
-                raise RuntimeError(f"Target B2 unhealthy: {target_b2_health}")
             if source_b2 and source_b2 != target_b2:
-                source_b2_health = b2_health(source_b2)
-                if not source_b2_health.get("healthy"):
-                    raise RuntimeError(f"Source B2 unhealthy: {source_b2_health}")
                 if plan["sync_b2"]:
-                    b2_result = b2_migrate(
-                        source_b2,
-                        target_b2,
-                        prune_extra=plan["prune_b2_extra"],
-                    )
+                    b2_result = b2_migrate(source_b2, target_b2,
+                                           prune_extra=plan["prune_b2_extra"])
                 else:
                     comparison_b2 = b2_compare(source_b2, target_b2)
                     if not comparison_b2.get("match"):
-                        raise RuntimeError(
-                            "B2 slots do not match and sync_b2=false. Run with sync_b2=true to mirror the source first."
-                        )
+                        raise RuntimeError("B2 slots differ; sync them before switching")
                     b2_result = {"comparison": comparison_b2}
             else:
                 b2_result = {"skipped": True, "reason": "source equals target or no source"}
             result["phases"]["b2"] = b2_result
+
+        if source_postgres != target["postgres"]:
+            comparison = replicate_barrier(source_postgres, target["postgres"])
+            assert_matching_schema(source_postgres, target["postgres"])
+            # From this point the old writer must not be reopened. A
+            # failed disable or sequence reset requires operator repair.
+            postgres_promotion_started = True
+            prepare_standby_for_writes(target["postgres"])
+            migration = {"skipped": True, "reason": "continuously replicated standby"}
+        else:
+            migration = {"skipped": True, "reason": "source equals target"}
+            comparison = {"match": True, "skipped": True, "reason": "source equals target"}
+        result["phases"]["postgres"] = {"migration": migration, "comparison": comparison}
 
         pg_runtime = postgres_runtime_config(target["postgres"])
         b2_runtime = b2_runtime_config(target_b2) if target_b2 else None
@@ -428,6 +443,15 @@ def run_failover(
                     result["rollback"][
                         f"{role}_router_maintenance_on_error"
                     ] = str(exc)
+
+        if postgres_promotion_started:
+            # Never roll back to the former publisher after a standby could
+            # have accepted writes. Leave ingress closed and services frozen.
+            logger.critical(
+                "Postgres promotion reached one-way boundary; routers remain "
+                "in maintenance. Inspect coordinator/replica before recovery."
+            )
+            raise
 
         # Stop both halves of every paired Render slot before restoring env.
         for role in ("n8n", "sh01"):
@@ -520,7 +544,9 @@ def run_failover(
             result["rollback"]["restore_state_error"] = str(exc)
 
         # Reopen both public entry points only after rollback is complete.
-        if plan["switch_router"]:
+        if plan["switch_router"] and not any(
+            key.endswith("_error") for key in result["rollback"]
+        ):
             for role in ("n8n", "sh01"):
                 try:
                     result["rollback"][

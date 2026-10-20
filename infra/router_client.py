@@ -3,6 +3,7 @@ import os
 from typing import Any
 
 import httpx
+from .coordination import require_lease
 
 logger = logging.getLogger("infra.router")
 
@@ -68,6 +69,7 @@ def router_status(role: str = "n8n") -> dict[str, Any]:
 
 
 def router_set_preferred(role: str, backend: str) -> dict[str, Any]:
+    require_lease()
     backend = backend.rstrip("/")
     result = _request(
         role,
@@ -80,6 +82,7 @@ def router_set_preferred(role: str, backend: str) -> dict[str, Any]:
 
 
 def router_set_maintenance(role: str, enabled: bool) -> dict[str, Any]:
+    require_lease()
     result = _request(
         role,
         "POST",

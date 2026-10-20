@@ -4,6 +4,7 @@ import threading
 from typing import Any
 
 from .persistence import store
+from . import coordination
 
 logger = logging.getLogger("infra.state")
 
@@ -71,16 +72,28 @@ class InfraState:
         except Exception as exc:
             logger.warning("Could not load durable state; using env defaults: %s", exc)
 
+    def refresh_authoritative(self) -> dict[str, Any]:
+        """Read D1 before every entry point that can inspect or change leadership."""
+        if coordination.enabled():
+            active = self._normalize(coordination.active())
+            with self._lock:
+                self._active = active
+        return self.all()
+
     def get_active(self, infra_type: str) -> str | None:
         with self._lock:
             return self._active.get(infra_type)
 
     def set_active(self, infra_type: str, slot: str, persist: bool = True) -> dict[str, Any]:
         with self._lock:
+            if coordination.enabled():
+                coordination.require_lease()
             next_state = self.all()
             previous = next_state.get(infra_type)
             next_state[infra_type] = slot
             next_revision = self._revision + 1
+            if coordination.enabled():
+                coordination.commit_active(next_state)
             persistence = None
             if persist:
                 persistence = store.save_state(
@@ -100,6 +113,8 @@ class InfraState:
 
     def set_all(self, active: dict[str, Any], persist: bool = True) -> dict[str, Any]:
         with self._lock:
+            if coordination.enabled():
+                coordination.require_lease()
             next_state = self.all()
             incoming = self._normalize(active)
             for key in ("render", "postgres", "b2"):
@@ -107,6 +122,8 @@ class InfraState:
                     next_state[key] = incoming[key]
 
             next_revision = self._revision + 1
+            if coordination.enabled():
+                coordination.commit_active(next_state)
             persistence = None
             if persist:
                 persistence = store.save_state(

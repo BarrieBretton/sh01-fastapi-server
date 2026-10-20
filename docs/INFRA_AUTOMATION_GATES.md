@@ -1,0 +1,41 @@
+# Infrastructure automation: implementation gates
+
+> Update for the accompanying implementation: the D1 coordination endpoint,
+> lease checks, replica inspection, write barrier, and one-way planned database
+> promotion are now included in the proposed files. The historical audit below
+> describes the *previous* deployed behavior. Follow
+> [SUPABASE_REPLICA_RUNBOOK.md](SUPABASE_REPLICA_RUNBOOK.md) to provision and
+> verify real projects. Automatic lossless promotion after an inaccessible
+> source and a redundant B2 ring are **not** provided.
+
+This document describes what must be true before the SH01 controller can claim unattended failover. Source checked: `infra/{sla,orchestrator,postgres,b2ring,persistence,state,registry,routes}.py` on `main`, 20 October 2026. Current operator report: two Supabase projects, one Backblaze account with one bucket, and one Cloudflare account. Operator-provided deployed control Worker code and binding screenshot show D1 `MEDIA_QUEUE_DB` (`sh01-media-queue`) and KV `ROUTER_STATE` (`infra-control-routing-state`), with no coordinator endpoint or Durable Object binding. Actual cross-project database replication is not established by repository source.
+
+## Current behavior
+
+| Ring | Membership | Periodic automation | Planned migration | Outage promotion |
+| --- | --- | --- | --- | --- |
+| Render | Each registry member contains one n8n and one SH01 service; more than two members are supported | Pair health and candidate promotion in `infra/sla.py`; the watchdog must actually be deployed and scheduled | `/infra/failover` can configure and switch both services | Can change Render pair while keeping the currently selected Postgres and B2 slots, if the database, bucket, routers, and controller remain usable |
+| Postgres | `supabase-a` and `supabase-b` are registered, each with its own connection fields | No automatic storage failover or continuously verified data freshness | `/infra/failover` can dump source `public`, transactionally replace destination `public`, then compare table lists/counts | Requires a reachable source and therefore cannot use that migration to recover an unreachable source; no automatic promotion |
+| B2 | One registered slot, `b2-a` | No alternative bucket or automatic B2 promotion | Future registry slots can use distinct account keys; `/infra/b2/migrate` copies objects on request | No available B2 destination today |
+| Control-plane coordination | Two Render controllers behind a Cloudflare router were reported | The SLA lock is local to each process; state revisions are stored independently on reachable Postgres slots | No verified shared leader or fencing token | Conflicting controller actions remain possible without a shared coordinator |
+
+`/infra/status` reports active and configured slot names. `/infra/{postgres,b2}/{slot}/health` checks basic reachability, not replica freshness. `/infra/select/{render,postgres,b2}` previously wrote only active-slot metadata and did not move traffic or configure runtime environments. The selection patch leaves dry runs and same-slot no-ops available and rejects a different active slot with HTTP 409. The follow-up independent-ring patch keeps omitted `/infra/failover` targets unchanged and rejects a live request without an explicit target; current `main` otherwise rotates omitted rings. Use coordinated `/infra/failover` with explicit targets for intentional migrations.
+
+## Required invariants for unattended switching
+
+1. **Exactly one failover writer:** acquire a lease in one strongly consistent coordinator shared by all controller processes; assign a fencing generation to every operation. Abort on a lost/expired lease before modifying routers, Render services, or active state. The per-process `threading.Lock` is insufficient. Record the current generation and active slot in that coordinator; reject stale controllers during recovery. Do not route this coordination through a storage node that the failover is intended to replace.
+2. **Paired Render promotion:** both services exist, are permitted to resume, report ready, and carry the selected Postgres/B2 runtime settings; then change both proxy routes as one reviewed operation with rollback. Every added pair needs environment, service IDs, health paths, router targets, and a staging failover exercise. Never remove the active pair until another is serving and controller state matches.
+3. **Postgres recovery point:** establish a continuous replica or another supported data shipping mechanism **before** enabling automatic Postgres promotion. Verify subscription/replication health, n8n tables, schema/migrations, sequence values, encryption-key compatibility, last applied change, and absence of writes on the standby. PostgreSQL logical replication does not propagate DDL or sequence state automatically. Freeze old writers before promoting a writable copy; use a documented recovery point/data-loss policy. When freshness is unknown or source is unreachable, leave automatic database promotion disabled. A planned `pg_dump`/restore is a separate operation and can replace the destination `public` schema; do not run it on an irreplaceable active project.
+4. **B2 single-node mode:** keep `b2-a` selected and expose its health; do not claim B2 redundancy. Later add an account/bucket, keys, access and replication, validate both old/new objects and previously issued URLs, and only then arm B2 promotion. A second bucket in the same Backblaze account can be useful, but a separate region requires a separate account. Account for asynchronous replication and object deletions/version behavior.
+5. **Fail-closed observability:** a useful ring status distinguishes `serving`, `degraded_no_standby`, `unhealthy`, `replica_unverified`, and `unknown`. Emit timestamps, active/standby identities, last verified replica change, and controller lease owner/generation. A basic HTTP 200 or database `SELECT 1` must not be reported as readiness for data-safe promotion. Keep logs/metrics and an external alert for a stalled watchdog; its cron alone is not evidence of execution.
+6. **Tests before production:** exercise one failing member of an active Render pair; rejected candidate resumes; both controllers attempting promotion simultaneously; total source database loss; stale database standby; single B2 bucket outage; failed router update; and controller failure mid-promotion. Assert no dual n8n writers, no stale controller committing an active slot, and no automatic promotion when replication evidence is absent.
+
+## Safe implementation order
+
+1. Deploy the metadata-selection guard and confirm no workflow relies on using `/infra/select/*` to perform a live switch. Keep the Render watchdog on its existing safe storage targets.
+2. Add a separately authenticated failover coordinator to the deployed control Worker, using a dedicated table in the existing D1 database or a dedicated Durable Object binding. The media queue's lease protects media jobs only. Never use `ROUTER_STATE` KV as the lock: its writes are eventually consistent. Make the controller fail closed when coordination is unavailable, fence stale generations at mutating boundaries, and test competing controller instances and expired leases. Verify the watchdog schedule in the deployed environment.
+3. Define a data loss target for the n8n database. Set up and validate ongoing replication or an appropriate managed failover mechanism on the two Supabase projects; build a promotion gate that checks actual freshness and application readiness. Only then enable automatic Postgres switching.
+4. Keep B2 at one node until a standby is wanted. At that point provision the bucket/account, replication, URL strategy, freshness checks, and test object/version behavior before enabling automatic B2 switching.
+5. Configure each Render pair with access to the **selected** Postgres and B2 slots, verify `N8N_ENCRYPTION_KEY` compatibility without revealing it, perform staging failure drills, then deploy production monitors and alerting.
+
+Code changes alone cannot create or prove the replica, the controller's deployed Worker bindings, account permissions, router maintenance policy, or a successful failure drill. Do not label independent Postgres/B2 failover as automated until those gates are met and demonstrated.

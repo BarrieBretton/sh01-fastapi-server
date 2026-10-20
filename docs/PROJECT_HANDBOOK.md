@@ -52,6 +52,8 @@ flowchart TB
 
 The control plane selects a **paired** n8n and SH01 Render slot; Postgres and B2 selections are independent. The current Render-to-letter mapping comes from the **live registry**, not from the A/B letter in a hostname or an older document. The media queue's D1 storage is distinct from router KV and from the active Supabase/Postgres slot.
 
+**Automation boundary (code checked 20 October 2026):** The SLA watchdog can switch paired Render slots while retaining the selected database and bucket. `/infra/failover` can copy a reachable Postgres source on a planned switch; it does not provide continuous replication or recovery from a lost source. The two controller processes have process-local locks, with no verified shared leader or fencing. The operator-provided deployed control Worker code and binding screenshot show D1 `MEDIA_QUEUE_DB` (`sh01-media-queue`) and KV `ROUTER_STATE` (`infra-control-routing-state`); neither currently coordinates infra failovers. One B2 slot is registered. After the selection guard change, `/infra/select/*` rejects different active slots with HTTP 409. The independent-ring guard makes `/infra/failover` retain omitted ring targets and rejects a live request with no explicit target; otherwise an omitted target on current `main` advances to the next slot. See [infrastructure automation gates](INFRA_AUTOMATION_GATES.md) for the required standby, coordination and failure tests.
+
 ### Public and internal entry points
 
 | Name | URL / route | Responsibility | Evidence |
@@ -187,3 +189,11 @@ Do not assume that source code's `DEFAULT_WORKFLOWS` list in `app.py` is the cur
 - [Kaggle media regression notebook](../notebooks/sh01_kaggle_branding_endpoint_test.ipynb)
 
 `MEDIA_JOB_STORE_SETUP.md` in this documentation package describes the current D1 queue arrangement. If you encounter a copy that points to a direct Render master URL, replace that older copy before following its installation steps.
+# Proposed database standby and D1 coordinator update
+
+The accompanying controller changes add a D1-based failover lease and a
+verified, one-way planned Supabase switch. Production setup and limitations are
+documented in `docs/SUPABASE_REPLICA_RUNBOOK.md`. The changes require Worker
+deployment, D1 seed and a working database subscription; merely deploying the
+Python files does not activate database failover. One B2 bucket remains a
+single point of failure.

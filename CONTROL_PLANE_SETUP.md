@@ -59,6 +59,8 @@ The control plane stores a single active Render slot:
 
 The Render, Postgres, and B2 slot names are independent. `render-a` does not imply `supabase-a` or `b2-a`.
 
+After the selection guard change, `POST /infra/select/render`, `/infra/select/postgres`, and `/infra/select/b2` only preview a target or return a same-slot no-op. A different live target returns HTTP 409: changing controller metadata alone would not update traffic or runtime environments. For a coordinated, explicit switch, use `/infra/failover`. Once the independent-ring guard is applied, omitted targets retain their current slots, and a live request with no target is rejected. The watchdog switches paired Render slots; it does not promote Supabase or B2. See [automation gates](docs/INFRA_AUTOMATION_GATES.md) before enabling storage promotion.
+
 ---
 
 ## 2. Repository files
@@ -653,3 +655,15 @@ Cloudflare `ROUTER_CONTROL_KEY` must be a Worker Secret.
 - SH01 direct health currently depends on `/` returning 2xx.
 - The target n8n service may begin workloads once resumed/deployed before public cutover.
 - Multi-process control-plane deployment would require stronger distributed locking/state coordination.
+# Proposed D1 coordinator and database standby
+
+Before enabling `INFRA_COORDINATION_ENABLED=true` on either controller, deploy
+`cloudflare/control-plane-worker.js`, apply `cloudflare/infra_coordination.sql`
+to its `MEDIA_QUEUE_DB` binding, and seed the `global` row from the observed
+serving pair, selected Supabase database and `b2-a` bucket. Set the Worker's
+`CONTROL_PLANE_API_KEY` secret to the controller's existing key. Both
+controllers must use the same `CONTROL_PLANE_BASE_URL`.
+
+Provision the Supabase subscription and verify it before attempting a database
+switch. Full instructions: `docs/SUPABASE_REPLICA_RUNBOOK.md`. Do not enable
+this mode until the operator has verified D1, both routers and a staging drill.

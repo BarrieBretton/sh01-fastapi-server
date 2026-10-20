@@ -16,6 +16,7 @@ def load_sla():
     infra.__path__ = [str(root / "infra")]
     modules = {"infra": infra}
     attributes = {
+        "coordination": ("coordinated", "enabled"),
         "b2ring": ("b2_runtime_config",),
         "orchestrator": ("run_failover",),
         "persistence": ("store",),
@@ -33,7 +34,7 @@ def load_sla():
     for name, fields in attributes.items():
         module = types.ModuleType("infra." + name)
         for field in fields:
-            setattr(module, field, Mock(name=field))
+            setattr(module, field, (lambda fn: fn) if field == "coordinated" else Mock(name=field))
         modules[module.__name__] = module
     with patch.dict(sys.modules, modules):
         spec = importlib.util.spec_from_file_location("infra.sla", root / "infra/sla.py")
@@ -53,6 +54,8 @@ def load_orchestrator():
     infra.__path__ = [str(root / "infra")]
     modules = {"infra": infra}
     attributes = {
+        "coordination": ("coordinated", "enabled"),
+        "pg_replica": ("assert_matching_schema", "inspect_replica", "prepare_standby_for_writes", "replicate_barrier"),
         "b2ring": ("b2_compare", "b2_health", "b2_migrate", "b2_runtime_config"),
         "postgres": ("postgres_compare", "postgres_health", "postgres_migrate"),
         "registry": ("registry",),
@@ -70,7 +73,7 @@ def load_orchestrator():
     for name, fields in attributes.items():
         module = types.ModuleType("infra." + name)
         for field in fields:
-            setattr(module, field, Mock(name=field))
+            setattr(module, field, (lambda fn: fn) if field == "coordinated" else Mock(name=field))
         modules[module.__name__] = module
     with patch.dict(sys.modules, modules):
         spec = importlib.util.spec_from_file_location("infra.orchestrator", root / "infra/orchestrator.py")
@@ -157,6 +160,7 @@ class SlaRecoveryTests(unittest.TestCase):
         self.sla.router_set_maintenance.assert_not_called()
 
     def test_failed_promotion_restores_preexisting_maintenance(self):
+        self.sla.render_service_status.return_value = {"suspended": "suspended"}
         self.sla.render_base_url.side_effect = lambda slot, role: f"https://{slot}-{role}.example"
         self.sla.router_status.return_value = {"maintenance": True}
         self.sla.router_set_maintenance.side_effect = [
@@ -169,6 +173,13 @@ class SlaRecoveryTests(unittest.TestCase):
                          ("n8n", True))
         self.assertEqual(self.sla.router_set_maintenance.call_args_list[-1].args,
                          ("sh01", True))
+
+    def test_fast_promotion_rejects_running_old_writer(self):
+        self.sla.render_service_status.return_value = {"suspended": "not_suspended"}
+        with self.assertRaisesRegex(RuntimeError, "not confirmed suspended"):
+            self.sla._promote_live_candidate("render-b", "render-a")
+        self.sla.router_set_preferred.assert_not_called()
+        self.sla.state.set_active.assert_not_called()
 
     def test_transient_active_recovery_avoids_hard_stop_after_failed_failover(self):
         self.sla._load_monitor_state.return_value = ({"consecutive_failures": 1}, 23)
