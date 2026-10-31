@@ -53,6 +53,14 @@ async def _run(row: dict[str, Any], lease_id: str) -> bool:
                 m._jobs[job_id] = job
             await spawn_media_task(m._execute(job_id, request), request.unlimited_resources)
             result = m._job_view(job)
+        elif kind == "ai_compose":
+            import ai_compose as m
+            request = m.AIComposeRequest.model_validate(payload["request"])
+            validate_high_resources(request.unlimited_resources)
+            job = m.make_dispatch_job(job_id, request, row["attempts"], lease_id)
+            await m.register_dispatch_job(job)
+            await spawn_media_task(m._execute(job_id, request), request.unlimited_resources)
+            result = m._job_view(job)
         elif kind == "clip_caption":
             import caption_router as m
             request = m.ClipCaptionRequest.model_validate(payload["request"])

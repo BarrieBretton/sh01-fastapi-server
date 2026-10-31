@@ -1,0 +1,178 @@
+"""Typed contracts for the local AI video-composition workflow.
+
+The model is allowed to propose these objects, but the renderer only accepts
+validated instances.  The model never emits an FFmpeg command line.
+"""
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class AssetSourceConfig(BaseModel):
+    local_library: bool = True
+    pexels: bool = True
+    pixabay: bool = True
+    unsplash: bool = False
+    freesound: bool = False
+    max_candidates_per_query: int = Field(default=8, ge=1, le=20)
+
+
+class VoiceoverOptions(BaseModel):
+    mode: Literal["off", "hook_only", "hook_and_outro", "full"] = "off"
+    text: str | None = Field(default=None, max_length=2400)
+    voice: str | None = Field(default=None, max_length=300)
+    volume: float = Field(default=1.0, ge=0.0, le=2.0)
+
+
+class SfxOptions(BaseModel):
+    mode: Literal["off", "adaptive", "transitions_only", "aggressive"] = "adaptive"
+    volume: float = Field(default=0.55, ge=0.0, le=2.0)
+    local_library: str | None = None
+
+
+class AIComposeRequest(BaseModel):
+    """Public request accepted by POST /media/ai-compose."""
+
+    unlimited_resources: bool = False
+    source_path: str | None = None
+    source_url: str | None = None
+    telegram_file_id: str | None = None
+    request_id: str | None = Field(default=None, max_length=512)
+
+    brief: str = Field(
+        default="Create an informative, energetic short-form video from the strongest moments.",
+        min_length=3,
+        max_length=5000,
+    )
+    preset: Literal["viral_short", "clean_explainer", "documentary", "product_promo"] = "viral_short"
+    target_seconds: float = Field(default=45.0, ge=5.0, le=1800.0)
+    start_seconds: float = Field(default=0.0, ge=0.0)
+    end_seconds: float | None = Field(default=None, gt=0.0)
+    language: str | None = Field(default=None, min_length=2, max_length=12)
+    output_count: int = Field(default=1, ge=1, le=3)
+
+    output_width: int = Field(default=1080, ge=256, le=3840)
+    output_height: int = Field(default=1920, ge=256, le=3840)
+    fps: Literal[24, 25, 30, 60] = 30
+    crf: int = Field(default=21, ge=16, le=30)
+    audio_bitrate: Literal[128, 160, 192, 256] = 192
+
+    captions_enabled: bool = True
+    fetch_assets: bool = True
+    asset_sources: AssetSourceConfig = Field(default_factory=AssetSourceConfig)
+    local_asset_library: str | None = None
+    local_sfx_library: str | None = None
+    max_asset_layers: int = Field(default=8, ge=0, le=12)
+
+    voiceover: VoiceoverOptions = Field(default_factory=VoiceoverOptions)
+    sfx: SfxOptions = Field(default_factory=SfxOptions)
+    music_url: str | None = None
+    music_volume: float = Field(default=0.08, ge=0.0, le=1.0)
+
+    llm_url: str | None = Field(default=None, max_length=500)
+    llm_model: str | None = Field(default=None, max_length=300)
+    llm_required: bool = False
+    visual_model: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "AIComposeRequest":
+        if sum(bool(value) for value in (self.source_path, self.source_url, self.telegram_file_id)) != 1:
+            raise ValueError("Provide exactly one of source_url, telegram_file_id, or source_path")
+        if self.end_seconds is not None and self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        if self.preset == "clean_explainer" and self.sfx.mode == "aggressive":
+            raise ValueError("clean_explainer cannot use aggressive SFX")
+        return self
+
+
+class BaseSegment(BaseModel):
+    source_start: float = Field(ge=0.0)
+    source_end: float = Field(gt=0.0)
+    reason: str = Field(default="selected_by_director", max_length=500)
+    score: float | None = None
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "BaseSegment":
+        if self.source_end <= self.source_start:
+            raise ValueError("source_end must be greater than source_start")
+        return self
+
+
+class AssetRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=300)
+    kind: Literal["video", "image"] = "video"
+    start: float = Field(ge=0.0)
+    end: float = Field(gt=0.0)
+    placement: Literal["full", "top", "bottom", "left", "right", "picture_in_picture", "split"] = "picture_in_picture"
+    x: float = Field(default=0.08, ge=0.0, le=1.0)
+    y: float = Field(default=0.54, ge=0.0, le=1.0)
+    width: float = Field(default=0.84, gt=0.02, le=1.0)
+    height: float | None = Field(default=None, gt=0.02, le=1.0)
+    animation: Literal["none", "fade", "slide_up", "slide_down", "slide_left", "slide_right", "float", "reveal"] = "slide_up"
+    animation_seconds: float = Field(default=0.28, ge=0.05, le=1.5)
+    opacity: float = Field(default=1.0, ge=0.05, le=1.0)
+    reason: str = Field(default="semantic_support", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "AssetRequest":
+        if self.end <= self.start:
+            raise ValueError("asset end must be greater than start")
+        return self
+
+
+class SfxEvent(BaseModel):
+    kind: Literal["whoosh", "click", "pop", "impact", "riser", "swipe", "transition"]
+    at: float = Field(ge=0.0)
+    volume: float = Field(default=0.55, ge=0.0, le=2.0)
+    reason: str = Field(default="visual_event", max_length=300)
+
+
+class VoiceoverPlan(BaseModel):
+    text: str = Field(min_length=1, max_length=2400)
+    start: float = Field(default=0.0, ge=0.0)
+    volume: float = Field(default=1.0, ge=0.0, le=2.0)
+
+
+class CompositionPlan(BaseModel):
+    schema_version: Literal["sh01/ai-compose@1"] = "sh01/ai-compose@1"
+    title: str = Field(default="AI composed short", max_length=300)
+    hook_text: str | None = Field(default=None, max_length=240)
+    outro_text: str | None = Field(default=None, max_length=240)
+    base_segments: list[BaseSegment] = Field(min_length=1, max_length=60)
+    asset_requests: list[AssetRequest] = Field(default_factory=list, max_length=12)
+    sfx_events: list[SfxEvent] = Field(default_factory=list, max_length=24)
+    voiceovers: list[VoiceoverPlan] = Field(default_factory=list, max_length=3)
+    captions_enabled: bool = True
+    director_notes: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ResolvedLayer(BaseModel):
+    asset_id: str
+    local_path: str
+    source: str
+    license: str | None = None
+    attribution: str | None = None
+    query: str
+    kind: Literal["video", "image"]
+    start: float
+    end: float
+    x: float
+    y: float
+    width: float
+    height: float | None = None
+    animation: str = "none"
+    animation_seconds: float = 0.28
+    opacity: float = 1.0
+    score: float = 0.0
+    reason: str = "semantic_support"
+
+
+class AIComposePlan(BaseModel):
+    schema_version: Literal["sh01/ai-compose-result@1"] = "sh01/ai-compose-result@1"
+    plan: CompositionPlan
+    resolved_layers: list[ResolvedLayer] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    asset_manifest: list[dict[str, Any]] = Field(default_factory=list)
+

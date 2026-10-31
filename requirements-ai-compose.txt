@@ -1,0 +1,8 @@
+# The core patch uses dependencies already present in SH01 requirements.txt.
+# Install these only when using an in-process Hugging Face director on Kaggle.
+transformers>=4.45
+accelerate>=0.34
+bitsandbytes>=0.43; platform_system != "Windows"
+
+# Optional: install a local Piper binary and model separately when using
+# AI_COMPOSE_TTS_MODEL for offline voiceover synthesis.

@@ -1,0 +1,33 @@
+# Existing SH01 media authentication
+MEDIA_CLIP_API_KEY=
+MEDIA_LOCAL_SOURCE_DIR=/kaggle/input/your-dataset
+MEDIA_ALLOW_UNLIMITED_RESOURCES=true
+
+# Long-source analysis/output workspace
+AI_COMPOSE_WORK_DIR=/kaggle/working/ai-compose-jobs
+AI_COMPOSE_MAX_SOURCE_BYTES=17179869184
+AI_COMPOSE_TRANSCRIPTION_CHUNK_SECONDS=120
+AI_COMPOSE_USE_NVENC=false
+
+# Choose one local director backend.
+# In-process Hugging Face GPU model:
+# AI_COMPOSE_HF_MODEL=Qwen/Qwen2.5-3B-Instruct
+# AI_COMPOSE_HF_LOAD_4BIT=true
+# OpenAI-compatible llama.cpp server:
+# AI_COMPOSE_LLM_URL=http://127.0.0.1:8080/v1/chat/completions
+# AI_COMPOSE_LLM_MODEL=local-director
+# Ollama:
+# AI_COMPOSE_LLM_BACKEND=ollama
+# AI_COMPOSE_LLM_URL=http://127.0.0.1:11434/api/chat
+# AI_COMPOSE_LLM_MODEL=qwen3:4b
+
+# Local catalog/SFX/music
+AI_COMPOSE_ASSET_LIBRARY=/kaggle/input/asset-library
+AI_COMPOSE_SFX_LIBRARY=/kaggle/input/sfx-library
+AI_COMPOSE_TTS_MODEL=/kaggle/input/piper-model/en_US-lessac-medium.onnx
+
+# Optional remote asset providers; preserve attribution in outputs.
+PEXELS_API_KEY=
+PIXABAY_API_KEY=
+UNSPLASH_ACCESS_KEY=
+FREESOUND_API_KEY=
