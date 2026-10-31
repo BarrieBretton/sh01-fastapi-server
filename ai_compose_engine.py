@@ -473,39 +473,67 @@ class LocalDirector:
             except Exception as exc:
                 logger.info("4-bit loading unavailable; using native precision: %s", exc)
         model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-        messages = [
-            {"role": "system", "content": "You are a precise video editor. Return only JSON matching the requested schema."},
-            {"role": "user", "content": prompt},
-        ]
-        if hasattr(tokenizer, "apply_chat_template"):
-            encoded = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-            if hasattr(encoded, "input_ids"):
-                encoded = encoded.to(model.device)
-                input_ids = encoded["input_ids"]
-                output = model.generate(
-                    **encoded,
-                    max_new_tokens=max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800"))),
-                    do_sample=False,
+
+        def generate_content(user_prompt: str) -> str:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise video editor. Return one concrete composition "
+                        "plan instance as JSON, never a JSON Schema."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ]
+            max_new_tokens = max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800")))
+            if hasattr(tokenizer, "apply_chat_template"):
+                encoded = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
                 )
-            else:
-                input_ids = encoded.to(model.device)
-                output = model.generate(
-                    input_ids,
-                    max_new_tokens=max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800"))),
-                    do_sample=False,
-                )
-            generated = output[0][input_ids.shape[-1]:]
-            content = tokenizer.decode(generated, skip_special_tokens=True)
-        else:
-            encoded = tokenizer(prompt, return_tensors="pt").to(model.device)
-            output = model.generate(**encoded, max_new_tokens=1800, do_sample=False)
-            content = tokenizer.decode(output[0][encoded["input_ids"].shape[-1]:], skip_special_tokens=True)
+                if hasattr(encoded, "input_ids"):
+                    encoded = encoded.to(model.device)
+                    input_ids = encoded["input_ids"]
+                    output = model.generate(
+                        **encoded,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                    )
+                else:
+                    input_ids = encoded.to(model.device)
+                    output = model.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                    )
+                generated = output[0][input_ids.shape[-1]:]
+                return tokenizer.decode(generated, skip_special_tokens=True)
+
+            encoded = tokenizer(user_prompt, return_tensors="pt").to(model.device)
+            output = model.generate(**encoded, max_new_tokens=max_new_tokens, do_sample=False)
+            return tokenizer.decode(output[0][encoded["input_ids"].shape[-1]:], skip_special_tokens=True)
+
+        errors: list[str] = []
         try:
-            return CompositionPlan.model_validate(self._parse_json(content))
+            # A small model can copy the large schema from the prompt instead of
+            # instantiating it. Retry once with a compact, schema-free contract.
+            retry_prompts = [prompt, self._prompt(self.request, media, words, frames, compact=True)]
+            for attempt, candidate_prompt in enumerate(retry_prompts, start=1):
+                try:
+                    content = generate_content(candidate_prompt)
+                    payload = self._parse_json(content)
+                    if "base_segments" not in payload:
+                        raise ComposeError(
+                            "Local director echoed a schema or incomplete object; "
+                            "base_segments is required"
+                        )
+                    return CompositionPlan.model_validate(payload)
+                except Exception as exc:
+                    errors.append(f"attempt {attempt}: {str(exc)[:300]}")
+                    if attempt < len(retry_prompts):
+                        logger.warning("Local director first response was unusable; retrying compact plan: %s", exc)
+            raise ComposeError("; ".join(errors))
         finally:
             del model
             del tokenizer
@@ -549,22 +577,39 @@ class LocalDirector:
             raise ComposeError("Local director returned a non-object plan")
         return parsed
 
-    def _prompt(self, request: AIComposeRequest, media: dict[str, Any], words: list[dict[str, Any]], frames: list[dict[str, Any]]) -> str:
-        schema = CompositionPlan.model_json_schema()
-        scene_summary = [{"time": frame["time"], "frame_available": True} for frame in frames[:48]]
+    def _prompt(
+        self,
+        request: AIComposeRequest,
+        media: dict[str, Any],
+        words: list[dict[str, Any]],
+        frames: list[dict[str, Any]],
+        *,
+        compact: bool = False,
+    ) -> str:
+        scene_summary = [{"time": frame["time"], "frame_available": True} for frame in frames[:24 if compact else 48]]
+        output_contract = (
+            "Return one concrete JSON object, not a JSON Schema. Top-level keys are "
+            "schema_version, title, hook_text, outro_text, base_segments, asset_requests, "
+            "sfx_events, voiceovers, captions_enabled, and director_notes. "
+            "base_segments is REQUIRED and must be a non-empty array. Each item must "
+            "contain source_start and source_end. Use empty arrays when optional features "
+            "are not needed. Never output $defs, properties, required, definitions, "
+            "markdown fences, or explanatory text."
+        )
         return (
-            "You are a short-form video editor. Return ONLY JSON matching the supplied schema. "
+            "You are a short-form video editor. Return ONLY the requested concrete plan JSON. "
             "You are planning, not executing shell commands. Never invent source timestamps outside the media. "
             "base_segments use absolute source seconds. asset_requests use output-timeline seconds. "
             "Use supplementary assets only when they clarify the spoken idea. Do not invent factual claims. "
             "Use adaptive SFX sparingly: only for meaningful visual entrances, transitions, or payoffs. "
             "If a voiceover request is present, emit voiceovers with exact output-timeline start times; otherwise leave voiceovers empty. "
+            f"{output_contract}\n"
             f"Brief: {request.brief}\nPreset: {request.preset}\nTarget output seconds: {request.target_seconds}\n"
             f"Voiceover mode: {request.voiceover.mode}\nSFX mode: {request.sfx.mode}\n"
             f"Media metadata: {json.dumps(media, separators=(',', ':'))}\n"
-            f"Transcript: {transcript_text(words, 18000)}\n"
+            f"Transcript: {transcript_text(words, 6000 if compact else 12000)}\n"
             f"Representative frames: {json.dumps(scene_summary, separators=(',', ':'))}\n"
-            f"JSON schema: {json.dumps(schema, separators=(',', ':'))}"
+            "Choose a small number of high-confidence segments and keep all arrays concise."
         )
 
     def plan(self, media: dict[str, Any], words: list[dict[str, Any]], frames: list[dict[str, Any]]) -> tuple[CompositionPlan, list[str]]:
