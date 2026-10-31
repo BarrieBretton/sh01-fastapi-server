@@ -1,0 +1,20 @@
+{
+  "schema_echo": {
+    "$defs": {"BaseSegment": {"type": "object"}},
+    "properties": {"base_segments": {"type": "array"}},
+    "required": ["base_segments"]
+  },
+  "small_model_scalar_fields": {
+    "schema_version": 1,
+    "title": "A compact director plan",
+    "base_segments": [
+      {"source_start": 0.0, "source_end": 5.0, "reason": "opening"}
+    ],
+    "director_notes": "Keep the opening concise.",
+    "asset_requests": [],
+    "sfx_events": [],
+    "voiceovers": [],
+    "captions_enabled": true
+  },
+  "malformed_missing_comma": "{\"schema_version\": 1 \"base_segments\": [{\"source_start\": 0, \"source_end\": 5}]}"
+}
