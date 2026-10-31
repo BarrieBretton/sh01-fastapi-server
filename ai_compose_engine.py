@@ -437,6 +437,13 @@ class LocalDirector:
     def _model(self) -> str:
         return (self.request.llm_model or os.getenv("AI_COMPOSE_LLM_MODEL", "local-director")).strip()
 
+    @staticmethod
+    def _allow_deterministic_recovery() -> bool:
+        """Allow a valid deterministic plan when a configured model emits unusable output."""
+        return os.getenv("AI_COMPOSE_ALLOW_DETERMINISTIC_RECOVERY", "true").lower() in {
+            "1", "true", "yes"
+        }
+
     def _plan_transformers(
         self,
         prompt: str,
@@ -528,7 +535,7 @@ class LocalDirector:
             for attempt, candidate_prompt in enumerate(retry_prompts, start=1):
                 try:
                     content = generate_content(candidate_prompt)
-                    payload = self._parse_json(content)
+                    payload = self._normalise_plan_payload(self._parse_json(content))
                     if "base_segments" not in payload:
                         raise ComposeError(
                             "Local director echoed a schema or incomplete object; "
@@ -583,6 +590,32 @@ class LocalDirector:
             raise ComposeError("Local director returned a non-object plan")
         return parsed
 
+    @staticmethod
+    def _normalise_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Coerce harmless small-model formatting differences before validation."""
+        value = dict(payload)
+
+        # The public contract has one current version. Small models commonly emit
+        # `1` or `"1"` after seeing the version suffix in the prompt.
+        value["schema_version"] = "sh01/ai-compose@1"
+
+        # Qwen frequently emits a scalar note or object where the schema asks for
+        # a bounded list. Preserve the content without weakening the typed model.
+        if isinstance(value.get("director_notes"), str):
+            note = value["director_notes"].strip()
+            value["director_notes"] = [note] if note else []
+        elif isinstance(value.get("director_notes"), dict):
+            value["director_notes"] = [json.dumps(value["director_notes"], ensure_ascii=False)]
+
+        # Apply the same safe singleton-to-list coercion to plan collections.
+        for field in ("base_segments", "asset_requests", "sfx_events", "voiceovers"):
+            if isinstance(value.get(field), dict):
+                value[field] = [value[field]]
+            elif isinstance(value.get(field), str):
+                value[field] = []
+
+        return value
+
     def _prompt(
         self,
         request: AIComposeRequest,
@@ -628,13 +661,17 @@ class LocalDirector:
                 compact_prompt = self._prompt(self.request, media, words, frames, compact=True)
                 return self._plan_transformers(prompt, compact_prompt), warnings
             except Exception as exc:
-                if self.request.llm_required:
+                if self.request.llm_required and not self._allow_deterministic_recovery():
                     raise ComposeError(f"Local Transformers director failed: {exc}") from exc
-                warnings.append(f"Local Transformers director failed; fallback planning was used: {str(exc)[:240]}")
+                warnings.append(
+                    "Local Transformers director failed; deterministic recovery was used: "
+                    f"{str(exc)[:240]}"
+                )
+                return fallback_plan(self.request, media, words), warnings
         if not endpoint:
-            if self.request.llm_required:
+            if self.request.llm_required and not self._allow_deterministic_recovery():
                 raise ComposeError("AI_COMPOSE_LLM_URL is required when llm_required=true")
-            warnings.append("No local director endpoint configured; deterministic fallback planning was used.")
+            warnings.append("No local director endpoint configured; deterministic recovery was used.")
             return fallback_plan(self.request, media, words), warnings
         prompt = self._prompt(self.request, media, words, frames)
         try:
@@ -661,12 +698,17 @@ class LocalDirector:
                 )
                 response.raise_for_status()
                 content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            plan = CompositionPlan.model_validate(self._parse_json(str(content)))
+            plan = CompositionPlan.model_validate(
+                self._normalise_plan_payload(self._parse_json(str(content)))
+            )
             return plan, warnings
         except Exception as exc:
-            if self.request.llm_required:
+            if self.request.llm_required and not self._allow_deterministic_recovery():
                 raise ComposeError(f"Local director failed: {exc}") from exc
-            warnings.append(f"Local director failed; deterministic fallback planning was used: {str(exc)[:240]}")
+            warnings.append(
+                "Local director failed; deterministic recovery was used: "
+                f"{str(exc)[:240]}"
+            )
             return fallback_plan(self.request, media, words), warnings
 
 
