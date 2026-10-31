@@ -437,7 +437,11 @@ class LocalDirector:
     def _model(self) -> str:
         return (self.request.llm_model or os.getenv("AI_COMPOSE_LLM_MODEL", "local-director")).strip()
 
-    def _plan_transformers(self, prompt: str) -> CompositionPlan:
+    def _plan_transformers(
+        self,
+        prompt: str,
+        compact_prompt: str | None = None,
+    ) -> CompositionPlan:
         """Optional in-process GPU backend for Kaggle.
 
         It is intentionally opt-in through AI_COMPOSE_HF_MODEL.  Kaggle
@@ -518,7 +522,9 @@ class LocalDirector:
         try:
             # A small model can copy the large schema from the prompt instead of
             # instantiating it. Retry once with a compact, schema-free contract.
-            retry_prompts = [prompt, self._prompt(self.request, media, words, frames, compact=True)]
+            retry_prompts = [prompt]
+            if compact_prompt and compact_prompt != prompt:
+                retry_prompts.append(compact_prompt)
             for attempt, candidate_prompt in enumerate(retry_prompts, start=1):
                 try:
                     content = generate_content(candidate_prompt)
@@ -619,7 +625,8 @@ class LocalDirector:
         if hf_model:
             try:
                 prompt = self._prompt(self.request, media, words, frames)
-                return self._plan_transformers(prompt), warnings
+                compact_prompt = self._prompt(self.request, media, words, frames, compact=True)
+                return self._plan_transformers(prompt, compact_prompt), warnings
             except Exception as exc:
                 if self.request.llm_required:
                     raise ComposeError(f"Local Transformers director failed: {exc}") from exc
