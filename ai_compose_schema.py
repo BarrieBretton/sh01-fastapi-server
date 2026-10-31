@@ -52,7 +52,7 @@ class AIComposeRequest(BaseModel):
     end_seconds: float | None = Field(default=None, gt=0.0)
     language: str | None = Field(default=None, min_length=2, max_length=12)
     output_count: int = Field(default=1, ge=1, le=3)
-
+    # Bounded draft-review-revision cycles after the first render.\n    refinement_iterations: int = Field(default=2, ge=0, le=4)\n
     output_width: int = Field(default=1080, ge=256, le=3840)
     output_height: int = Field(default=1920, ge=256, le=3840)
     fps: Literal[24, 25, 30, 60] = 30
@@ -175,4 +175,5 @@ class AIComposePlan(BaseModel):
     resolved_layers: list[ResolvedLayer] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     asset_manifest: list[dict[str, Any]] = Field(default_factory=list)
+
 

@@ -478,11 +478,27 @@ class LocalDirector:
             {"role": "user", "content": prompt},
         ]
         if hasattr(tokenizer, "apply_chat_template"):
-            encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
-            if hasattr(encoded, "to"):
+            encoded = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if hasattr(encoded, "input_ids"):
                 encoded = encoded.to(model.device)
-            output = model.generate(encoded, max_new_tokens=max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800"))), do_sample=False)
-            generated = output[0][encoded.shape[-1]:]
+                input_ids = encoded["input_ids"]
+                output = model.generate(
+                    **encoded,
+                    max_new_tokens=max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800"))),
+                    do_sample=False,
+                )
+            else:
+                input_ids = encoded.to(model.device)
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=max(512, int(os.getenv("AI_COMPOSE_HF_MAX_NEW_TOKENS", "1800"))),
+                    do_sample=False,
+                )
+            generated = output[0][input_ids.shape[-1]:]
             content = tokenizer.decode(generated, skip_special_tokens=True)
         else:
             encoded = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -1132,8 +1148,29 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
         rendered.update(_upload_output(Path(rendered["local_path"]), str(job["request_id"]), variant))
         outputs.append(rendered)
         await update(stage="rendering", progress=0.68 + 0.22 * variant / max(1, request.output_count), outputs=outputs)
+    if request.refinement_iterations > 0:
+        from ai_compose_refinement import refine_composition
+
+        plan, layers, manifest, outputs, refinement_warnings = await refine_composition(
+            request=request,
+            job=job,
+            update=update,
+            source=source,
+            media=media,
+            words=words,
+            frames=frames,
+            work_root=work_root,
+            plan=plan,
+            layers=layers,
+            manifest=manifest,
+            outputs=outputs,
+            warnings=warnings,
+        )
+        warnings.extend(refinement_warnings)
+
     receipt = AIComposePlan(plan=plan, resolved_layers=layers, warnings=warnings, asset_manifest=manifest)
     receipt_path = work_root / "composition_receipt.json"
     receipt_path.write_text(json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False), encoding="utf-8")
     await update(stage="complete", progress=1.0, status="complete", outputs=outputs, plan=receipt.model_dump(mode="json"), receipt_path=str(receipt_path), completed_at=_now(), work_dir=str(work_root))
+
 
