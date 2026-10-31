@@ -341,7 +341,7 @@ async def refine_composition(
                 round_number,
             )
         except Exception as exc:
-            if request.llm_required:
+            if request.refinement_strict:
                 raise ComposeError(
                     f"Iterative director failed in round {round_number}: "
                     f"{str(exc)[:500]}"
@@ -349,7 +349,7 @@ async def refine_composition(
 
             refinement_warnings.append(
                 f"Iterative director failed in round {round_number}; "
-                f"keeping prior draft: {str(exc)[:240]}"
+                f"keeping the best completed draft: {str(exc)[:240]}"
             )
             break
 

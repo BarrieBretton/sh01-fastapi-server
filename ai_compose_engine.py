@@ -519,13 +519,32 @@ class LocalDirector:
         if value.startswith("```"):
             value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.I)
             value = re.sub(r"\s*```$", "", value)
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", value, flags=re.S)
-            if not match:
-                raise ComposeError("Local director did not return JSON")
-            parsed = json.loads(match.group(0))
+        candidates = [value]
+        match = re.search(r"\{.*\}", value, flags=re.S)
+        if match and match.group(0) != value:
+            candidates.append(match.group(0))
+
+        parse_error: Exception | None = None
+        parsed: Any = None
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+                break
+            except json.JSONDecodeError as exc:
+                parse_error = exc
+
+        if parsed is None:
+            try:
+                from json_repair import repair_json
+
+                repaired = repair_json(value)
+                parsed = json.loads(repaired)
+            except Exception as exc:
+                raise ComposeError(
+                    "Local director did not return valid JSON: "
+                    f"{str(parse_error or exc)[:500]}"
+                ) from exc
+
         if not isinstance(parsed, dict):
             raise ComposeError("Local director returned a non-object plan")
         return parsed

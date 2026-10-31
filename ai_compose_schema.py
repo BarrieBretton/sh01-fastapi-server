@@ -54,6 +54,7 @@ class AIComposeRequest(BaseModel):
     output_count: int = Field(default=1, ge=1, le=3)
     # Bounded draft-review-revision cycles after the first render.
     refinement_iterations: int = Field(default=2, ge=0, le=4)
+    refinement_strict: bool = False
     output_width: int = Field(default=1080, ge=256, le=3840)
     output_height: int = Field(default=1920, ge=256, le=3840)
     fps: Literal[24, 25, 30, 60] = 30

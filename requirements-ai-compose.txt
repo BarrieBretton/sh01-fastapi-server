@@ -3,6 +3,7 @@
 transformers>=4.45
 accelerate>=0.34
 bitsandbytes>=0.43; platform_system != "Windows"
+json-repair>=0.30
 
 # Optional: install a local Piper binary and model separately when using
 # AI_COMPOSE_TTS_MODEL for offline voiceover synthesis.
