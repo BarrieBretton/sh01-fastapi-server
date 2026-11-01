@@ -41,6 +41,9 @@ from ai_compose_schema import (
     SfxEvent,
     VoiceoverPlan,
 )
+from ai_compose_ir import EditPlan, camera_for_clip, compile_edit_plan
+from ai_compose_policy import policy_prompt_context, resolve_editorial_policy
+from ai_compose_quality import inspect_edit_plan, inspect_render
 
 logger = logging.getLogger("ai_compose")
 
@@ -357,6 +360,7 @@ def _window_score(words: list[dict[str, Any]], start: float, end: float) -> floa
 
 
 def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[dict[str, Any]]) -> CompositionPlan:
+    policy = resolve_editorial_policy(request, media, words)
     start = min(request.start_seconds, max(0.0, media["duration"] - 0.05))
     end = min(media["duration"], request.end_seconds or media["duration"])
     available = max(0.1, end - start)
@@ -398,14 +402,38 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
     full_text = transcript_text(words, 8000)
     keywords = _keywords(request.brief + " " + full_text, 6)
     asset_requests: list[AssetRequest] = []
-    if request.fetch_assets and request.max_asset_layers and keywords:
+    if policy.supplementary_visuals != "off" and request.max_asset_layers and keywords:
         query = " ".join(keywords[:3])
         asset_requests.append(
-            AssetRequest(query=query, start=min(2.5, max(0.0, output_duration - 1.0)), end=min(output_duration, max(4.5, output_duration * 0.30)), placement="picture_in_picture", reason="support_the_opening_topic")
+            AssetRequest(
+                query=query,
+                start=min(2.5, max(0.0, output_duration - 1.0)),
+                end=min(output_duration, max(4.5, output_duration * 0.30)),
+                placement="picture_in_picture",
+                reason="support_the_opening_topic",
+                benefit="Make the opening concept concrete without replacing the primary narrative.",
+                confidence=0.62,
+                evidence_refs=["opening_transcript_window"],
+                must_not_cover=["speaker_face", "captions"],
+            )
         )
         if output_duration > 12 and len(keywords) > 3:
             asset_requests.append(
-                AssetRequest(query=" ".join(keywords[3:6]), start=max(6.0, output_duration * 0.48), end=min(output_duration, max(9.0, output_duration * 0.68)), placement="bottom", x=0.0, y=0.53, width=1.0, height=0.47, reason="support_the_explanation")
+                AssetRequest(
+                    query=" ".join(keywords[3:6]),
+                    start=max(6.0, output_duration * 0.48),
+                    end=min(output_duration, max(9.0, output_duration * 0.68)),
+                    placement="bottom",
+                    x=0.0,
+                    y=0.53,
+                    width=1.0,
+                    height=0.47,
+                    reason="support_the_explanation",
+                    benefit="Add a lower-frame explanatory cutaway while keeping the speaker and captions visible.",
+                    confidence=0.56,
+                    evidence_refs=["midpoint_transcript_window"],
+                    must_not_cover=["captions"],
+                )
             )
 
     hook = None
@@ -413,7 +441,7 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
         first = re.split(r"(?<=[.!?])\s+", full_text)[0].strip()
         hook = first[:150] if first else None
     sfx_events: list[SfxEvent] = []
-    if request.sfx.mode != "off":
+    if policy.sfx != "off":
         for asset in asset_requests:
             sfx_events.append(SfxEvent(kind="whoosh", at=asset.start, volume=request.sfx.volume, reason="asset_entered"))
     return CompositionPlan(
@@ -423,7 +451,11 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
         asset_requests=asset_requests,
         sfx_events=sfx_events,
         captions_enabled=request.captions_enabled,
-        director_notes=["Fallback plan used because no local director endpoint was available.", f"Selected output duration: {output_duration:.2f}s"],
+        director_notes=[
+            "Fallback plan used because no local director endpoint was available.",
+            f"Selected output duration: {output_duration:.2f}s",
+            f"Editorial policy: {policy.content_type}/{policy.editing_intensity}/{policy.supplementary_visuals}",
+        ],
     )
 
 
@@ -614,6 +646,19 @@ class LocalDirector:
             elif isinstance(value.get(field), str):
                 value[field] = []
 
+        for item in value.get("asset_requests", []):
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("evidence_refs"), str):
+                item["evidence_refs"] = [item["evidence_refs"]]
+            if isinstance(item.get("must_not_cover"), str):
+                item["must_not_cover"] = [item["must_not_cover"]]
+            try:
+                if "confidence" in item:
+                    item["confidence"] = float(item["confidence"])
+            except (TypeError, ValueError):
+                item["confidence"] = 0.0
+
         return value
 
     def _prompt(
@@ -625,6 +670,7 @@ class LocalDirector:
         *,
         compact: bool = False,
     ) -> str:
+        policy = resolve_editorial_policy(self.request, media, words)
         scene_summary = [{"time": frame["time"], "frame_available": True} for frame in frames[:24 if compact else 48]]
         output_contract = (
             "Return one concrete JSON object, not a JSON Schema. Top-level keys are "
@@ -640,9 +686,12 @@ class LocalDirector:
             "You are planning, not executing shell commands. Never invent source timestamps outside the media. "
             "base_segments use absolute source seconds. asset_requests use output-timeline seconds. "
             "Use supplementary assets only when they clarify the spoken idea. Do not invent factual claims. "
+            "When supporting visuals are allowed and a concrete visual opportunity exists, emit one or more "
+            "asset_requests with query, benefit, confidence, evidence_refs, and must_not_cover. "
             "Use adaptive SFX sparingly: only for meaningful visual entrances, transitions, or payoffs. "
             "If a voiceover request is present, emit voiceovers with exact output-timeline start times; otherwise leave voiceovers empty. "
             f"{output_contract}\n"
+            f"{policy_prompt_context(policy)}\n"
             f"Brief: {request.brief}\nPreset: {request.preset}\nTarget output seconds: {request.target_seconds}\n"
             f"Voiceover mode: {request.voiceover.mode}\nSFX mode: {request.sfx.mode}\n"
             f"Media metadata: {json.dumps(media, separators=(',', ':'))}\n"
@@ -770,11 +819,18 @@ def _search_local(library: Path, query: str, kind: str) -> list[dict[str, Any]]:
 
 
 def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dict[str, Any]]:
+    cfg = request.asset_sources
+    configured = (
+        (cfg.pexels and bool(os.getenv("PEXELS_API_KEY", "").strip()))
+        or (cfg.pixabay and bool(os.getenv("PIXABAY_API_KEY", "").strip()))
+        or (cfg.unsplash and kind == "image" and bool(os.getenv("UNSPLASH_ACCESS_KEY", "").strip()))
+    )
+    if not configured:
+        return []
     try:
         import requests
     except ImportError as exc:
         raise ComposeError("requests is required for remote asset search") from exc
-    cfg = request.asset_sources
     results: list[dict[str, Any]] = []
     limit = cfg.max_candidates_per_query
     if cfg.pexels and os.getenv("PEXELS_API_KEY", "").strip():
@@ -854,6 +910,7 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
     layers: list[ResolvedLayer] = []
     manifest: list[dict[str, Any]] = []
     warnings: list[str] = []
+    minimum_score = min(1.0, max(0.0, float(os.getenv("AI_COMPOSE_MIN_ASSET_SCORE", "0.18"))))
     for index, asset_request in enumerate(plan.asset_requests[: request.max_asset_layers]):
         candidates: list[dict[str, Any]] = []
         if request.asset_sources.local_library and library_setting:
@@ -864,6 +921,13 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
         candidate = next((item for item in candidates if item.get("asset_id") not in used), None)
         if not candidate:
             warnings.append(f"No asset found for query: {asset_request.query}")
+            continue
+        candidate_score = float(candidate.get("score", 0.0) or 0.0)
+        if candidate_score < minimum_score:
+            warnings.append(
+                f"Asset skipped for query {asset_request.query!r}: "
+                f"best semantic score {candidate_score:.3f} < {minimum_score:.3f}"
+            )
             continue
         used.add(str(candidate.get("asset_id")))
         try:
@@ -877,10 +941,21 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
                 raise ComposeError("Downloaded asset is empty")
             x, y, width, height = _placement(asset_request)
             layer = ResolvedLayer(
-                asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=asset_request.animation, animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=float(candidate.get("score", 0.0)), reason=asset_request.reason,
+                asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=asset_request.animation, animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=candidate_score, reason=asset_request.reason,
             )
             layers.append(layer)
-            manifest.append({**candidate, "local_path": str(local_path), "sha256": _sha256(local_path), "timeline": {"start": asset_request.start, "end": asset_request.end}, "geometry": {"x": x, "y": y, "width": width, "height": height}, "animation": asset_request.animation})
+            manifest.append({
+                **candidate,
+                "local_path": str(local_path),
+                "sha256": _sha256(local_path),
+                "timeline": {"start": asset_request.start, "end": asset_request.end},
+                "geometry": {"x": x, "y": y, "width": width, "height": height},
+                "animation": asset_request.animation,
+                "benefit": asset_request.benefit,
+                "confidence": asset_request.confidence,
+                "evidence_refs": asset_request.evidence_refs,
+                "must_not_cover": asset_request.must_not_cover,
+            })
         except Exception as exc:
             warnings.append(f"Asset {asset_request.query!r} was rejected: {str(exc)[:220]}")
     return layers, manifest, warnings
@@ -1055,7 +1130,18 @@ def _build_audio_inputs(request: AIComposeRequest, plan: CompositionPlan, root: 
     return inputs
 
 
-def render_composition(source: Path, media: dict[str, Any], request: AIComposeRequest, plan: CompositionPlan, layers: list[ResolvedLayer], words: list[dict[str, Any]], root: Path, variant: int, warnings: list[str]) -> dict[str, Any]:
+def render_composition(
+    source: Path,
+    media: dict[str, Any],
+    request: AIComposeRequest,
+    plan: CompositionPlan,
+    layers: list[ResolvedLayer],
+    words: list[dict[str, Any]],
+    root: Path,
+    variant: int,
+    warnings: list[str],
+    edit_plan: EditPlan | None = None,
+) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise ComposeError("ffmpeg is required")
@@ -1063,6 +1149,9 @@ def render_composition(source: Path, media: dict[str, Any], request: AIComposeRe
     duration = sum(max(0.05, segment.source_end - segment.source_start) for segment in segments)
     if duration <= 0.1:
         raise ComposeError("Composition plan contains no usable base duration")
+    if edit_plan is None:
+        policy = resolve_editorial_policy(request, media, words)
+        edit_plan = compile_edit_plan(request, plan, layers, words, policy, media, variant=variant)
     output = root / f"variant_{variant:02d}.mp4"
     ass = root / f"variant_{variant:02d}.ass"
     _make_ass(words, segments, duration, plan, ass)
@@ -1098,7 +1187,32 @@ def render_composition(source: Path, media: dict[str, Any], request: AIComposeRe
     base_audio_labels: list[str] = []
     for i, segment in enumerate(segments):
         d = segment.source_end - segment.source_start
-        filters.append(f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},setpts=PTS-STARTPTS[vseg{i}]")
+        camera = camera_for_clip(edit_plan, i)
+        zoom = 1.0
+        offset_x = 0.0
+        offset_y = 0.0
+        if camera and camera.keyframes:
+            # The renderer intentionally uses a bounded, deterministic crop
+            # approximation of the track. The full keyframe track remains in
+            # the receipt for richer render backends; FFmpeg gets a safe
+            # segment-level punch-in that works on long files and low memory.
+            peak = max(item.scale for item in camera.keyframes)
+            zoom = min(1.28, max(1.0, peak))
+            midpoint = camera.keyframes[len(camera.keyframes) // 2]
+            offset_x = midpoint.x
+            offset_y = midpoint.y
+        if zoom > 1.001:
+            scaled_width = max(width, int(math.ceil(width * zoom / 2.0) * 2))
+            scaled_height = max(height, int(math.ceil(height * zoom / 2.0) * 2))
+            crop_x = f"(in_w-out_w)/2+({offset_x:.4f})*(in_w-out_w)"
+            crop_y = f"(in_h-out_h)/2+({offset_y:.4f})*(in_h-out_h)"
+            visual_filter = (
+                f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}:x='{crop_x}':y='{crop_y}'"
+            )
+        else:
+            visual_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        filters.append(f"[{i}:v]{visual_filter},setsar=1,fps={fps},setpts=PTS-STARTPTS[vseg{i}]")
         base_video_labels.append(f"[vseg{i}]")
         if media.get("has_audio"):
             filters.append(f"[{i}:a]aresample=48000,atrim=duration={d:.3f},asetpts=PTS-STARTPTS[aseg{i}]")
@@ -1211,6 +1325,29 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
     frames = await asyncio.to_thread(extract_frames, source, end - start, work_root, 48, start)
     for frame in frames:
         frame["time"] = round(float(frame["time"]) + start, 3)
+    policy = resolve_editorial_policy(request, media, words)
+    evidence_path = work_root / "evidence.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "media": media,
+                "source_window": {"start": start, "end": end},
+                "word_count": len(words),
+                "words": words,
+                "representative_frames": frames,
+                "editorial_profile": policy.model_dump(mode="json"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    await update(
+        stage="editorial_profile",
+        progress=0.34,
+        frame_count=len(frames),
+        editorial_profile=policy.model_dump(mode="json"),
+    )
     await update(stage="direction", progress=0.40, frame_count=len(frames))
     director = LocalDirector(request)
     plan, planner_warnings = await asyncio.to_thread(director.plan, media, words, frames)
@@ -1247,17 +1384,77 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
         if asset_end - asset_start > 0.05:
             valid_assets.append(item.model_copy(update={"start": asset_start, "end": asset_end}))
     plan.asset_requests = valid_assets
+    if policy.supplementary_visuals == "off":
+        if valid_assets:
+            warnings.append("Supporting visual requests were removed by the effective editorial policy.")
+        plan.asset_requests = []
+    if policy.voiceover == "off":
+        plan.voiceovers = []
+    if policy.sfx == "off":
+        plan.sfx_events = []
     await update(stage="asset_retrieval", progress=0.54, asset_queries=len(plan.asset_requests))
     layers, manifest, asset_warnings = await asyncio.to_thread(resolve_assets, request, plan, work_root)
     warnings.extend(asset_warnings)
     await update(stage="rendering", progress=0.68, resolved_assets=len(layers))
     outputs: list[dict[str, Any]] = []
+    variant_plans: dict[str, dict[str, Any]] = {}
+    variant_reviews: dict[str, dict[str, Any]] = {}
     for variant in range(1, request.output_count + 1):
-        # Small deterministic variation for multiple outputs: alternate one animation.
+        variant_edit_plan = compile_edit_plan(
+            request,
+            plan,
+            layers,
+            words,
+            policy,
+            media,
+            variant=variant,
+        )
+        plan_review = inspect_edit_plan(
+            variant_edit_plan,
+            request,
+            resolved_layer_count=len(layers),
+        )
+        if not plan_review.ok:
+            raise ComposeError(
+                f"Compiled edit plan failed validation for variant {variant}: "
+                f"{plan_review.model_dump_json()}"
+            )
+        variant_plans[str(variant)] = variant_edit_plan.model_dump(mode="json")
+        variant_reviews[str(variant)] = {"plan": plan_review.model_dump(mode="json")}
         variant_layers = layers
         if variant > 1:
-            variant_layers = [layer.model_copy(update={"animation": "fade" if layer.animation.startswith("slide") else layer.animation}) for layer in layers]
-        rendered = await asyncio.to_thread(render_composition, source, media, request, plan, variant_layers, words, work_root, variant, warnings)
+            if variant == 2:
+                variant_layers = [
+                    layer.model_copy(update={"animation": "fade" if layer.animation.startswith("slide") else layer.animation})
+                    for layer in layers
+                ]
+            elif variant >= 3:
+                variant_layers = [
+                    layer.model_copy(update={"animation": "float" if layer.animation == "none" else layer.animation})
+                    for layer in layers
+                ]
+        rendered = await asyncio.to_thread(
+            render_composition,
+            source,
+            media,
+            request,
+            plan,
+            variant_layers,
+            words,
+            work_root,
+            variant,
+            warnings,
+            variant_edit_plan,
+        )
+        render_review = await asyncio.to_thread(
+            inspect_render,
+            Path(rendered["local_path"]),
+            variant_edit_plan.duration,
+            request,
+            probe_media,
+        )
+        rendered["quality_review"] = render_review.model_dump(mode="json")
+        variant_reviews[str(variant)]["render"] = render_review.model_dump(mode="json")
         rendered.update(_upload_output(Path(rendered["local_path"]), str(job["request_id"]), variant))
         outputs.append(rendered)
         await update(stage="rendering", progress=0.68 + 0.22 * variant / max(1, request.output_count), outputs=outputs)
@@ -1281,7 +1478,65 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
         )
         warnings.extend(refinement_warnings)
 
-    receipt = AIComposePlan(plan=plan, resolved_layers=layers, warnings=warnings, asset_manifest=manifest)
+    # Refinement may have replaced every rendered variant. Rebuild the receipt
+    # metadata from the winning plans/outputs rather than retaining stale draft
+    # plans from before the last revision round.
+    variant_plans = {}
+    variant_reviews = {}
+    for variant in range(1, request.output_count + 1):
+        variant_edit_plan = compile_edit_plan(
+            request,
+            plan,
+            layers,
+            words,
+            policy,
+            media,
+            variant=variant,
+        )
+        plan_review = inspect_edit_plan(
+            variant_edit_plan,
+            request,
+            resolved_layer_count=len(layers),
+        )
+        variant_plans[str(variant)] = variant_edit_plan.model_dump(mode="json")
+        variant_reviews[str(variant)] = {"plan": plan_review.model_dump(mode="json")}
+        if len(outputs) >= variant:
+            quality_value = outputs[variant - 1].get("quality_review")
+            if not quality_value:
+                quality_value = (
+                    await asyncio.to_thread(
+                        inspect_render,
+                        Path(outputs[variant - 1]["local_path"]),
+                        variant_edit_plan.duration,
+                        request,
+                        probe_media,
+                    )
+                ).model_dump(mode="json")
+                outputs[variant - 1]["quality_review"] = quality_value
+            variant_reviews[str(variant)]["render"] = quality_value
+
+    final_edit_plan = compile_edit_plan(request, plan, layers, words, policy, media, variant=1)
+    final_plan_review = inspect_edit_plan(final_edit_plan, request, resolved_layer_count=len(layers))
+    final_render_reviews = [item.get("quality_review") for item in outputs if item.get("quality_review")]
+    quality_review = {
+        "plan": final_plan_review.model_dump(mode="json"),
+        "variants": variant_reviews,
+        "final_render_reviews": final_render_reviews,
+    }
+    receipt = AIComposePlan(
+        plan=plan,
+        resolved_layers=layers,
+        warnings=warnings,
+        asset_manifest=manifest,
+        editorial_profile=policy.model_dump(mode="json"),
+        edit_plan=final_edit_plan.model_dump(mode="json"),
+        quality_review=quality_review,
+        artifacts={
+            "evidence_path": str(evidence_path),
+            "variant_edit_plans": variant_plans,
+            "source_media": media,
+        },
+    )
     receipt_path = work_root / "composition_receipt.json"
     receipt_path.write_text(json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False), encoding="utf-8")
     await update(stage="complete", progress=1.0, status="complete", outputs=outputs, plan=receipt.model_dump(mode="json"), receipt_path=str(receipt_path), completed_at=_now(), work_dir=str(work_root))

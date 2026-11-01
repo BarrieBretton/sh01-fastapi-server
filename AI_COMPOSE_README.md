@@ -130,3 +130,45 @@ selected reason in `composition_receipt.json`.
   local path must therefore be consumed by the Kaggle worker, not a Render
   worker.
 
+## Generalized edit-program layer
+
+The compatible edit-program patch adds these internal artifacts without adding
+another public media or caption endpoint:
+
+- `ai_compose_policy.py` resolves content type, audio, voiceover, B-roll,
+  camera, graphics, music, SFX, and review policy from the brief and source
+  evidence.
+- `ai_compose_ir.py` compiles the legacy `CompositionPlan` into the versioned
+  `sh01/ai-edit@2` timeline. It contains source-to-program mappings, camera
+  tracks, visual layers, graphics, audio cues, transitions, variant strategy,
+  and an append-only decision log.
+- `ai_compose_quality.py` validates the edit program before rendering and the
+  produced media after rendering. Its reports are included in the receipt.
+
+The effective policy is conservative around speech: detected dialogue remains
+the primary narrative, generated voiceover is not placed over it by default,
+and supporting visuals are requested only when they have an evidence-backed
+benefit. `fetch_assets=false` is a hard retrieval stop. Local libraries remain
+the first retrieval source when asset retrieval is enabled.
+
+The renderer now applies bounded, deterministic segment-level camera punch-ins
+for policies and variants that permit them. The full camera keyframe track is
+retained in the receipt so a future Remotion/HyperFrames renderer can use the
+same plan without changing the API contract.
+
+New per-job artifacts include:
+
+```text
+evidence.json
+composition_receipt.json
+assets/...
+frames/...
+variant_01.mp4
+variant_01.ass
+```
+
+The current patch intentionally keeps FFmpeg as the default renderer and does
+not introduce Node, Remotion, HyperFrames, arbitrary HTML execution, or a
+second caption endpoint. Those can be added later as capability-selected
+workers consuming the same `EditPlan`.
+

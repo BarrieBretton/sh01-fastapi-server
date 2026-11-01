@@ -31,6 +31,9 @@ from ai_compose_engine import (
     render_composition,
     resolve_assets,
 )
+from ai_compose_ir import compile_edit_plan
+from ai_compose_policy import resolve_editorial_policy
+from ai_compose_quality import inspect_edit_plan, inspect_render
 
 logger = logging.getLogger("ai_compose_refinement")
 
@@ -172,6 +175,13 @@ def _normalise_plan(
             )
 
     plan.asset_requests = valid_assets
+    policy = resolve_editorial_policy(request, media, words)
+    if policy.supplementary_visuals == "off":
+        plan.asset_requests = []
+    if policy.voiceover == "off":
+        plan.voiceovers = []
+    if policy.sfx == "off":
+        plan.sfx_events = []
     return plan
 
 
@@ -228,8 +238,24 @@ async def _render_variants(
     warnings: list[str],
 ) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
+    policy = resolve_editorial_policy(request, media, words)
 
     for variant in range(1, request.output_count + 1):
+        edit_plan = compile_edit_plan(
+            request,
+            plan,
+            layers,
+            words,
+            policy,
+            media,
+            variant=variant,
+        )
+        plan_review = inspect_edit_plan(edit_plan, request, resolved_layer_count=len(layers))
+        if not plan_review.ok:
+            raise ComposeError(
+                f"Revised edit plan failed validation for variant {variant}: "
+                f"{plan_review.model_dump_json()}"
+            )
         variant_layers = layers
         if variant > 1:
             variant_layers = [
@@ -256,7 +282,16 @@ async def _render_variants(
             work_root,
             variant,
             warnings,
+            edit_plan,
         )
+        render_review = await asyncio.to_thread(
+            inspect_render,
+            Path(rendered["local_path"]),
+            edit_plan.duration,
+            request,
+            probe_media,
+        )
+        rendered["quality_review"] = render_review.model_dump(mode="json")
         rendered.update(
             _upload_output(
                 Path(rendered["local_path"]),

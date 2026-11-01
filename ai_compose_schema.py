@@ -32,6 +32,32 @@ class SfxOptions(BaseModel):
     local_library: str | None = None
 
 
+class EditorialPolicy(BaseModel):
+    """Generalized editorial controls normalized from a short user brief.
+
+    These controls are deliberately additive.  Existing top-level ``preset``,
+    ``voiceover`` and ``sfx`` fields remain supported; the policy resolver
+    combines both forms before direction starts.
+    """
+
+    content_type: Literal[
+        "auto", "talking_head", "podcast", "interview", "tutorial",
+        "screen_demo", "product", "documentary", "vlog", "montage",
+        "music", "animation",
+    ] = "auto"
+    editing_intensity: Literal["auto", "minimal", "clean", "dynamic", "viral", "cinematic"] = "auto"
+    cut_policy: Literal["auto", "preserve_existing_silence_cuts", "editorial", "aggressive"] = "auto"
+    source_audio: Literal["auto", "preserve", "replace", "mute"] = "auto"
+    voiceover: Literal["auto", "off", "hook_only", "hook_and_outro", "full"] = "auto"
+    supplementary_visuals: Literal["auto", "off", "prefer", "require"] = "auto"
+    motion_graphics: Literal["auto", "off", "selective", "hero"] = "auto"
+    camera_motion: Literal["auto", "static", "punch_ins", "dynamic"] = "auto"
+    music: Literal["auto", "off", "library", "generated"] = "auto"
+    sfx: Literal["auto", "off", "transitions_only", "adaptive", "aggressive"] = "auto"
+    style_profile: str = Field(default="auto", min_length=1, max_length=120)
+    review_level: Literal["mechanical", "visual", "strict"] = "visual"
+
+
 class AIComposeRequest(BaseModel):
     """Public request accepted by POST /media/ai-compose."""
 
@@ -67,6 +93,7 @@ class AIComposeRequest(BaseModel):
     local_asset_library: str | None = None
     local_sfx_library: str | None = None
     max_asset_layers: int = Field(default=8, ge=0, le=12)
+    editorial_policy: EditorialPolicy = Field(default_factory=EditorialPolicy)
 
     voiceover: VoiceoverOptions = Field(default_factory=VoiceoverOptions)
     sfx: SfxOptions = Field(default_factory=SfxOptions)
@@ -116,6 +143,10 @@ class AssetRequest(BaseModel):
     animation_seconds: float = Field(default=0.28, ge=0.05, le=1.5)
     opacity: float = Field(default=1.0, ge=0.05, le=1.0)
     reason: str = Field(default="semantic_support", max_length=500)
+    benefit: str | None = Field(default=None, max_length=500)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=12)
+    must_not_cover: list[str] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
     def validate_range(self) -> "AssetRequest":
@@ -177,5 +208,9 @@ class AIComposePlan(BaseModel):
     resolved_layers: list[ResolvedLayer] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     asset_manifest: list[dict[str, Any]] = Field(default_factory=list)
+    editorial_profile: dict[str, Any] = Field(default_factory=dict)
+    edit_plan: dict[str, Any] = Field(default_factory=dict)
+    quality_review: dict[str, Any] = Field(default_factory=dict)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
 
 

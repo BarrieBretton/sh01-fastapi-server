@@ -16,7 +16,8 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from ai_compose_engine import ComposeError, run_composition
-from ai_compose_schema import AIComposeRequest, CompositionPlan
+from ai_compose_ir import EditPlan
+from ai_compose_schema import AIComposeRequest, CompositionPlan, EditorialPolicy
 from media_job_store import store
 from media_resources import spawn_media_task, validate_high_resources
 
@@ -246,7 +247,22 @@ async def ai_compose_capabilities(x_api_key: str | None = Header(default=None, a
         "local_director": bool(os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
         "local_director_url_configured": bool(os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
         "asset_sources": {"local_library": True, "pexels": bool(os.getenv("PEXELS_API_KEY", "")), "pixabay": bool(os.getenv("PIXABAY_API_KEY", "")), "unsplash": bool(os.getenv("UNSPLASH_ACCESS_KEY", "")), "freesound": bool(os.getenv("FREESOUND_API_KEY", ""))},
-        "features": ["long-source-chunking", "word-timed-captions", "semantic-asset-requests", "partial-frame-video-layers", "adaptive-sfx", "optional-local-voiceover", "multi-variant-output", "provenance-receipt", "preview-local-file-route"],
+        "features": [
+            "long-source-chunking",
+            "word-timed-captions",
+            "semantic-asset-requests",
+            "explicit-editorial-policy",
+            "versioned-edit-plan",
+            "evidence-artifact",
+            "partial-frame-video-layers",
+            "motivated-camera-punch-ins",
+            "adaptive-sfx",
+            "optional-local-voiceover",
+            "multi-variant-output",
+            "technical-quality-review",
+            "provenance-receipt",
+            "preview-local-file-route",
+        ],
         "animations": ["none", "fade", "slide_up", "slide_down", "slide_left", "slide_right", "float", "reveal"],
         "geometry": "normalized x/y/width/height coordinates",
         "encoder": os.getenv("AI_COMPOSE_VIDEO_CODEC", "auto"),
@@ -257,7 +273,12 @@ async def ai_compose_capabilities(x_api_key: str | None = Header(default=None, a
 @router.get("/ai-compose-schema")
 async def ai_compose_schema(x_api_key: str | None = Header(default=None, alias="X-API-KEY")):
     _require_key(x_api_key)
-    return {"request": AIComposeRequest.model_json_schema(), "plan": CompositionPlan.model_json_schema()}
+    return {
+        "request": AIComposeRequest.model_json_schema(),
+        "plan": CompositionPlan.model_json_schema(),
+        "editorial_policy": EditorialPolicy.model_json_schema(),
+        "edit_plan": EditPlan.model_json_schema(),
+    }
 
 
 @router.get("/ai-compose-files/{job_id}/{filename}")
