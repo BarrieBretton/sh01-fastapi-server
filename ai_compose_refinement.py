@@ -175,7 +175,18 @@ def _normalise_plan(
             )
 
     plan.asset_requests = valid_assets
+    valid_graphics = []
+    for item in plan.graphics:
+        if item.end <= 0 or item.start >= output_duration:
+            continue
+        graphic_start = max(0.0, min(max(0.0, output_duration - 0.05), item.start))
+        graphic_end = min(output_duration, item.end)
+        if graphic_end - graphic_start > 0.05:
+            valid_graphics.append(item.model_copy(update={"start": graphic_start, "end": graphic_end}))
+    plan.graphics = valid_graphics
     policy = resolve_editorial_policy(request, media, words)
+    if policy.motion_graphics == "off":
+        plan.graphics = []
     if policy.supplementary_visuals == "off":
         plan.asset_requests = []
     if policy.voiceover == "off":
@@ -290,6 +301,8 @@ async def _render_variants(
             edit_plan.duration,
             request,
             probe_media,
+            edit_plan=edit_plan,
+            render_features=rendered.get("render_features"),
         )
         rendered["quality_review"] = render_review.model_dump(mode="json")
         rendered.update(
@@ -357,12 +370,14 @@ async def refine_composition(
             item.source_end - item.source_start
             for item in current_plan.base_segments
         )
-        quality = await asyncio.to_thread(
-            _quality_check,
-            Path(current_outputs[0]["local_path"]),
-            expected_duration,
-            request,
-        )
+        quality = current_outputs[0].get("quality_review")
+        if not quality:
+            quality = await asyncio.to_thread(
+                _quality_check,
+                Path(current_outputs[0]["local_path"]),
+                expected_duration,
+                request,
+            )
 
         try:
             revised_plan, planner_warnings = await asyncio.to_thread(

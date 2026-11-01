@@ -167,8 +167,16 @@ variant_01.mp4
 variant_01.ass
 ```
 
-The current patch intentionally keeps FFmpeg as the default renderer and does
-not introduce Node, Remotion, HyperFrames, arbitrary HTML execution, or a
-second caption endpoint. Those can be added later as capability-selected
-workers consuming the same `EditPlan`.
+The FFmpeg renderer now consumes the edit program rather than merely storing
+it: explicit graphics are burned into the ASS composition, camera keyframes
+drive per-frame pan/punch expressions, and cinematic transition specs are
+rendered with `xfade` while the audio timeline remains contiguous. Each
+variant returns a `render_features` contract and quality review checks that
+planned graphics, camera tracks, and transitions were actually applied.
+
+This remains an FFmpeg-first implementation rather than a JavaScript
+Remotion runtime. It deliberately avoids Node, arbitrary HTML execution, and
+an additional caption endpoint. A future Remotion/HyperFrames worker can
+consume the same versioned `EditPlan`; the current server already has a real
+rendered baseline instead of a receipt-only placeholder.
 

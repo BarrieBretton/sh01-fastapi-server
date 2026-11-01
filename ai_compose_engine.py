@@ -26,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +38,7 @@ from ai_compose_schema import (
     AssetRequest,
     BaseSegment,
     CompositionPlan,
+    GraphicPlan,
     ResolvedLayer,
     SfxEvent,
     VoiceoverPlan,
@@ -437,9 +439,61 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
             )
 
     hook = None
+    graphics: list[GraphicPlan] = []
     if full_text:
-        first = re.split(r"(?<=[.!?])\s+", full_text)[0].strip()
+        sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", full_text) if item.strip()]
+        first = sentences[0] if sentences else full_text.strip()
         hook = first[:150] if first else None
+        if hook and policy.motion_graphics != "off":
+            graphics.append(
+                GraphicPlan(
+                    kind="hook",
+                    start=0.0,
+                    end=min(output_duration, 1.8),
+                    text=hook,
+                    placement="top",
+                    animation="slide_down",
+                    style="accent",
+                    reason="fallback_transcript_hook",
+                    evidence_refs=["transcript_opening"],
+                )
+            )
+        if len(sentences) > 1 and output_duration >= 8.0 and policy.motion_graphics in {"hero", "selective"}:
+            bridge = sentences[1][:180]
+            bridge_start = min(output_duration - 1.0, max(2.0, output_duration * 0.42))
+            graphics.append(
+                GraphicPlan(
+                    kind="callout",
+                    start=bridge_start,
+                    end=min(output_duration, bridge_start + 2.2),
+                    text=bridge,
+                    placement="lower_left",
+                    animation="reveal",
+                    style="default",
+                    reason="fallback_transcript_bridge",
+                    evidence_refs=["transcript_followup"],
+                )
+            )
+    elif policy.motion_graphics == "hero":
+        # A missing transcription must not silently turn a requested motion-
+        # graphics edit into a plain crop. Use the user's own brief as a
+        # non-factual title cue; never invent source claims.
+        brief_title = re.split(r"(?<=[.!?])\s+", request.brief.strip())[0][:150]
+        if brief_title:
+            hook = brief_title
+            graphics.append(
+                GraphicPlan(
+                    kind="hook",
+                    start=0.0,
+                    end=min(output_duration, 1.8),
+                    text=brief_title,
+                    placement="top",
+                    animation="slide_down",
+                    style="accent",
+                    reason="fallback_brief_title",
+                    evidence_refs=["user_brief"],
+                )
+            )
     sfx_events: list[SfxEvent] = []
     if policy.sfx != "off":
         for asset in asset_requests:
@@ -447,6 +501,7 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
     return CompositionPlan(
         title=(request.brief[:120] or "AI composed short"),
         hook_text=hook if request.preset == "viral_short" else None,
+        graphics=graphics,
         base_segments=segments,
         asset_requests=asset_requests,
         sfx_events=sfx_events,
@@ -640,7 +695,7 @@ class LocalDirector:
             value["director_notes"] = [json.dumps(value["director_notes"], ensure_ascii=False)]
 
         # Apply the same safe singleton-to-list coercion to plan collections.
-        for field in ("base_segments", "asset_requests", "sfx_events", "voiceovers"):
+        for field in ("base_segments", "asset_requests", "sfx_events", "voiceovers", "graphics"):
             if isinstance(value.get(field), dict):
                 value[field] = [value[field]]
             elif isinstance(value.get(field), str):
@@ -659,6 +714,26 @@ class LocalDirector:
             except (TypeError, ValueError):
                 item["confidence"] = 0.0
 
+        graphic_enums = {
+            "kind": {"hook", "outro", "lower_third", "quote_card", "callout", "cta"},
+            "placement": {"top", "upper_left", "center", "lower_left", "bottom"},
+            "animation": {"none", "fade", "slide_up", "slide_down", "pop", "reveal"},
+            "style": {"default", "accent", "warning", "quote", "cta"},
+        }
+        for item in value.get("graphics", []):
+            if not isinstance(item, dict):
+                continue
+            for field, allowed in graphic_enums.items():
+                if item.get(field) not in allowed:
+                    item[field] = {
+                        "kind": "callout",
+                        "placement": "center",
+                        "animation": "fade",
+                        "style": "default",
+                    }[field]
+            if isinstance(item.get("evidence_refs"), str):
+                item["evidence_refs"] = [item["evidence_refs"]]
+
         return value
 
     def _prompt(
@@ -675,7 +750,7 @@ class LocalDirector:
         output_contract = (
             "Return one concrete JSON object, not a JSON Schema. Top-level keys are "
             "schema_version, title, hook_text, outro_text, base_segments, asset_requests, "
-            "sfx_events, voiceovers, captions_enabled, and director_notes. "
+            "sfx_events, voiceovers, graphics, captions_enabled, and director_notes. "
             "base_segments is REQUIRED and must be a non-empty array. Each item must "
             "contain source_start and source_end. Use empty arrays when optional features "
             "are not needed. Never output $defs, properties, required, definitions, "
@@ -685,9 +760,13 @@ class LocalDirector:
             "You are a short-form video editor. Return ONLY the requested concrete plan JSON. "
             "You are planning, not executing shell commands. Never invent source timestamps outside the media. "
             "base_segments use absolute source seconds. asset_requests use output-timeline seconds. "
+            "graphics use output-timeline seconds. "
             "Use supplementary assets only when they clarify the spoken idea. Do not invent factual claims. "
             "When supporting visuals are allowed and a concrete visual opportunity exists, emit one or more "
             "asset_requests with query, benefit, confidence, evidence_refs, and must_not_cover. "
+            "When motion graphics are allowed, emit concise graphics entries with kind, start, end, text, "
+            "placement, animation, and style. Keep graphics clear of speaker faces and captions; do not use "
+            "graphics as a substitute for source dialogue. "
             "Use adaptive SFX sparingly: only for meaningful visual entrances, transitions, or payoffs. "
             "If a voiceover request is present, emit voiceovers with exact output-timeline start times; otherwise leave voiceovers empty. "
             f"{output_contract}\n"
@@ -973,7 +1052,62 @@ def _ass_escape(value: str) -> str:
     return value.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", " ")
 
 
-def _make_ass(words: list[dict[str, Any]], segments: list[BaseSegment], duration: float, plan: CompositionPlan, destination: Path) -> None:
+def _graphic_text(value: str, width: int = 26, max_lines: int = 4) -> str:
+    """Wrap graphic copy into bounded ASS lines so it cannot clip the frame."""
+
+    clean = " ".join(str(value).split())
+    lines = textwrap.wrap(clean, width=width, break_long_words=False, break_on_hyphens=False)
+    lines = lines[:max_lines] or [clean[:width]]
+    return r"\N".join(_ass_escape(line) for line in lines)
+
+
+def _graphic_position(placement: str) -> tuple[int, int, int]:
+    """Return a safe ASS anchor/alignment position for a graphic cue."""
+
+    positions = {
+        "top": (540, 150, 8),
+        "upper_left": (90, 260, 7),
+        "center": (540, 960, 5),
+        "lower_left": (90, 1500, 1),
+        "bottom": (540, 1750, 2),
+    }
+    return positions.get(placement, positions["center"])
+
+
+def _graphic_tags(cue: Any) -> str:
+    """Translate a typed graphic animation into bounded ASS tags."""
+
+    x, y, alignment = _graphic_position(cue.placement)
+    tags = [f"\\an{alignment}", f"\\pos({x},{y})"]
+    if cue.animation in {"fade", "reveal"}:
+        tags.append("\\fad(120,160)")
+    elif cue.animation == "slide_up":
+        tags.append(f"\\move({x},{y + 90},{x},{y},0,280)")
+    elif cue.animation == "slide_down":
+        tags.append(f"\\move({x},{y - 90},{x},{y},0,280)")
+    elif cue.animation == "pop":
+        tags.extend(["\\fscx85", "\\fscy85", "\\t(0,180,\\fscx100\\fscy100)", "\\fad(80,120)"])
+    return "{" + "".join(tags) + "}"
+
+
+def _graphic_style(cue: Any) -> str:
+    return {
+        "default": "GraphicDefault",
+        "accent": "GraphicAccent",
+        "warning": "GraphicWarning",
+        "quote": "GraphicQuote",
+        "cta": "GraphicCta",
+    }.get(cue.style, "GraphicDefault")
+
+
+def _make_ass(
+    words: list[dict[str, Any]],
+    segments: list[BaseSegment],
+    duration: float,
+    plan: CompositionPlan,
+    destination: Path,
+    edit_plan: EditPlan | None = None,
+) -> None:
     mapped: list[dict[str, Any]] = []
     offsets: list[float] = []
     cursor = 0.0
@@ -1001,17 +1135,33 @@ def _make_ass(words: list[dict[str, Any]], segments: list[BaseSegment], duration
         "[V4+ Styles]", "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         "Style: Default,DejaVu Sans,48,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,3,1,2,80,80,170,1",
         "Style: Hook,DejaVu Sans,64,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,4,1,8,80,80,140,1",
-        "Style: Outro,DejaVu Sans,54,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,4,1,2,80,80,180,1", "",
+        "Style: Outro,DejaVu Sans,54,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,4,1,2,80,80,180,1",
+        "Style: GraphicDefault,DejaVu Sans,54,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,4,1,5,80,80,120,1",
+        "Style: GraphicAccent,DejaVu Sans,66,&H0000FFFF,&H0000FFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,5,1,5,80,80,120,1",
+        "Style: GraphicWarning,DejaVu Sans,58,&H0044AAFF,&H0044AAFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,5,1,5,80,80,120,1",
+        "Style: GraphicQuote,DejaVu Sans,56,&H00FFFFFF,&H00FFFFFF,&H00333333,&HCC111111,0,1,0,0,100,100,0,0,1,4,1,5,90,90,120,1",
+        "Style: GraphicCta,DejaVu Sans,60,&H00FFFFFF,&H00FFFFFF,&H00101010,&H90000000,1,0,0,0,100,100,0,0,1,5,1,2,80,80,150,1", "",
         "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     for start, end, text in lines:
         if end > start:
             content.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(min(duration, end))},Default,,0,0,0,,{_ass_escape(text)}")
-    if plan.hook_text:
-        content.append(f"Dialogue: 5,0:00:00.00,{_ass_time(min(duration, 1.7))},Hook,,0,0,0,,{{\\fad(80,120)}}{_ass_escape(plan.hook_text)}")
-    if plan.outro_text and duration > 1.0:
+    explicit_graphics = list(edit_plan.graphics) if edit_plan is not None else []
+    explicit_kinds = {cue.kind for cue in explicit_graphics}
+    for cue in explicit_graphics:
+        start = max(0.0, min(duration, float(cue.start)))
+        end = max(start + 0.05, min(duration, float(cue.end)))
+        if end <= start or not cue.text.strip():
+            continue
+        content.append(
+            f"Dialogue: 10,{_ass_time(start)},{_ass_time(end)},{_graphic_style(cue)},,0,0,0,,"
+            f"{_graphic_tags(cue)}{_graphic_text(cue.text)}"
+        )
+    if edit_plan is None and plan.hook_text and "hook" not in explicit_kinds:
+        content.append(f"Dialogue: 5,0:00:00.00,{_ass_time(min(duration, 1.7))},Hook,,0,0,0,,{{\\fad(80,120)}}{_graphic_text(plan.hook_text)}")
+    if edit_plan is None and plan.outro_text and "outro" not in explicit_kinds and duration > 1.0:
         start = max(0.0, duration - 2.4)
-        content.append(f"Dialogue: 5,{_ass_time(start)},{_ass_time(duration)},Outro,,0,0,0,,{{\\fad(120,120)}}{_ass_escape(plan.outro_text)}")
+        content.append(f"Dialogue: 5,{_ass_time(start)},{_ass_time(duration)},Outro,,0,0,0,,{{\\fad(120,120)}}{_graphic_text(plan.outro_text)}")
     destination.write_text("\n".join(content) + "\n", encoding="utf-8")
 
 
@@ -1130,6 +1280,54 @@ def _build_audio_inputs(request: AIComposeRequest, plan: CompositionPlan, root: 
     return inputs
 
 
+def _piecewise_keyframe_expr(keyframes: list[Any], field: str, track_start: float) -> str:
+    """Build a bounded FFmpeg expression that interpolates a camera field."""
+
+    points = sorted(
+        ((max(0.0, float(item.time) - track_start), float(getattr(item, field))) for item in keyframes),
+        key=lambda item: item[0],
+    )
+    if not points:
+        return "0"
+    expression = f"{points[-1][1]:.5f}"
+    for left, right in reversed(list(zip(points, points[1:]))):
+        t0, value0 = left
+        t1, value1 = right
+        span = max(0.001, t1 - t0)
+        interpolation = f"({value0:.5f}+({value1 - value0:.5f})*(t-{t0:.5f})/{span:.5f})"
+        expression = f"if(lt(t,{t1:.5f}),{interpolation},{expression})"
+    return expression
+
+
+def _camera_visual_filter(camera: Any, width: int, height: int, fps: int) -> str:
+    """Return a safe FFmpeg camera filter consuming the complete keyframe track.
+
+    FFmpeg's crop filter evaluates x/y expressions per frame, so the normalized
+    pan track is animated continuously. The peak scale is applied before the
+    crop to keep output dimensions stable and memory bounded.
+    """
+
+    peak = min(1.28, max(1.0, max(float(item.scale) for item in camera.keyframes)))
+    scaled_width = max(width, int(math.ceil(width * peak / 2.0) * 2))
+    scaled_height = max(height, int(math.ceil(height * peak / 2.0) * 2))
+    x_offset = _piecewise_keyframe_expr(camera.keyframes, "x", float(camera.start))
+    y_offset = _piecewise_keyframe_expr(camera.keyframes, "y", float(camera.start))
+    crop_x = f"(in_w-out_w)/2+({x_offset})*(in_w-out_w)"
+    crop_y = f"(in_h-out_h)/2+({y_offset})*(in_h-out_h)"
+    return (
+        f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}:x='{crop_x}':y='{crop_y}',fps={fps}"
+    )
+
+
+def _transition_name(kind: str) -> str | None:
+    return {
+        "dissolve": "fade",
+        "swipe": "slideleft",
+        "match": "smoothleft",
+    }.get(kind)
+
+
 def render_composition(
     source: Path,
     media: dict[str, Any],
@@ -1154,7 +1352,7 @@ def render_composition(
         edit_plan = compile_edit_plan(request, plan, layers, words, policy, media, variant=variant)
     output = root / f"variant_{variant:02d}.mp4"
     ass = root / f"variant_{variant:02d}.ass"
-    _make_ass(words, segments, duration, plan, ass)
+    _make_ass(words, segments, duration, plan, ass, edit_plan)
 
     command: list[str] = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     video_input_count = len(segments)
@@ -1185,43 +1383,62 @@ def render_composition(
     width, height, fps = request.output_width, request.output_height, request.fps
     base_video_labels: list[str] = []
     base_audio_labels: list[str] = []
+    camera_tracks_rendered = 0
     for i, segment in enumerate(segments):
         d = segment.source_end - segment.source_start
         camera = camera_for_clip(edit_plan, i)
-        zoom = 1.0
-        offset_x = 0.0
-        offset_y = 0.0
         if camera and camera.keyframes:
-            # The renderer intentionally uses a bounded, deterministic crop
-            # approximation of the track. The full keyframe track remains in
-            # the receipt for richer render backends; FFmpeg gets a safe
-            # segment-level punch-in that works on long files and low memory.
-            peak = max(item.scale for item in camera.keyframes)
-            zoom = min(1.28, max(1.0, peak))
-            midpoint = camera.keyframes[len(camera.keyframes) // 2]
-            offset_x = midpoint.x
-            offset_y = midpoint.y
-        if zoom > 1.001:
-            scaled_width = max(width, int(math.ceil(width * zoom / 2.0) * 2))
-            scaled_height = max(height, int(math.ceil(height * zoom / 2.0) * 2))
-            crop_x = f"(in_w-out_w)/2+({offset_x:.4f})*(in_w-out_w)"
-            crop_y = f"(in_h-out_h)/2+({offset_y:.4f})*(in_h-out_h)"
-            visual_filter = (
-                f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height}:x='{crop_x}':y='{crop_y}'"
-            )
+            visual_filter = _camera_visual_filter(camera, width, height, fps)
+            camera_tracks_rendered += 1
         else:
-            visual_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
-        filters.append(f"[{i}:v]{visual_filter},setsar=1,fps={fps},setpts=PTS-STARTPTS[vseg{i}]")
+            visual_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}"
+        filters.append(f"[{i}:v]{visual_filter},setsar=1,setpts=PTS-STARTPTS[vseg{i}]")
         base_video_labels.append(f"[vseg{i}]")
         if media.get("has_audio"):
             filters.append(f"[{i}:a]aresample=48000,atrim=duration={d:.3f},asetpts=PTS-STARTPTS[aseg{i}]")
         else:
             filters.append(f"[{silence_index}:a]atrim=duration={d:.3f},asetpts=PTS-STARTPTS[aseg{i}]")
         base_audio_labels.append(f"[aseg{i}]")
+    transitions_rendered = 0
+    transition_specs = list(edit_plan.transitions[: max(0, len(segments) - 1)])
+    can_xfade = (
+        len(segments) > 1
+        and len(transition_specs) == len(segments) - 1
+        and all(float(item.duration) > 0.0 and _transition_name(item.kind) for item in transition_specs)
+    )
     if len(segments) == 1:
         video_label = base_video_labels[0]
         audio_label = base_audio_labels[0]
+    elif can_xfade:
+        current_label = base_video_labels[0]
+        elapsed = float(segments[0].source_end - segments[0].source_start)
+        total_overlap = 0.0
+        for index, transition in enumerate(transition_specs, 1):
+            segment_duration = float(segments[index].source_end - segments[index].source_start)
+            previous_duration = float(segments[index - 1].source_end - segments[index - 1].source_start)
+            transition_duration = min(float(transition.duration), previous_duration - 0.05, segment_duration - 0.05)
+            if transition_duration <= 0.0:
+                can_xfade = False
+                break
+            output_label = f"[vtrans{index}]"
+            filters.append(
+                f"{current_label}{base_video_labels[index]}xfade="
+                f"transition={_transition_name(transition.kind)}:duration={transition_duration:.3f}:"
+                f"offset={max(0.0, elapsed - transition_duration):.3f}{output_label}"
+            )
+            current_label = output_label
+            elapsed += segment_duration - transition_duration
+            total_overlap += transition_duration
+            transitions_rendered += 1
+        if can_xfade and total_overlap > 0.0:
+            filters.append(f"{current_label}tpad=stop_mode=clone:stop_duration={total_overlap:.3f}[vbase]")
+            video_label = "[vbase]"
+        else:
+            transitions_rendered = 0
+            filters.append("".join(base_video_labels) + f"concat=n={len(segments)}:v=1:a=0[vbase]")
+            video_label = "[vbase]"
+        filters.append("".join(base_audio_labels) + f"concat=n={len(segments)}:v=0:a=1[abase]")
+        audio_label = "[abase]"
     else:
         filters.append("".join(base_video_labels) + f"concat=n={len(segments)}:v=1:a=0[vbase]")
         filters.append("".join(base_audio_labels) + f"concat=n={len(segments)}:v=0:a=1[abase]")
@@ -1257,7 +1474,13 @@ def render_composition(
         filters.append(f"[{video_label[1:-1]}][ov{index}]overlay=x='{x_expr}':y='{y_expr}':eof_action=pass:shortest=0:enable='between(t,{start:.3f},{min(duration, layer.end):.3f})'[vlay{index}]")
         video_label = f"[vlay{index}]"
 
-    if plan.captions_enabled and request.captions_enabled and ass.exists() and (words or plan.hook_text or plan.outro_text):
+    graphics_rendered = len(edit_plan.graphics)
+    should_burn_ass = ass.exists() and (
+        (plan.captions_enabled and request.captions_enabled and bool(words))
+        or bool(edit_plan.graphics)
+        or (edit_plan is None and (bool(plan.hook_text) or bool(plan.outro_text)))
+    )
+    if should_burn_ass:
         ass_path = str(ass).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
         filters.append(f"{video_label}ass='{ass_path}'[vcaption]")
         video_label = "[vcaption]"
@@ -1282,7 +1505,22 @@ def render_composition(
     if not output.exists() or output.stat().st_size == 0:
         raise ComposeError("FFmpeg produced no output")
     result = probe_media(output)
-    return {"variant": variant, "local_path": str(output), "size_bytes": output.stat().st_size, "duration": round(result["duration"], 3), "width": result["width"], "height": result["height"], "codec": result["video_codec"]}
+    return {
+        "variant": variant,
+        "local_path": str(output),
+        "size_bytes": output.stat().st_size,
+        "duration": round(result["duration"], 3),
+        "width": result["width"],
+        "height": result["height"],
+        "codec": result["video_codec"],
+        "render_features": {
+            "graphics_rendered": graphics_rendered,
+            "camera_tracks_rendered": camera_tracks_rendered,
+            "visual_layers_rendered": len(layer_indices),
+            "transitions_rendered": transitions_rendered,
+            "captions_rendered": bool(plan.captions_enabled and request.captions_enabled and words),
+        },
+    }
 
 
 def _upload_output(path: Path, request_id: str, variant: int) -> dict[str, Any]:
@@ -1384,6 +1622,17 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
         if asset_end - asset_start > 0.05:
             valid_assets.append(item.model_copy(update={"start": asset_start, "end": asset_end}))
     plan.asset_requests = valid_assets
+    valid_graphics = []
+    for item in plan.graphics:
+        if item.end <= 0 or item.start >= output_duration:
+            continue
+        graphic_start = max(0.0, min(max(0.0, output_duration - 0.05), item.start))
+        graphic_end = min(output_duration, item.end)
+        if graphic_end - graphic_start > 0.05:
+            valid_graphics.append(item.model_copy(update={"start": graphic_start, "end": graphic_end}))
+    plan.graphics = valid_graphics
+    if policy.motion_graphics == "off":
+        plan.graphics = []
     if policy.supplementary_visuals == "off":
         if valid_assets:
             warnings.append("Supporting visual requests were removed by the effective editorial policy.")
@@ -1452,6 +1701,8 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
             variant_edit_plan.duration,
             request,
             probe_media,
+            edit_plan=variant_edit_plan,
+            render_features=rendered.get("render_features"),
         )
         rendered["quality_review"] = render_review.model_dump(mode="json")
         variant_reviews[str(variant)]["render"] = render_review.model_dump(mode="json")
@@ -1510,6 +1761,8 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
                         variant_edit_plan.duration,
                         request,
                         probe_media,
+                        edit_plan=variant_edit_plan,
+                        render_features=outputs[variant - 1].get("render_features"),
                     )
                 ).model_dump(mode="json")
                 outputs[variant - 1]["quality_review"] = quality_value

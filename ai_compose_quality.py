@@ -57,6 +57,26 @@ def inspect_edit_plan(
         if layer.x + layer.width > 1.001 or layer.y + (layer.height or 1.0) > 1.001:
             issues.append(QualityIssue(severity="warning", category="visual", code="layer_outside_frame", message=f"Layer {layer.asset_id} extends outside the normalized frame."))
 
+    for index, track in enumerate(edit_plan.camera_tracks):
+        if track.start < -0.01 or track.end > edit_plan.duration + 0.01:
+            issues.append(QualityIssue(severity="error", category="camera", code="camera_track_outside_program", message=f"Camera track {index} lies outside the program duration."))
+        for keyframe in track.keyframes:
+            if keyframe.time < track.start - 0.01 or keyframe.time > track.end + 0.01:
+                issues.append(QualityIssue(severity="error", category="camera", code="camera_keyframe_outside_track", message=f"Camera keyframe {keyframe.time:.3f}s lies outside track {index}."))
+
+    for index, graphic in enumerate(edit_plan.graphics):
+        if graphic.start < -0.01 or graphic.end > edit_plan.duration + 0.01:
+            issues.append(QualityIssue(severity="error", category="graphics", code="graphic_outside_program", message=f"Graphic cue {index} lies outside the program duration."))
+        if not graphic.text.strip():
+            issues.append(QualityIssue(severity="error", category="graphics", code="empty_graphic", message=f"Graphic cue {index} has no visible text."))
+
+    expected_transitions = max(0, len(clips) - 1)
+    if edit_plan.transitions and len(edit_plan.transitions) != expected_transitions:
+        issues.append(QualityIssue(severity="warning", category="transitions", code="transition_count_mismatch", message=f"Edit plan has {len(edit_plan.transitions)} transitions for {len(clips)} clips; expected {expected_transitions}."))
+    for index, transition in enumerate(edit_plan.transitions):
+        if transition.at < -0.01 or transition.at > edit_plan.duration + 0.01:
+            issues.append(QualityIssue(severity="error", category="transitions", code="transition_outside_program", message=f"Transition {index} lies outside the program duration."))
+
     if edit_plan.policy.get("supplementary_visuals") == "require" and resolved_layer_count == 0:
         issues.append(QualityIssue(severity="warning", category="assets", code="required_asset_missing", message="The policy required supporting visuals but no asset layer was resolved."))
     if edit_plan.policy.get("source_audio") == "preserve" and not edit_plan.audio_cues:
@@ -72,6 +92,7 @@ def inspect_edit_plan(
             "source_clip_count": len(clips),
             "visual_layer_count": len(edit_plan.visual_layers),
             "camera_track_count": len(edit_plan.camera_tracks),
+            "graphic_count": len(edit_plan.graphics),
             "transition_count": len(edit_plan.transitions),
             "audio_cue_count": len(edit_plan.audio_cues),
             "duration": edit_plan.duration,
@@ -88,6 +109,8 @@ def inspect_render(
     probe: Callable[[Path], dict[str, Any]],
     *,
     run_decode: bool = True,
+    edit_plan: EditPlan | None = None,
+    render_features: dict[str, Any] | None = None,
 ) -> ReviewReport:
     """Check a rendered file without importing the engine (avoids a cycle)."""
 
@@ -107,6 +130,22 @@ def inspect_render(
         issues.append(QualityIssue(severity="error", category="technical", code="dimensions_mismatch", message=f"Rendered dimensions are {media.get('width')}x{media.get('height')}; expected {request.output_width}x{request.output_height}."))
     if not media.get("has_audio"):
         issues.append(QualityIssue(severity="warning", category="audio", code="missing_audio", message="Rendered output has no audio stream."))
+
+    feature_checks: dict[str, Any] = {}
+    if edit_plan is not None:
+        if render_features is None:
+            issues.append(QualityIssue(severity="error", category="render_contract", code="render_features_missing", message="The renderer did not report which planned features it actually applied."))
+        else:
+            required_features = {
+                "graphics_rendered": len(edit_plan.graphics),
+                "camera_tracks_rendered": len(edit_plan.camera_tracks),
+                "transitions_rendered": sum(float(item.duration) > 0.0 for item in edit_plan.transitions),
+            }
+            feature_checks = {"required": required_features, "actual": render_features}
+            for field, required in required_features.items():
+                actual = int(render_features.get(field, 0) or 0)
+                if actual < required:
+                    issues.append(QualityIssue(severity="error", category="render_contract", code=f"{field}_not_rendered", message=f"Renderer reported {actual} {field}; the edit plan requires {required}."))
 
     if run_decode and shutil.which("ffmpeg"):
         decoded = subprocess.run(
@@ -132,6 +171,7 @@ def inspect_render(
             "height": media.get("height"),
             "has_audio": bool(media.get("has_audio")),
             "codec": media.get("video_codec"),
+            "render_features": feature_checks,
         },
         recommended_actions=[issue.message for issue in issues],
     )

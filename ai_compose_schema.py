@@ -168,6 +168,26 @@ class VoiceoverPlan(BaseModel):
     volume: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
+class GraphicPlan(BaseModel):
+    """A model-directed text/graphic cue rendered by the compositor."""
+
+    kind: Literal["hook", "outro", "lower_third", "quote_card", "callout", "cta"] = "callout"
+    start: float = Field(ge=0.0)
+    end: float = Field(gt=0.0)
+    text: str = Field(min_length=1, max_length=500)
+    placement: Literal["top", "upper_left", "center", "lower_left", "bottom"] = "center"
+    animation: Literal["none", "fade", "slide_up", "slide_down", "pop", "reveal"] = "fade"
+    style: Literal["default", "accent", "warning", "quote", "cta"] = "default"
+    reason: str = Field(default="director_decision", max_length=300)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "GraphicPlan":
+        if self.end <= self.start:
+            raise ValueError("graphic end must be greater than start")
+        return self
+
+
 class CompositionPlan(BaseModel):
     schema_version: Literal["sh01/ai-compose@1"] = "sh01/ai-compose@1"
     title: str = Field(default="AI composed short", max_length=300)
@@ -177,6 +197,7 @@ class CompositionPlan(BaseModel):
     asset_requests: list[AssetRequest] = Field(default_factory=list, max_length=12)
     sfx_events: list[SfxEvent] = Field(default_factory=list, max_length=24)
     voiceovers: list[VoiceoverPlan] = Field(default_factory=list, max_length=3)
+    graphics: list[GraphicPlan] = Field(default_factory=list, max_length=24)
     captions_enabled: bool = True
     director_notes: list[str] = Field(default_factory=list, max_length=20)
 

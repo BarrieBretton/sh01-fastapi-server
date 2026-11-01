@@ -74,8 +74,17 @@ class GraphicCue(BaseModel):
     start: float = Field(ge=0.0)
     end: float = Field(gt=0.0)
     text: str = Field(min_length=1, max_length=500)
+    placement: Literal["top", "upper_left", "center", "lower_left", "bottom"] = "center"
+    animation: Literal["none", "fade", "slide_up", "slide_down", "pop", "reveal"] = "fade"
+    style: Literal["default", "accent", "warning", "quote", "cta"] = "default"
     reason: str = Field(default="director_decision", max_length=300)
     evidence_refs: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "GraphicCue":
+        if self.end <= self.start:
+            raise ValueError("graphic cue end must be greater than start")
+        return self
 
 
 class AudioCue(BaseModel):
@@ -218,10 +227,55 @@ def compile_edit_plan(
     ]
 
     graphics: list[GraphicCue] = []
-    if plan.hook_text and policy.motion_graphics != "off":
-        graphics.append(GraphicCue(kind="hook", start=0.0, end=min(cursor, 1.7), text=plan.hook_text, reason="opening_hook"))
-    if plan.outro_text and policy.motion_graphics != "off" and cursor > 1.0:
-        graphics.append(GraphicCue(kind="outro", start=max(0.0, cursor - 2.4), end=cursor, text=plan.outro_text, reason="closing_cta"))
+    if policy.motion_graphics != "off":
+        # New directors can provide a complete, explicit graphics track. Keep
+        # the legacy hook/outro fields as a backwards-compatible fallback, but
+        # do not duplicate a matching explicit cue.
+        explicit_kinds = {item.kind for item in plan.graphics}
+        for item in plan.graphics:
+            start = max(0.0, min(cursor - 0.05, item.start))
+            end = min(cursor, max(start + 0.05, item.end))
+            if end <= start:
+                continue
+            graphics.append(
+                GraphicCue(
+                    kind=item.kind,
+                    start=round(start, 3),
+                    end=round(end, 3),
+                    text=item.text,
+                    placement=item.placement,
+                    animation=item.animation,
+                    style=item.style,
+                    reason=item.reason,
+                    evidence_refs=item.evidence_refs,
+                )
+            )
+        if plan.hook_text and "hook" not in explicit_kinds:
+            graphics.append(
+                GraphicCue(
+                    kind="hook",
+                    start=0.0,
+                    end=min(cursor, 1.7),
+                    text=plan.hook_text,
+                    placement="top",
+                    animation="slide_down",
+                    style="accent",
+                    reason="opening_hook",
+                )
+            )
+        if plan.outro_text and "outro" not in explicit_kinds and cursor > 1.0:
+            graphics.append(
+                GraphicCue(
+                    kind="outro",
+                    start=max(0.0, cursor - 2.4),
+                    end=cursor,
+                    text=plan.outro_text,
+                    placement="bottom",
+                    animation="fade",
+                    style="cta",
+                    reason="closing_cta",
+                )
+            )
 
     audio_cues: list[AudioCue] = []
     if media.get("has_audio") and policy.source_audio != "mute":
