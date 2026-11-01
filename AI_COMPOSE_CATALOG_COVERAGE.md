@@ -41,3 +41,4 @@ being advertised as complete:
 The same edit-program contract is designed so a future capability-selected
 worker can consume it without adding another public caption or media endpoint.
 The default worker remains safe, deterministic FFmpeg execution.
+

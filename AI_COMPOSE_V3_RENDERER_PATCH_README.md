@@ -33,3 +33,4 @@ The LLM still returns typed JSON only. It never receives shell access or an
 FFmpeg command channel. The renderer constructs the filter graph from bounded
 Pydantic objects and keeps FFmpeg as the default backend. No existing caption
 route is replaced or duplicated.
+
