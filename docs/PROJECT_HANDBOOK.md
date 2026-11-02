@@ -232,3 +232,13 @@ narration separation, caption timing, overlays, motion graphics and audio mixing
 user-footage quality. No production queue, caption endpoint, infrastructure
 selection or cloud deployment was modified. See `ONE_CELL_EDITOR_README.md` for
 configuration and the reproducible single-cell notebook build.
+
+## Automated CI quality checks
+
+Code configuration: GitHub Actions workflows now define Python/FFmpeg tests,
+Worker tests, notebook consistency, decoder compatibility, CodeQL and dependency
+audits. See [setup and limitations](CODE_QUALITY.md).
+
+Execution status remains unverified until GitHub Actions completes successfully.
+Tests run on GitHub-hosted runners; local company-PC execution is not required.
+Dependabot activation requires its configuration on the default branch.
