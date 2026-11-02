@@ -28,6 +28,9 @@ def build():
     # Consecutive string literals keep the single cell readable in notebook editors.
     literal='(\n'+ '\n'.join(repr(encoded[i:i+110]) for i in range(0,len(encoded),110))+'\n)'
     source=(ROOT/'scripts/kaggle_one_cell_template.py').read_text()
+    bootstrap=(ROOT/'scripts/kaggle_bootstrap.py').read_text()
+    ast.parse(bootstrap)
+    source=source.replace('# __ENVIRONMENT_BOOTSTRAP__', bootstrap)
     source=source.replace("'__SOURCE_BUNDLE__'",literal).replace('__SOURCE_SHA256__',digest)
     ast.parse(source)
     target=ROOT/'notebooks/sh01_full_editor_one_cell.py';target.write_text(source)

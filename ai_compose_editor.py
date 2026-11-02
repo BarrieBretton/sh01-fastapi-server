@@ -354,11 +354,12 @@ async def run_editor(request, job, update):
     await update(stage='design_direction',progress=.41)
     design_req = effective.model_copy(update={'brief':request.brief +
         '\nDesign a supporting visual track for this selected narrative. Keep base_segments unchanged. '
-        'Choose concise hook, quote/callout/checklist/timeline cards, relevant asset requests, sparse SFX, and the requested narration_sections. '
+        'Keep narration_sections and voiceovers unchanged from the validated selected plan. '
+        'Choose concise hook, quote/callout/checklist/timeline cards, relevant asset requests and sparse SFX. '
         'Do not rewrite dates or invent factual text. Capabilities: '+json.dumps(caps)+
         '\nSelected plan: '+plan.model_dump_json()[:11000]})
     try:
-        designed, notes = await asyncio.to_thread(LocalDirector(design_req).plan,media,
+        designed, notes = await asyncio.to_thread(LocalDirector(design_req, narrative_plan=plan).plan,media,
             [w for w in words if any(s.source_start<=w['start']<s.source_end for s in plan.base_segments)], frames)
         designed.base_segments = plan.base_segments
         plan = designed

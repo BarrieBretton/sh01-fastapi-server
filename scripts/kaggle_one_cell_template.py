@@ -48,9 +48,8 @@ if shutil.which('nvidia-smi') is None:
     raise RuntimeError('Enable a Kaggle GPU accelerator before running this cell')
 subprocess.run(['nvidia-smi'], check=True)
 
-PYTHON = RUNTIME / 'venv' / 'bin' / 'python'
-if not PYTHON.exists():
-    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(PYTHON.parent.parent)
+# __ENVIRONMENT_BOOTSTRAP__
+PYTHON, setup_environment = prepare_editor_environment(RUNTIME)
 # Use a private environment; preserve Kaggle's CUDA-enabled Torch installation.
 import importlib.metadata
 constraints = RUNTIME / 'constraints.txt'
@@ -60,27 +59,30 @@ setup_log = RUNTIME / 'setup.log'
 def run_setup(command, *, env=None):
     """Record setup failures without putting secrets or huge pip logs in output."""
     with setup_log.open('a') as stream:
-        result = subprocess.run([str(x) for x in command], stdout=stream, stderr=subprocess.STDOUT, env=env)
+        result = subprocess.run([str(x) for x in command], stdout=stream, stderr=subprocess.STDOUT,
+                                env=setup_environment if env is None else env)
     if result.returncode:
         print(setup_log.read_text(errors='replace')[-4500:])
         raise RuntimeError(f'Setup failed; full log: {setup_log}')
 
 stamp = RUNTIME / 'dependencies-ready'
-if not stamp.exists():
+setup_version = 'bootstrap-v2;torch=' + importlib.metadata.version('torch')
+if not stamp.exists() or stamp.read_text() != setup_version:
     print('Installing isolated editor dependencies…', flush=True)
     run_setup([PYTHON,'-m','pip','install','--disable-pip-version-check','-q','-c',constraints,
         'fastapi>=0.115,<1','uvicorn>=0.30,<1','pydantic>=2.9,<3','requests>=2.32,<3',
         'httpx>=0.27,<1','python-dotenv>=1,<2','Pillow>=10','numpy>=1.26',
         'transformers>=4.51,<5','accelerate>=1,<2','bitsandbytes>=0.45,<1',
         'json-repair>=0.30,<1','faster-whisper>=1.1,<2','sentencepiece'])
-    stamp.write_text('Installed; Torch kept at '+importlib.metadata.version('torch'))
 check = subprocess.check_output([str(PYTHON),'-c',
     'import torch, bitsandbytes, transformers, json, pathlib, site; '
     'assert torch.cuda.is_available(), "CUDA unavailable in fresh subprocess"; '
-    'roots=[pathlib.Path(p) for p in site.getsitepackages()]; '
+    'import sys; roots=[pathlib.Path(p) for p in sys.path if p]; '
     'libs=[str(p) for root in roots for p in root.glob("nvidia/*/lib")]; '
-    'print(json.dumps({"torch":torch.__version__,"gpu":torch.cuda.get_device_name(0),"libraries":libs}))'],text=True)
+    'print(json.dumps({"torch":torch.__version__,"gpu":torch.cuda.get_device_name(0),"libraries":libs}))'],
+    text=True,env=setup_environment)
 gpu = json.loads(check.strip().splitlines()[-1])
+stamp.write_text(setup_version)
 print('GPU ready:', gpu['gpu'], '| Torch', gpu['torch'], flush=True)
 if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
     run_setup(['apt-get','update','-qq'])
@@ -172,7 +174,7 @@ print('Running the integrated editor. Evidence, drafts, and logs are saved under
 runner_log=WORK/'driver.log'
 with runner_log.open('w') as stream:
     process=subprocess.Popen([str(PYTHON),'-u',str(CODE/'ai_compose_kaggle.py'),str(config_path)],
-        cwd=CODE,stdout=stream,stderr=subprocess.STDOUT)
+        cwd=CODE,stdout=stream,stderr=subprocess.STDOUT,env=setup_environment)
     offset=0
     try:
         while process.poll() is None:

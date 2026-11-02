@@ -516,8 +516,15 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
 
 
 class LocalDirector:
-    def __init__(self, request: AIComposeRequest):
+    def __init__(self, request: AIComposeRequest, *, narrative_plan: CompositionPlan | None = None):
         self.request = request
+        # Visual design owns graphics/assets/SFX, not already approved narration
+        # or source cuts. Snapshot validated values so later mutations cannot
+        # change this stage's input or silently replace the speaker's narrative.
+        self._narrative_plan = (
+            CompositionPlan.model_validate(narrative_plan.model_dump(mode="json"))
+            if narrative_plan is not None else None
+        )
 
     def _endpoint(self) -> str:
         return (self.request.llm_url or os.getenv("AI_COMPOSE_LLM_URL", "") or os.getenv("LLAMA_SERVER_URL", "")).strip().rstrip("/")
@@ -613,34 +620,72 @@ class LocalDirector:
             output = model.generate(**encoded, max_new_tokens=max_new_tokens, do_sample=False)
             return tokenizer.decode(output[0][encoded["input_ids"].shape[-1]:], skip_special_tokens=True)
 
-        errors: list[str] = []
         try:
-            # A small model can copy the large schema from the prompt instead of
-            # instantiating it. Retry once with a compact, schema-free contract.
-            retry_prompts = [prompt]
-            if compact_prompt and compact_prompt != prompt:
-                retry_prompts.append(compact_prompt)
-            for attempt, candidate_prompt in enumerate(retry_prompts, start=1):
-                try:
-                    content = generate_content(candidate_prompt)
-                    payload = self._normalise_plan_payload(self._parse_json(content))
-                    if "base_segments" not in payload:
-                        raise ComposeError(
-                            "Local director echoed a schema or incomplete object; "
-                            "base_segments is required"
-                        )
-                    return CompositionPlan.model_validate(payload)
-                except Exception as exc:
-                    errors.append(f"attempt {attempt}: {str(exc)[:300]}")
-                    if attempt < len(retry_prompts):
-                        logger.warning("Local director first response was unusable; retrying compact plan: %s", exc)
-            raise ComposeError("; ".join(errors))
+            return self._generate_valid_plan(generate_content, prompt, compact_prompt)
         finally:
             del model
             del tokenizer
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _generate_valid_plan(
+        self,
+        generate_content: Callable[[str], str],
+        prompt: str,
+        compact_prompt: str | None = None,
+    ) -> CompositionPlan:
+        """Ask for bounded corrections; never invent missing editorial timings.
+
+        Retry even when compact/full prompts are identical (common for short
+        videos). Send the failed response AND field-level validation feedback,
+        rather than repeating the same deterministic generation unchanged.
+        """
+        candidate_prompt = prompt
+        errors: list[str] = []
+        for attempt in range(1, 4):
+            # Transport, model-loading, and GPU failures are not JSON failures.
+            content = generate_content(candidate_prompt)
+            try:
+                payload = self._normalise_plan_payload(self._parse_json(content))
+                if "base_segments" not in payload:
+                    raise ComposeError("base_segments is required; return a plan instance, not a schema")
+                if self._narrative_plan is not None:
+                    approved = self._narrative_plan.model_dump(mode="json")
+                    for field in ("base_segments", "narration_sections", "voiceovers"):
+                        payload[field] = approved[field]
+                plan = CompositionPlan.model_validate(payload)
+                expected = {
+                    "intro": {"intro"}, "intro_outro": {"intro", "outro"},
+                    "intro_bridge_outro": {"intro", "bridge", "outro"},
+                }.get(self.request.editor.narration, set())
+                missing = expected - {section.position for section in plan.narration_sections}
+                if missing:
+                    raise ComposeError("Missing requested narration_sections: " + ", ".join(sorted(missing))
+                                       + "; each section needs position and non-empty text")
+                if any(not section.text.strip() for section in plan.narration_sections):
+                    raise ComposeError("Every narration_sections text must contain spoken words")
+                return plan
+            except (ComposeError, ValueError, TypeError) as exc:
+                if hasattr(exc, "errors"):
+                    feedback = json.dumps(exc.errors(include_input=False, include_url=False),
+                                          ensure_ascii=False, default=str)
+                else:
+                    feedback = str(exc)
+                errors.append(f"attempt {attempt}: {feedback}")
+                logger.warning("Director validation failed, attempt %s/3: %s", attempt, feedback)
+                candidate_prompt = (compact_prompt or prompt) + (
+                    "\nCORRECTION REQUIRED. Your previous response failed validation. "
+                    "Return a complete corrected plan JSON, not a patch or JSON Schema. "
+                    "Preserve the selected narrative and requested supporting assets; do not remove "
+                    "features merely to avoid validation. For every asset_requests item provide "
+                    "query, numeric start and numeric end. Choose relevant timing from the selected "
+                    "narrative: 0 <= start < end <= the sum of base segment durations. "
+                    "These are BODY output seconds before narration inserts, not source seconds. "
+                    "Correct all listed field errors.\nValidation errors: " + feedback[:6000] +
+                    "\nPrevious response (may be truncated):\n" + content[:14000]
+                )
+        raise ComposeError("Director failed after 3 validation attempts: " + "; ".join(errors))
 
     @staticmethod
     def _parse_json(content: str) -> dict[str, Any]:
@@ -766,7 +811,12 @@ class LocalDirector:
             "graphics use output-timeline seconds. "
             "Use supplementary assets only when they clarify the spoken idea. Do not invent factual claims. "
             "When supporting visuals are allowed and a concrete visual opportunity exists, emit one or more "
-            "asset_requests with query, benefit, confidence, evidence_refs, and must_not_cover. "
+            "asset_requests with REQUIRED query, start, and end; start/end must be numeric BODY "
+            "output seconds satisfying 0 <= start < end <= sum(source_end-source_start). "
+            "For example, an asset item has this shape (choose your own grounded query/timing): "
+            '{"query":"relevant visual subject","start":2.0,"end":5.0,"kind":"video",'
+            '"placement":"picture_in_picture"}. '
+            "Also include benefit, confidence, evidence_refs, and must_not_cover. "
             "When motion graphics are allowed, emit concise graphics entries with kind, start, end, text, "
             "kind is hook/outro/lower_third/quote_card/callout/cta/checklist/stat/timeline/badge. "
             "For checklist/timeline use | separated short labels. For stat use only numbers present in evidence. "
@@ -792,6 +842,10 @@ class LocalDirector:
             f"Media metadata: {json.dumps(media, separators=(',', ':'))}\n"
             f"Timestamped transcript: {json.dumps([{'start':round(float(w['start']),2),'end':round(float(w['end']),2),'text':w.get('word','')} for w in words], ensure_ascii=False)[:14000 if compact else 26000]}\n"
             f"Representative frames: {json.dumps(scene_summary, separators=(',', ':'))}\n"
+            + ("VISUAL DESIGN PASS: base_segments, narration_sections and voiceovers are locked "
+               "to the validated narrative plan supplied in the brief. Do not rewrite them. "
+               "Design graphics, supplementary assets and SFX for that existing narrative.\n"
+               if self._narrative_plan is not None else "") +
             "Choose a small number of high-confidence segments and keep all arrays concise."
         )
 
@@ -821,29 +875,32 @@ class LocalDirector:
         try:
             import requests
 
-            if os.getenv("AI_COMPOSE_LLM_BACKEND", "openai").strip().lower() == "ollama" or endpoint.endswith("/api/chat"):
-                response = requests.post(
-                    endpoint if endpoint.endswith("/api/chat") else f"{endpoint}/api/chat",
-                    json={"model": self._model(), "stream": False, "format": CompositionPlan.model_json_schema(), "messages": [{"role": "user", "content": prompt}]},
-                    timeout=(30, 600),
-                )
-                response.raise_for_status()
-                content = response.json().get("message", {}).get("content", "")
-            else:
-                response = requests.post(
-                    endpoint if endpoint.endswith("/chat/completions") else f"{endpoint}/v1/chat/completions",
-                    json={
-                        "model": self._model(),
-                        "temperature": 0.15,
-                        "messages": [{"role": "system", "content": "Produce only valid JSON."}, {"role": "user", "content": prompt}],
-                        "response_format": {"type": "json_schema", "json_schema": {"name": "composition_plan", "schema": CompositionPlan.model_json_schema(), "strict": True}},
-                    },
-                    timeout=(30, 600),
-                )
-                response.raise_for_status()
-                content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-            plan = CompositionPlan.model_validate(
-                self._normalise_plan_payload(self._parse_json(str(content)))
+            def generate_remote(candidate_prompt: str) -> str:
+                if os.getenv("AI_COMPOSE_LLM_BACKEND", "openai").strip().lower() == "ollama" or endpoint.endswith("/api/chat"):
+                    response = requests.post(
+                        endpoint if endpoint.endswith("/api/chat") else f"{endpoint}/api/chat",
+                        json={"model": self._model(), "stream": False, "format": CompositionPlan.model_json_schema(), "messages": [{"role": "user", "content": candidate_prompt}]},
+                        timeout=(30, 600),
+                    )
+                    response.raise_for_status()
+                    content = response.json().get("message", {}).get("content", "")
+                else:
+                    response = requests.post(
+                        endpoint if endpoint.endswith("/chat/completions") else f"{endpoint}/v1/chat/completions",
+                        json={
+                            "model": self._model(),
+                            "temperature": 0.15,
+                            "messages": [{"role": "system", "content": "Produce only valid JSON."}, {"role": "user", "content": candidate_prompt}],
+                            "response_format": {"type": "json_schema", "json_schema": {"name": "composition_plan", "schema": CompositionPlan.model_json_schema(), "strict": True}},
+                        },
+                        timeout=(30, 600),
+                    )
+                    response.raise_for_status()
+                    content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                return str(content)
+
+            plan = self._generate_valid_plan(
+                generate_remote, prompt, self._prompt(self.request, media, words, frames, compact=True)
             )
             return plan, warnings
         except Exception as exc:
