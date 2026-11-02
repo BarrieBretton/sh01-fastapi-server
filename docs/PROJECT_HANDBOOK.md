@@ -258,3 +258,11 @@ render fixtures on GitHub-hosted runners. This is a finite per-process RSS
 budget, scoped to that CI step; production retains its 256 MiB default.
 Cgroup headroom checks and subprocess timeouts remain enabled. Passing these
 render tests does not establish suitability for a 512 MiB production host.
+
+### Local director cleanup
+
+The Transformers adapter clears model/tokenizer closure references with `None`
+in its `finally` block before garbage collection and CUDA cache cleanup.
+Offline adapter tests cover tensor and mapping chat-template outputs, plain
+tokenization, prompt-token removal, and cleanup after generation failure.
+These tests use fake models and do not establish live GPU inference quality.

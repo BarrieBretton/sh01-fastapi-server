@@ -629,8 +629,9 @@ class LocalDirector:
         try:
             return self._generate_valid_plan(generate_content, prompt, compact_prompt)
         finally:
-            del model
-            del tokenizer
+            # Release captured objects without deleting the generator's bindings.
+            model = None
+            tokenizer = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
