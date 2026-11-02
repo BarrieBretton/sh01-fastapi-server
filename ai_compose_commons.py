@@ -15,6 +15,32 @@ def plain(value):
     return html.unescape(re.sub(r'<[^>]+>', ' ', str(value))).strip()
 
 
+def media_download_url(info, kind):
+    """Prefer a usable thumbnail, otherwise try the independently checked original.
+
+    A populated thumburl is not necessarily an acceptable download endpoint.
+    Keep the media-host restriction; never trust another host merely because
+    the URL appeared in API metadata. Protocol-relative media URLs use HTTPS.
+    """
+    choices = [info.get('thumburl'), info.get('url')] if kind == 'image' else [info.get('url')]
+    for value in choices:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        if value.startswith('//'):
+            value = 'https:' + value
+        try:
+            parsed = urlparse(value)
+            allowed = (parsed.scheme == 'https' and parsed.hostname == 'upload.wikimedia.org'
+                       and parsed.username is None and parsed.password is None
+                       and parsed.port in (None, 443))
+        except ValueError:
+            continue
+        if allowed:
+            return value
+    return None
+
+
 def parse_candidates(payload, kind):
     results = []
     for page in payload.get('query', {}).get('pages', {}).values():
@@ -32,9 +58,8 @@ def parse_candidates(payload, kind):
             continue
         if info.get('size', 0) > 80*1024*1024 or min(info.get('width', 0), info.get('height', 0)) < 240:
             continue
-        url = info.get('thumburl') if kind == 'image' else info.get('url')
-        url = url or info.get('url', '')
-        if urlparse(url).scheme != 'https' or urlparse(url).hostname != 'upload.wikimedia.org':
+        url = media_download_url(info, kind)
+        if not url:
             continue
         results.append({'asset_id':'commons_'+str(page['pageid']), 'source':'wikimedia',
             'title':plain(page.get('title', '')), 'description':get('ImageDescription'),
