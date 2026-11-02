@@ -43,6 +43,7 @@ from ai_compose_schema import (
     SfxEvent,
     VoiceoverPlan,
 )
+from ai_compose_http import USER_AGENT, check_cooldown, observe_response, failure_details
 from ai_compose_ir import EditPlan, camera_for_clip, compile_edit_plan
 from ai_compose_policy import policy_prompt_context, resolve_editorial_policy
 from ai_compose_quality import inspect_edit_plan, inspect_render
@@ -127,8 +128,10 @@ async def _download_async(url: str, destination: Path, *, max_bytes: int | None 
     limit = max_bytes or _max_source_bytes()
     async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
         for _ in range(6):
+            check_cooldown(current)
             _validate_public_url(current)
-            async with client.stream("GET", current, headers={"User-Agent": "SH01-AI-Compose/1.0"}) as response:
+            async with client.stream("GET", current, headers={"User-Agent": USER_AGENT}) as response:
+                observe_response(current, response)
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
                     if not location:
@@ -159,35 +162,40 @@ def _download_sync(url: str, destination: Path, *, max_bytes: int = 512 * 1024 *
         raise ComposeError("requests is required for remote asset downloads") from exc
     current = url
     for _ in range(6):
+        check_cooldown(current)
         _validate_public_url(current)
         response = requests.get(
             current,
-            headers={"User-Agent": "SH01-AI-Compose/1.0"},
+            headers={"User-Agent": USER_AGENT},
             stream=True,
             allow_redirects=False,
             timeout=(20, 180),
         )
-        if response.status_code in {301, 302, 303, 307, 308}:
-            location = response.headers.get("location")
-            if not location:
-                raise ComposeError("Remote asset redirect has no Location header")
-            current = urljoin(current, location)
-            continue
-        response.raise_for_status()
-        declared = response.headers.get("content-length")
-        if declared and int(declared) > max_bytes:
-            raise ComposeError("Remote asset exceeds the configured byte limit")
-        total = 0
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as output:
-            for chunk in response.iter_content(1024 * 1024):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ComposeError("Remote asset exceeds the configured byte limit")
-                output.write(chunk)
-        return
+        try:
+            observe_response(current, response)
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    raise ComposeError("Remote asset redirect has no Location header")
+                current = urljoin(current, location)
+                continue
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared and int(declared) > max_bytes:
+                raise ComposeError("Remote asset exceeds the configured byte limit")
+            total = 0
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as output:
+                for chunk in response.iter_content(1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ComposeError("Remote asset exceeds the configured byte limit")
+                    output.write(chunk)
+            return
+        finally:
+            response.close()
     raise ComposeError("Too many redirects while downloading asset")
 
 
@@ -1015,7 +1023,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest, *, diagnost
                 if matches:
                     break
         except Exception as exc:
-            diagnostics.append({"provider": "wikimedia", "error_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)})
+            diagnostics.append({"provider": "wikimedia", **failure_details(exc, "https://commons.wikimedia.org/w/api.php")})
             logger.warning('Wikimedia search failed: %s', exc)
     if cfg.pexels and os.getenv("PEXELS_API_KEY", "").strip():
         try:
@@ -1145,10 +1153,13 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path,
                 break
             except Exception as exc:
                 report.setdefault("download_decode_errors", []).append({
-                    "asset_id": choice.get("asset_id"), "error_type": type(exc).__name__})
+                    "asset_id": choice.get("asset_id"),
+                    **failure_details(exc, choice.get("download_url"))})
                 warnings.append(f'Candidate rejected for {asset_request.query!r}: {str(exc)[:200]}')
         if candidate is None:
             report["outcome"] = "no_candidates" if not candidates else "no_usable_candidate"
+            if any(e.get("error_type") == "MediaHTTPBackoff" for e in report.get("download_decode_errors", [])):
+                report["outcome"] = "host_cooldown"
             # Cache deterministic empty/score failures; allow transient download retries.
             if not eligible and not report.get("provider_errors") and not any(c.get("asset_id") in used for c in candidates):
                 failed_searches.add(key)

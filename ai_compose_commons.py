@@ -10,6 +10,8 @@ import html
 import re
 from urllib.parse import urlparse
 
+from ai_compose_http import USER_AGENT, check_cooldown, observe_response
+
 
 def plain(value):
     return html.unescape(re.sub(r'<[^>]+>', ' ', str(value))).strip()
@@ -71,14 +73,20 @@ def parse_candidates(payload, kind):
 
 def search(query, kind, limit=8):
     import requests
-    response = requests.get('https://commons.wikimedia.org/w/api.php',
-        headers={'User-Agent':'SH01LocalEditor/2.0 (https://github.com/BarrieBretton/sh01-fastapi-server)'},
+    endpoint = 'https://commons.wikimedia.org/w/api.php'
+    check_cooldown(endpoint)
+    response = requests.get(endpoint,
+        headers={'User-Agent': USER_AGENT},
         params={'action':'query','format':'json','generator':'search',
                 'gsrsearch':query+' filetype:' + ('video' if kind == 'video' else 'bitmap'),
                 'gsrnamespace':6,'gsrlimit':min(20,limit),'prop':'imageinfo',
                 'iiprop':'url|mime|size|extmetadata','iiurlwidth':1280},timeout=(15,40))
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        observe_response(endpoint, response)
+        response.raise_for_status()
+        payload = response.json()
+    finally:
+        response.close()
     if 'error' in payload:
         raise RuntimeError('Commons search: '+str(payload['error'].get('code','unknown error')))
     return parse_candidates(payload,kind)

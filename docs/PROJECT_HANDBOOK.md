@@ -266,3 +266,17 @@ in its `finally` block before garbage collection and CUDA cache cleanup.
 Offline adapter tests cover tensor and mapping chat-template outputs, plain
 tokenization, prompt-token removal, and cleanup after generation failure.
 These tests use fake models and do not establish live GPU inference quality.
+
+### Media download identity and HTTP cooldowns
+
+Search and synchronous/asynchronous media downloads use the same descriptive
+project User-Agent from `ai_compose_http.py`. The operator observed HTTP 429
+with the previous downloader identity and HTTP 200 with this identity on two
+Commons samples; this does not guarantee every download or asset is suitable.
+HTTP 429 and HTTP 503 with Retry-After establish a per-host process-wide
+cooldown, shared across candidates and editor rounds. Requests fail promptly
+during the cooldown rather than sleeping or rotating identities. Missing or
+invalid Retry-After on a 429 defaults to 600 seconds. Restarting the server
+loses this in-memory deadline; operators must still honor the reported delay.
+Retrieval reports record status, host and retry delay without URL queries or
+response bodies. Rebuild the one-cell notebook to embed this module and fix.
