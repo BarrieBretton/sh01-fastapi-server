@@ -39,7 +39,7 @@ class SourceVisionTests(unittest.TestCase):
     def test_missing_frame_invalid_time_and_audio_claims_are_rejected(self):
         invalid = []
         invalid.append({'observations': self.valid['observations'][:1]})
-        for time in (30.0, float('nan'), float('inf'), True, '0'):
+        for time in (30.0, float('nan'), float('inf'), True, None, 'unknown', '1-3s'):
             item = copy.deepcopy(self.valid)
             item['observations'][0]['time'] = time
             invalid.append(item)
@@ -49,6 +49,22 @@ class SourceVisionTests(unittest.TestCase):
             invalid.append(item)
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_source_observations(value, self.frames)
+
+    def test_explicit_timestamp_formats_preserve_frame_evidence(self):
+        for time in ('3.341', '3.341s', '3.341 seconds', '00:03.341', '00:00:03.341'):
+            value = copy.deepcopy(self.valid)
+            value['observations'][0]['time'] = '0'
+            value['observations'][1]['time'] = time
+            with self.subTest(time=time):
+                result = parse_source_observations(value, self.frames)
+                self.assertEqual(result['observations'][1]['time'], 3.341)
+
+    def test_parseable_but_unobserved_times_still_fail(self):
+        for time in ('30s', '00:30', '00:63', 'NaN', '-1', 'frame 2'):
+            value = copy.deepcopy(self.valid)
+            value['observations'][1]['time'] = time
+            with self.subTest(time=time), self.assertRaises(ValueError):
                 parse_source_observations(value, self.frames)
 
     def test_echo_gets_one_correction_and_valid_result_reaches_director(self):

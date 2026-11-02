@@ -62,6 +62,26 @@ def narrative_errors(request, plan, words):
     return errors
 
 
+def frame_timestamp(value, frames):
+    """Parse explicit time representations without guessing missing frame times."""
+    original = value
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r'\d+(?:\.\d+)?\s*(?:s|sec|seconds)?', text, re.I):
+            value = float(re.match(r'\d+(?:\.\d+)?', text)[0])
+        elif re.fullmatch(r'(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?', text):
+            parts = [float(p) for p in text.split(':')]
+            if any(p >= 60 for p in parts[1:]):
+                raise ValueError(f'Invalid clock timestamp: {text!r}')
+            value = sum(p * 60**i for i, p in enumerate(reversed(parts)))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'Frame time must be explicit seconds or a clock timestamp; received {str(original)[:80]!r}')
+    t = float(value)
+    if not math.isfinite(t) or t < 0 or not any(abs(t-f['time']) <= .15 for f in frames):
+        raise ValueError(f'Frame timestamp {str(original)[:80]!r} was not one of the supplied frames')
+    return t
+
+
 def parse_source_observations(value, frames):
     """Source descriptions need frame evidence, not an ungrounded quality score."""
     evidence = value.get('observations') if isinstance(value, dict) else None
@@ -75,12 +95,7 @@ def parse_source_observations(value, frames):
     for item in evidence:
         if not isinstance(item, dict):
             raise ValueError('Each source observation must be an object')
-        raw_time = item.get('time')
-        if isinstance(raw_time, bool) or not isinstance(raw_time, (int, float)):
-            raise ValueError('Source observation time must be a numeric supplied frame timestamp')
-        t = float(raw_time)
-        if not math.isfinite(t) or not any(abs(t-f['time']) <= .15 for f in frames):
-            raise ValueError('Source observation timestamp was not one of the supplied frames')
+        t = frame_timestamp(item.get('time'), frames)
         description = item.get('description')
         if not isinstance(description, str) or not 12 <= len(description.strip()) <= 600:
             raise ValueError('Each source frame needs a concrete visible description of 12-600 characters')
@@ -110,9 +125,7 @@ def parse_visual_review(value, frames, threshold):
     for obs in evidence:
         if not isinstance(obs, dict) or obs.get('category') not in allowed:
             raise ValueError('Review category must describe visible pixels, not audio or temporal transitions')
-        t = float(obs['time'])
-        if not math.isfinite(t) or not any(abs(t-f['time']) <= .15 for f in frames):
-            raise ValueError('Review timestamp was not one of the supplied frames')
+        t = frame_timestamp(obs.get('time'), frames)
         description = str(obs.get('observation','')).strip()
         action = str(obs.get('action','')).strip()
         if not description or not isinstance(obs.get('problem'), bool):

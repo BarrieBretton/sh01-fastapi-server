@@ -269,6 +269,13 @@ These tests use fake models and do not establish live GPU inference quality.
 
 ### Source vision evidence correction (3 November 2026)
 
+Timestamp compatibility follow-up: explicit numeric strings, seconds suffixes and
+MM:SS/HH:MM:SS timestamps are accepted by source and draft vision validation.
+Missing, ambiguous, negative, non-finite and unobserved times remain invalid.
+Prompts list the exact sampled times, and errors include the rejected time value.
+Job `77aa4350f4aa1d576f1dff6d219fc855` reported a rejected timestamp type; its raw
+model response was not supplied, so its exact representation is unverified.
+
 **Observed:** the uploaded diagnostics for job `7f9a4c4b1a01d427cb0ac32b0365e15e`
 contained 174 ASR words from the correct 36.8-second military source. Narrative
 planning failed before any render. The archive did not include the raw director
