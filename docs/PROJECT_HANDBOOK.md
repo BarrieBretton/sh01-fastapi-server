@@ -242,3 +242,11 @@ audits. See [setup and limitations](CODE_QUALITY.md).
 Execution status remains unverified until GitHub Actions completes successfully.
 Tests run on GitHub-hosted runners; local company-PC execution is not required.
 Dependabot activation requires its configuration on the default branch.
+
+### Portable one-cell notebook generation
+
+The one-cell builder and CI consistency check read text explicitly as UTF-8.
+Generated Python and notebook files use UTF-8 and LF, independent of the Windows
+locale. Rebuild both artifacts with `python scripts/build_one_cell.py` after
+source changes; CI still rejects any difference in decoded notebook/Python code.
+Regression tests simulate Windows-1252 defaults and verify Unicode and LF output.

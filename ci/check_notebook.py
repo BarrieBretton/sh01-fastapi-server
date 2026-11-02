@@ -13,8 +13,8 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-source = (ROOT / 'notebooks/sh01_full_editor_one_cell.py').read_text()
-notebook = json.loads((ROOT / 'notebooks/sh01_full_editor_one_cell.ipynb').read_text())
+source = (ROOT / 'notebooks/sh01_full_editor_one_cell.py').read_text(encoding='utf-8')
+notebook = json.loads((ROOT / 'notebooks/sh01_full_editor_one_cell.ipynb').read_text(encoding='utf-8'))
 assert source == ''.join(c['source'] if isinstance(c['source'], str) else ''.join(c['source'])
                          for c in notebook['cells'] if c['cell_type'] == 'code'), 'Notebook/Python differ'
 import nbformat
@@ -32,7 +32,7 @@ with zipfile.ZipFile(io.BytesIO(raw)) as archive:
     assert sorted(archive.namelist()) == sorted(FILES), 'Bundled module inventory differs'
     for name in FILES:
         embedded = archive.read(name).decode().replace('\r\n', '\n')
-        assert embedded == (ROOT / name).read_text(), f'Stale embedded module: {name}'
+        assert embedded == (ROOT / name).read_text(encoding='utf-8'), f'Stale embedded module: {name}'
 # Replace generated assignments by template placeholders, then compare setup code.
 lines = source.splitlines(keepends=True)
 for name, replacement in sorted([('BUNDLE', "BUNDLE = '__SOURCE_BUNDLE__'\n"),
@@ -40,7 +40,7 @@ for name, replacement in sorted([('BUNDLE', "BUNDLE = '__SOURCE_BUNDLE__'\n"),
                                 key=lambda pair: assignments[pair[0]].lineno, reverse=True):
     node = assignments[name]
     lines[node.lineno - 1:node.end_lineno] = [replacement]
-expected = (ROOT / 'scripts/kaggle_one_cell_template.py').read_text().replace(
-    '# __ENVIRONMENT_BOOTSTRAP__', (ROOT / 'scripts/kaggle_bootstrap.py').read_text())
+expected = (ROOT / 'scripts/kaggle_one_cell_template.py').read_text(encoding='utf-8').replace(
+    '# __ENVIRONMENT_BOOTSTRAP__', (ROOT / 'scripts/kaggle_bootstrap.py').read_text(encoding='utf-8'))
 assert ''.join(lines) == expected, 'Stale bootstrap/template; run python scripts/build_one_cell.py'
 print('Notebook schema, template, hash, and all embedded modules match.')
