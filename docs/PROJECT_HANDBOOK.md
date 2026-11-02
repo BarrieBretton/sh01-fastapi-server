@@ -267,6 +267,28 @@ Offline adapter tests cover tensor and mapping chat-template outputs, plain
 tokenization, prompt-token removal, and cleanup after generation failure.
 These tests use fake models and do not establish live GPU inference quality.
 
+### Source vision evidence correction (3 November 2026)
+
+**Observed:** the uploaded diagnostics for job `7f9a4c4b1a01d427cb0ac32b0365e15e`
+contained 174 ASR words from the correct 36.8-second military source. Narrative
+planning failed before any render. The archive did not include the raw director
+responses, so the rejected placement token cannot be recovered from it. Separately,
+source vision echoed the prompt's description placeholder and assigned 0.9; the
+old source branch accepted that string as evidence.
+
+**Code:** source vision now returns descriptions tied to supplied frame timestamps.
+`parse_source_observations` requires coverage of every supplied frame and rejects
+missing descriptions, the observed placeholder, invalid timestamps and unsupported
+audio-quality assessments. One correction attempt is allowed. Source descriptions
+do not carry a quality score; validated observations form the director's visual
+context. Draft-output scoring remains separate. Optional vision can report
+unavailable evidence; required vision still stops on invalid evidence.
+
+**Validation:** regressions replay the uploaded placeholder response, exercise its
+correction, and check per-frame coverage and the existing output-review path. They
+establish structural checks, not the truth of a VLM description. Actual Kaggle
+inference and final video quality remain to be verified.
+
 ### Media download identity and HTTP cooldowns
 
 Search and synchronous/asynchronous media downloads use the same descriptive

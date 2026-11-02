@@ -62,6 +62,41 @@ def narrative_errors(request, plan, words):
     return errors
 
 
+def parse_source_observations(value, frames):
+    """Source descriptions need frame evidence, not an ungrounded quality score."""
+    evidence = value.get('observations') if isinstance(value, dict) else None
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError('Source analysis needs timestamped observations, not a score or revision template')
+    placeholders = {
+        'timestamped visible subjects actions readable text and suggested safe overlay regions',
+        'specific visible fact', 'describe what is visible', 'visible subjects and actions',
+    }
+    checked = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            raise ValueError('Each source observation must be an object')
+        raw_time = item.get('time')
+        if isinstance(raw_time, bool) or not isinstance(raw_time, (int, float)):
+            raise ValueError('Source observation time must be a numeric supplied frame timestamp')
+        t = float(raw_time)
+        if not math.isfinite(t) or not any(abs(t-f['time']) <= .15 for f in frames):
+            raise ValueError('Source observation timestamp was not one of the supplied frames')
+        description = item.get('description')
+        if not isinstance(description, str) or not 12 <= len(description.strip()) <= 600:
+            raise ValueError('Each source frame needs a concrete visible description of 12-600 characters')
+        description = description.strip()
+        if normalized(description) in placeholders:
+            raise ValueError('Source description repeats a placeholder; describe the actual frame')
+        if re.search(r'\b(audio|audible|inaudible|background noise|sound quality|voice quality|music volume)\b', description, re.I):
+            raise ValueError('Source stills cannot establish audio quality; describe visible evidence only')
+        checked.append({'time': t, 'description': description})
+    if any(not any(abs(o['time']-f['time']) <= .15 for o in checked) for f in frames):
+        raise ValueError('Source analysis must describe every supplied frame')
+    return {'performed': True, 'observations': checked, 'issues': [],
+            'revision': '\n'.join(f"{o['time']:.2f}s: {o['description']}" for o in checked),
+            'scope': 'sampled source stills; no audio, motion or quality score assessment'}
+
+
 def parse_visual_review(value, frames, threshold):
     """Require timestamped visual observations; reject unsupported audio scoring."""
     score = float(value['score'])
