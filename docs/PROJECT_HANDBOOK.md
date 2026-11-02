@@ -215,3 +215,20 @@ documented in `docs/SUPABASE_REPLICA_RUNBOOK.md`. The changes require Worker
 deployment, D1 seed and a working database subscription; merely deploying the
 Python files does not activate database failover. One B2 bucket remains a
 single point of failure.
+
+
+### Integrated notebook editor: measured narration sections (2 November 2026)
+
+**Code:** The follow-up to feature commit `fed2f61` adds `ai_compose_sections.py`,
+`ai_compose_commons.py`, and `ai_compose_kaggle.py`. The existing composition route
+supports measured intro/bridge/outro slots, source-audio gains, cue remapping,
+required audio/visual features, and key-free Commons retrieval. The optional
+`--allow-empty` flag on `media_transcribe.py` is used only by the composition
+worker; its existing callers retain strict empty-transcript behavior.
+
+**Observed locally:** Real FFmpeg tests verify inserted durations, dialogue and
+narration separation, caption timing, overlays, motion graphics and audio mixing.
+**Unverified:** Live Kaggle GPU inference, model downloads, provider responses and
+user-footage quality. No production queue, caption endpoint, infrastructure
+selection or cloud deployment was modified. See `ONE_CELL_EDITOR_README.md` for
+configuration and the reproducible single-cell notebook build.

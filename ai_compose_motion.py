@@ -23,6 +23,9 @@ def clock(value):
 def map_words(words, segments):
     result, cursor = [], 0.0
     for segment in segments:
+        if getattr(segment, 'kind', 'source') == 'narration':
+            cursor += segment.source_end-segment.source_start
+            continue
         for word in words:
             a, b = float(word["start"]), float(word["end"])
             if a >= segment.source_start and a < segment.source_end:
@@ -85,6 +88,24 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
     for cue in edit_plan.graphics:
         # Fitted card text: long text wraps and shrinks, never silently truncates.
         text = escape(cue.text)
+        if cue.reason in {'intro_narration','bridge_narration','outro_narration'}:
+            # Dedicated title composition, with large typography and restrained
+            # vector movement. It occupies its own silent-base narration slot.
+            ms = int((cue.end-cue.start)*1000)
+            section = {'intro_narration':'CONTEXT','bridge_narration':'THE CONNECTION',
+                       'outro_narration':'THE TAKEAWAY'}[cue.reason]
+            rect(cue.start,cue.end,0,0,1080,1920,'&H002C1B10',layer=1)
+            rect(cue.start,cue.end,760,-120,420,2160,theme,
+                 f'\\1a&HED\\frz-12\\t(0,{ms},\\frz-6)',2)
+            for i in range(6):
+                rect(cue.start,cue.end,100,1160+i*36,880,2,theme,
+                     f'\\1a&HD8\\fscx40\\t(0,{ms},\\fscx100)',2)
+            rect(cue.start,cue.end,100,570,90,8,theme,'\\fad(120,120)',5)
+            event(6,cue.start,cue.end,'\\an7\\pos(100,490)\\fs30\\fsp5\\bord0'+f'\\1c{theme}\\fad(160,120)',section)
+            wrapped=textwrap.wrap(text,19,break_long_words=True)
+            event(7,cue.start,cue.end,'\\an7\\move(100,690,100,640,0,320)\\fs88\\bord0\\fad(160,120)',r'\N'.join(wrapped))
+            counts['graphics_rendered'] += 1
+            continue
         labels = [part.strip() for part in text.split('|') if part.strip()]
         if cue.kind in {'checklist', 'timeline'} and len(labels) <= 5 and all(len(label)<=43 for label in labels):
             y = 220 if cue.placement in {'top','upper_left'} else 1000

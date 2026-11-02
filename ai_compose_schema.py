@@ -16,6 +16,7 @@ class AssetSourceConfig(BaseModel):
     pixabay: bool = True
     unsplash: bool = False
     freesound: bool = False
+    wikimedia: bool = False  # public metadata API; no provider key
     max_candidates_per_query: int = Field(default=8, ge=1, le=20)
 
 
@@ -74,6 +75,10 @@ class EditorOptions(BaseModel):
     max_planning_windows: int = Field(default=24, ge=1, le=60)
     visual_review_required: bool = False
     publish_outputs: bool = False
+    narration: Literal["off", "auto", "intro", "intro_outro", "intro_bridge_outro"] = "off"
+    narration_budget_seconds: float = Field(default=12.0, ge=2.0, le=60.0)
+    transition: Literal["auto", "cut", "dissolve", "swipe", "match"] = "auto"
+    required_features: list[Literal["voiceover", "sfx", "music", "camera_motion", "transitions", "graphics", "supplementary_media", "captions"]] = Field(default_factory=list, max_length=8)
 
 
 class AIComposeRequest(BaseModel):
@@ -140,6 +145,8 @@ class BaseSegment(BaseModel):
     source_end: float = Field(gt=0.0)
     reason: str = Field(default="selected_by_director", max_length=500)
     score: float | None = None
+    kind: Literal["source", "narration"] = "source"
+    audio_gain: float = Field(default=1.0, ge=0.0, le=2.0)
 
     @model_validator(mode="after")
     def validate_range(self) -> "BaseSegment":
@@ -187,6 +194,15 @@ class VoiceoverPlan(BaseModel):
     volume: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
+class NarrationSection(BaseModel):
+    """Inserted narration; duration is measured from synthesized audio, never guessed."""
+
+    position: Literal["intro", "bridge", "outro"]
+    text: str = Field(min_length=1, max_length=600)
+    after_segment: int | None = Field(default=None, ge=0, le=59)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=12)
+
+
 class GraphicPlan(BaseModel):
     """A model-directed text/graphic cue rendered by the compositor."""
 
@@ -216,6 +232,8 @@ class CompositionPlan(BaseModel):
     asset_requests: list[AssetRequest] = Field(default_factory=list, max_length=12)
     sfx_events: list[SfxEvent] = Field(default_factory=list, max_length=24)
     voiceovers: list[VoiceoverPlan] = Field(default_factory=list, max_length=3)
+    narration_sections: list[NarrationSection] = Field(default_factory=list, max_length=3)
+    transition_style: Literal["cut", "dissolve", "swipe", "match"] | None = None
     graphics: list[GraphicPlan] = Field(default_factory=list, max_length=24)
     captions_enabled: bool = True
     director_notes: list[str] = Field(default_factory=list, max_length=20)
@@ -252,5 +270,3 @@ class AIComposePlan(BaseModel):
     edit_plan: dict[str, Any] = Field(default_factory=dict)
     quality_review: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, Any] = Field(default_factory=dict)
-
-

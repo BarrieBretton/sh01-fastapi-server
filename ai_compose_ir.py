@@ -16,6 +16,8 @@ from ai_compose_schema import AIComposeRequest, CompositionPlan, ResolvedLayer
 
 
 class SourceClip(BaseModel):
+    kind: Literal["source", "narration"] = "source"
+    audio_gain: float = Field(default=1.0, ge=0.0, le=2.0)
     source_start: float = Field(ge=0.0)
     source_end: float = Field(gt=0.0)
     program_start: float = Field(ge=0.0)
@@ -108,12 +110,12 @@ class EditPlan(BaseModel):
 
     schema_version: Literal["sh01/ai-edit@2"] = "sh01/ai-edit@2"
     duration: float = Field(gt=0.0)
-    source_clips: list[SourceClip] = Field(min_length=1, max_length=60)
-    camera_tracks: list[CameraTrack] = Field(default_factory=list, max_length=60)
-    visual_layers: list[VisualLayerSpec] = Field(default_factory=list, max_length=24)
-    graphics: list[GraphicCue] = Field(default_factory=list, max_length=24)
-    audio_cues: list[AudioCue] = Field(default_factory=list, max_length=60)
-    transitions: list[TransitionSpec] = Field(default_factory=list, max_length=60)
+    source_clips: list[SourceClip] = Field(min_length=1, max_length=64)
+    camera_tracks: list[CameraTrack] = Field(default_factory=list, max_length=64)
+    visual_layers: list[VisualLayerSpec] = Field(default_factory=list, max_length=64)
+    graphics: list[GraphicCue] = Field(default_factory=list, max_length=128)
+    audio_cues: list[AudioCue] = Field(default_factory=list, max_length=96)
+    transitions: list[TransitionSpec] = Field(default_factory=list, max_length=64)
     captions_enabled: bool = True
     style_profile: str = "clean_editorial"
     variant: int = Field(default=1, ge=1, le=12)
@@ -187,6 +189,8 @@ def compile_edit_plan(
     for index, segment in enumerate(plan.base_segments):
         duration = max(0.05, segment.source_end - segment.source_start)
         clip = SourceClip(
+            kind=segment.kind,
+            audio_gain=segment.audio_gain,
             source_start=segment.source_start,
             source_end=segment.source_end,
             program_start=cursor,
@@ -195,7 +199,7 @@ def compile_edit_plan(
             evidence_refs=[f"source_segment_{index}"],
         )
         source_clips.append(clip)
-        track = _camera_track(cursor, cursor + duration, camera_mode, index, variant, segment.reason)
+        track = None if segment.kind == 'narration' else _camera_track(cursor, cursor + duration, camera_mode, index, variant, segment.reason)
         if track:
             if request.editor.enabled:
                 anchors = [w for w in words if segment.source_start+.4 < w['end'] < segment.source_end-.4
@@ -206,11 +210,16 @@ def compile_edit_plan(
                     track.motivation = 'phrase_boundary:' + str(chosen['word'])[:100]
             camera_tracks.append(track)
         if index:
+            chosen = request.editor.transition if request.editor.enabled else 'auto'
+            if chosen == 'auto':
+                chosen = plan.transition_style or ('dissolve' if policy.editing_intensity == 'cinematic' else 'cut')
+            if request.editor.enabled and 'transitions' in request.editor.required_features and chosen == 'cut':
+                chosen = 'dissolve'
             transitions.append(
                 TransitionSpec(
                     at=cursor,
-                    kind="dissolve" if policy.editing_intensity == "cinematic" else "cut",
-                    duration=0.18 if policy.editing_intensity == "cinematic" else 0.0,
+                    kind=chosen,
+                    duration=min(.18, duration/3, (plan.base_segments[index-1].source_end-plan.base_segments[index-1].source_start)/3) if chosen != 'cut' else 0.0,
                     reason="source_segment_boundary",
                 )
             )
@@ -285,8 +294,11 @@ def compile_edit_plan(
             )
 
     audio_cues: list[AudioCue] = []
-    if media.get("has_audio") and policy.source_audio != "mute":
-        audio_cues.append(AudioCue(kind="source_dialogue", at=0.0, duration=cursor, reason="preserve_source_audio"))
+    if media.get("has_audio") and policy.source_audio not in {"mute", "replace"}:
+        for clip in source_clips:
+            if clip.kind == 'source' and clip.audio_gain > 0:
+                audio_cues.append(AudioCue(kind="source_dialogue", at=clip.program_start,
+                    duration=clip.program_end-clip.program_start, gain=clip.audio_gain, reason="preserve_source_audio"))
     for event in plan.sfx_events:
         audio_cues.append(AudioCue(kind="sfx", at=event.at, gain=event.volume, label=event.kind, reason=event.reason))
     for voiceover in plan.voiceovers:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def transcribe(audio: Path, language: str | None) -> list[dict]:
+def transcribe(audio: Path, language: str | None, *, allow_empty: bool = False) -> list[dict]:
     from faster_whisper import WhisperModel
 
     model = WhisperModel(
@@ -29,16 +29,16 @@ def transcribe(audio: Path, language: str | None) -> list[dict]:
         for segment in segments for w in segment.words or []
         if str(w.word or "").strip() and w.start is not None and w.end is not None
     ]
-    if not words:
+    if not words and not allow_empty:
         raise RuntimeError("faster-whisper returned no word timestamps")
     return words
 
 
 def main() -> None:
-    if len(sys.argv) != 4:
-        raise SystemExit("usage: python -m media_transcribe AUDIO OUTPUT LANGUAGE")
-    audio, output, language = sys.argv[1:]
-    Path(output).write_text(json.dumps(transcribe(Path(audio), language or None)), encoding="utf-8")
+    if len(sys.argv) not in {4,5} or (len(sys.argv) == 5 and sys.argv[4] != '--allow-empty'):
+        raise SystemExit("usage: python -m media_transcribe AUDIO OUTPUT LANGUAGE [--allow-empty]")
+    audio, output, language = sys.argv[1:4]
+    Path(output).write_text(json.dumps(transcribe(Path(audio), language or None, allow_empty=len(sys.argv)==5)), encoding="utf-8")
 
 
 if __name__ == "__main__":

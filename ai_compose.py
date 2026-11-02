@@ -246,8 +246,12 @@ async def ai_compose_capabilities(x_api_key: str | None = Header(default=None, a
         "workflow": "sh01/ai-compose@1",
         "local_director": bool(os.getenv("AI_COMPOSE_HF_MODEL", "").strip() or os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
         "local_director_url_configured": bool(os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
-        "asset_sources": {"local_library": True, "pexels": bool(os.getenv("PEXELS_API_KEY", "")), "pixabay": bool(os.getenv("PIXABAY_API_KEY", "")), "unsplash": bool(os.getenv("UNSPLASH_ACCESS_KEY", "")), "freesound": bool(os.getenv("FREESOUND_API_KEY", ""))},
+        "asset_sources": {"local_library": True, "wikimedia": True, "pexels": bool(os.getenv("PEXELS_API_KEY", "")), "pixabay": bool(os.getenv("PIXABAY_API_KEY", "")), "unsplash": bool(os.getenv("UNSPLASH_ACCESS_KEY", "")), "freesound": bool(os.getenv("FREESOUND_API_KEY", ""))},
         "features": [
+            "measured-narration-sections",
+            "section-source-audio-control",
+            "required-audio-visual-features",
+            "key-free-commons-retrieval",
             "automatic-editor-v1",
             "kinetic-captions",
             "vector-cards-checklists-timelines",
@@ -302,4 +306,3 @@ async def get_ai_compose_file(job_id: str, filename: str, x_api_key: str | None 
     if not path.is_relative_to(root) or not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="AI compose file not found")
     return FileResponse(path, media_type="video/mp4", filename=filename)
-

@@ -185,3 +185,13 @@ an additional caption endpoint. A future Remotion/HyperFrames worker can
 consume the same versioned `EditPlan`; the current server already has a real
 rendered baseline instead of a receipt-only placeholder.
 
+
+
+## Single-cell integrated editor
+
+See [ONE_CELL_EDITOR_README.md](ONE_CELL_EDITOR_README.md) and
+`notebooks/sh01_full_editor_one_cell.ipynb` for the self-contained Kaggle runner.
+It uses the same local API with measured narration sections and explicit required
+features. Source dialogue stays in source clips; generated speech occupies its
+own slots. Commons retrieval and procedural audio support a key-free run.
+Motion graphics use FFmpeg/libass; a Remotion runtime is not included.

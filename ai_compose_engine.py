@@ -287,7 +287,7 @@ def transcribe_chunked(source: Path, source_start: float, duration: float, langu
         extract_audio(source, source_start + float(offset), chunk_duration, audio)
         output.unlink(missing_ok=True)
         result = _run(
-            [sys.executable, "-m", "media_transcribe", str(audio), str(output), language or ""],
+            [sys.executable, "-m", "media_transcribe", str(audio), str(output), language or "", "--allow-empty"],
             max(900, int(chunk_duration * 12) + 180),
             "isolated Whisper transcription",
         )
@@ -696,10 +696,12 @@ class LocalDirector:
             value["director_notes"] = [json.dumps(value["director_notes"], ensure_ascii=False)]
 
         # Apply the same safe singleton-to-list coercion to plan collections.
-        for field in ("base_segments", "asset_requests", "sfx_events", "voiceovers", "graphics"):
+        for field in ("base_segments", "asset_requests", "sfx_events", "voiceovers", "graphics", "narration_sections"):
             if isinstance(value.get(field), dict):
                 value[field] = [value[field]]
             elif isinstance(value.get(field), str):
+                value[field] = []
+            elif value.get(field,[]) is None:
                 value[field] = []
 
         for item in value.get("asset_requests", []):
@@ -751,7 +753,7 @@ class LocalDirector:
         output_contract = (
             "Return one concrete JSON object, not a JSON Schema. Top-level keys are "
             "schema_version, title, hook_text, outro_text, base_segments, asset_requests, "
-            "sfx_events, voiceovers, graphics, captions_enabled, and director_notes. "
+            "sfx_events, voiceovers, narration_sections, transition_style, graphics, captions_enabled, and director_notes. "
             "base_segments is REQUIRED and must be a non-empty array. Each item must "
             "contain source_start and source_end. Use empty arrays when optional features "
             "are not needed. Never output $defs, properties, required, definitions, "
@@ -776,6 +778,17 @@ class LocalDirector:
             f"{policy_prompt_context(policy)}\n"
             f"Brief: {request.brief}\nPreset: {request.preset}\nTarget output seconds: {request.target_seconds}\n"
             f"Voiceover mode: {request.voiceover.mode}\nSFX mode: {request.sfx.mode}\n"
+            f"Inserted narration mode: {request.editor.narration}; total speech plus pauses budget: {request.editor.narration_budget_seconds}s. "
+            "When inserted narration is enabled, leave voiceovers empty and provide narration_sections: "
+            '[{"position":"intro","text":"short evidence-grounded hook","evidence_refs":["source:0-3"]}, '
+            '{"position":"bridge","after_segment":0,"text":"short grounded connection"}, '
+            '{"position":"outro","text":"short grounded takeaway"}]. '
+            "Include only the positions requested by mode; auto may omit unnecessary narration. "
+            "Use at most 5-8 words per section, no invented facts. These are inserted BETWEEN source excerpts, "
+            "never spoken over source dialogue. For a bridge select at least two meaningful base_segments. "
+            "All other cue times refer to the BODY before these inserts. Base segments must have kind=source. "
+            f"Required actual features: {request.editor.required_features}. "
+            "Choose transition_style cut/dissolve/swipe/match appropriate to the brief.\n"
             f"Media metadata: {json.dumps(media, separators=(',', ':'))}\n"
             f"Timestamped transcript: {json.dumps([{'start':round(float(w['start']),2),'end':round(float(w['end']),2),'text':w.get('word','')} for w in words], ensure_ascii=False)[:14000 if compact else 26000]}\n"
             f"Representative frames: {json.dumps(scene_summary, separators=(',', ':'))}\n"
@@ -906,6 +919,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
         (cfg.pexels and bool(os.getenv("PEXELS_API_KEY", "").strip()))
         or (cfg.pixabay and bool(os.getenv("PIXABAY_API_KEY", "").strip()))
         or (cfg.unsplash and kind == "image" and bool(os.getenv("UNSPLASH_ACCESS_KEY", "").strip()))
+        or cfg.wikimedia
     )
     if not configured:
         return []
@@ -915,6 +929,19 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
         raise ComposeError("requests is required for remote asset search") from exc
     results: list[dict[str, Any]] = []
     limit = cfg.max_candidates_per_query
+    if cfg.wikimedia:
+        try:
+            from ai_compose_commons import search
+            queries = list(dict.fromkeys([query, ' '.join(_keywords(query, 3))]))
+            for candidate_query in queries:
+                matches = search(candidate_query, kind, limit)
+                for candidate in matches:
+                    candidate['score'] = _score_candidate(query, candidate)
+                results.extend(matches)
+                if matches:
+                    break
+        except Exception as exc:
+            logger.warning('Wikimedia search failed: %s', exc)
     if cfg.pexels and os.getenv("PEXELS_API_KEY", "").strip():
         try:
             endpoint = "https://api.pexels.com/videos/search" if kind == "video" else "https://api.pexels.com/v1/search"
@@ -1002,27 +1029,34 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
         if request.fetch_assets:
             candidates.extend(_search_remote(asset_request.query, asset_request.kind, request))
         candidates.sort(key=lambda item: (item.get("asset_id") in used, -float(item.get("score", 0.0))))
-        candidate = next((item for item in candidates if item.get("asset_id") not in used), None)
-        if not candidate:
-            warnings.append(f"No asset found for query: {asset_request.query}")
+        eligible = [c for c in candidates if c.get('asset_id') not in used
+                    and float(c.get('score',0) or 0) >= minimum_score][:3]
+        candidate = None
+        for attempt, choice in enumerate(eligible):
+            try:
+                local_path = Path(str(choice['local_path'])) if choice.get('local_path') else asset_root / (
+                    f'asset_{index:02d}_{attempt}' + _safe_filename(str(choice.get('download_url') or ''),
+                    '.mp4' if asset_request.kind == 'video' else '.jpg'))
+                if choice.get('download_url'):
+                    _download_sync(str(choice['download_url']),local_path)
+                if not local_path.is_file() or not local_path.stat().st_size:
+                    raise ComposeError('Asset file is missing or empty')
+                if asset_request.kind == 'image':
+                    from PIL import Image
+                    with Image.open(local_path) as picture:
+                        picture.verify()
+                else:
+                    probe_media(local_path)
+                candidate = choice
+                break
+            except Exception as exc:
+                warnings.append(f'Candidate rejected for {asset_request.query!r}: {str(exc)[:200]}')
+        if candidate is None:
+            warnings.append(f'No usable relevant asset for {asset_request.query!r}; score floor {minimum_score:.3f}')
             continue
-        candidate_score = float(candidate.get("score", 0.0) or 0.0)
-        if candidate_score < minimum_score:
-            warnings.append(
-                f"Asset skipped for query {asset_request.query!r}: "
-                f"best semantic score {candidate_score:.3f} < {minimum_score:.3f}"
-            )
-            continue
-        used.add(str(candidate.get("asset_id")))
+        candidate_score = float(candidate.get('score',0) or 0)
+        used.add(str(candidate['asset_id']))
         try:
-            local_path = Path(str(candidate.get("local_path"))) if candidate.get("local_path") else asset_root / f"asset_{index:02d}{_safe_filename(str(candidate.get('download_url') or ''), '.mp4' if asset_request.kind == 'video' else '.jpg')}"
-            if candidate.get("download_url"):
-                awaitable = _download_sync
-                awaitable(str(candidate["download_url"]), local_path)
-            elif not local_path.exists():
-                raise ComposeError("Local asset disappeared before rendering")
-            if not local_path.exists() or local_path.stat().st_size == 0:
-                raise ComposeError("Downloaded asset is empty")
             x, y, width, height = _placement(asset_request)
             layer = ResolvedLayer(
                 asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=asset_request.animation, animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=candidate_score, reason=asset_request.reason,
@@ -1347,6 +1381,7 @@ def render_composition(
     variant: int,
     warnings: list[str],
     edit_plan: EditPlan | None = None,
+    prepared_voiceovers: list | None = None,
 ) -> dict[str, Any]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -1371,7 +1406,10 @@ def render_composition(
     video_input_count = len(segments)
     input_index = 0
     for segment in segments:
-        command += ["-ss", f"{segment.source_start:.3f}", "-t", f"{segment.source_end - segment.source_start:.3f}", "-i", str(source)]
+        if segment.kind == 'narration':
+            command += ['-f','lavfi','-i',f'color=c=0x101b2c:s={request.output_width}x{request.output_height}:r={request.fps}:d={segment.source_end-segment.source_start:.6f}']
+        else:
+            command += ["-ss", f"{segment.source_start:.3f}", "-t", f"{segment.source_end - segment.source_start:.3f}", "-i", str(source)]
         input_index += 1
     layer_indices: list[tuple[ResolvedLayer, int]] = []
     for layer in layers:
@@ -1379,7 +1417,12 @@ def render_composition(
         command += (["-stream_loop", "-1", "-i", str(path)] if _is_video(path) else ["-loop", "1", "-i", str(path)])
         layer_indices.append((layer, input_index))
         input_index += 1
-    audio_inputs = _build_audio_inputs(request, plan, root, warnings)
+    if prepared_voiceovers is None:
+        audio_inputs = _build_audio_inputs(request, plan, root, warnings)
+    else:
+        music_sfx_request = request.model_copy(deep=True)
+        music_sfx_request.voiceover.mode = 'off'
+        audio_inputs = _build_audio_inputs(music_sfx_request, plan, root, warnings) + prepared_voiceovers
     voice_inputs = [item for item in audio_inputs if item[3] == 'voiceover']
     if request.editor.enabled and voice_inputs:
         import wave
@@ -1392,13 +1435,17 @@ def render_composition(
             if request.captions_enabled and plan.captions_enabled and request.editor.caption_style != 'off':
                 voice_root = root/f'voice_words_{index}'
                 voice_root.mkdir(exist_ok=True)
-                for word in transcribe_chunked(path,0,voice_duration,request.language,voice_root):
+                transcribed_voice = transcribe_chunked(path,0,voice_duration,request.language,voice_root)
+                if not transcribed_voice:
+                    raise ComposeError('Generated narration could not be transcribed for required captions')
+                for word in transcribed_voice:
                     voice_words.append(dict(word,start=word['start']+at,end=word['end']+at))
-        if voice_words and (not words or edit_plan.policy.get('source_audio') in {'mute','replace'}):
+        if voice_words:
             # Voiceover timestamps already use program time, unlike source ASR.
             caption_plan = plan.model_copy(update={'base_segments':[BaseSegment(source_start=0,source_end=duration)]})
-            from ai_compose_motion import write_motion_ass
-            motion_counts = write_motion_ass(ass, request, caption_plan, edit_plan, voice_words)
+            from ai_compose_motion import write_motion_ass, map_words
+            body_words = map_words(words, segments) if edit_plan.policy.get('source_audio') not in {'mute','replace'} else []
+            motion_counts = write_motion_ass(ass, request, caption_plan, edit_plan, sorted(body_words+voice_words, key=lambda w:w['start']))
     audio_indices: list[tuple[Path, float, float, str, int]] = []
     for path, at, volume, kind in audio_inputs:
         command += (["-stream_loop", "-1"] if kind == 'music' else []) + ["-i", str(path)]
@@ -1426,8 +1473,10 @@ def render_composition(
             visual_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}"
         filters.append(f"[{i}:v]{visual_filter},setsar=1,setpts=PTS-STARTPTS[vseg{i}]")
         base_video_labels.append(f"[vseg{i}]")
-        if media.get("has_audio"):
-            filters.append(f"[{i}:a]aresample=48000,atrim=duration={d:.3f},asetpts=PTS-STARTPTS[aseg{i}]")
+        if segment.kind == 'narration':
+            filters.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={d:.6f},asetpts=PTS-STARTPTS[aseg{i}]")
+        elif media.get("has_audio"):
+            filters.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,volume={segment.audio_gain:.4f},apad,atrim=duration={d:.6f},asetpts=PTS-STARTPTS[aseg{i}]")
         else:
             filters.append(f"[{silence_index}:a]atrim=duration={d:.3f},asetpts=PTS-STARTPTS[aseg{i}]")
         base_audio_labels.append(f"[aseg{i}]")
@@ -1556,6 +1605,13 @@ def render_composition(
         filters.append("".join(mix_labels) + f"amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0,aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
 
     codec, codec_flags = _choose_encoder()
+    if codec == 'libx264':
+        if request.editor.enabled:
+            preset = os.getenv('AI_COMPOSE_X264_PRESET','veryfast')
+            if preset not in {'ultrafast','superfast','veryfast','faster','fast','medium','slow'}:
+                raise ComposeError('Invalid AI_COMPOSE_X264_PRESET')
+            codec_flags = ['-preset',preset,'-threads','4']
+        codec_flags += ['-crf',str(request.crf)]
     command += ["-filter_complex", ";".join(filters), "-map", video_label, "-map", "[aout]", "-c:v", codec, *codec_flags, "-pix_fmt", "yuv420p", "-r", str(fps), "-c:a", "aac", "-b:a", f"{request.audio_bitrate}k", "-ar", "48000", "-t", f"{duration:.3f}", "-movflags", "+faststart", str(output)]
     _run(command, max(900, int(duration * 60) + 600), f"AI composition variant {variant}")
     if not output.exists() or output.stat().st_size == 0:
@@ -1574,7 +1630,8 @@ def render_composition(
             "camera_tracks_rendered": camera_tracks_rendered,
             "visual_layers_rendered": len(layer_indices),
             "transitions_rendered": transitions_rendered,
-            "captions_rendered": bool(plan.captions_enabled and request.captions_enabled and words),
+            "captions_rendered": bool(motion_counts.get('caption_events')) if request.editor.enabled else bool(plan.captions_enabled and request.captions_enabled and words),
+            "narration_sections_rendered": sum(s.kind == 'narration' for s in segments),
             "sfx_rendered": sum(kind == 'sfx' for _, _, _, kind in audio_inputs),
             "voiceovers_rendered": sum(kind == 'voiceover' for _, _, _, kind in audio_inputs),
             "music_rendered": sum(kind == 'music' for _, _, _, kind in audio_inputs),
@@ -1856,5 +1913,3 @@ async def run_composition(request: AIComposeRequest, job: dict[str, Any], update
     receipt_path = work_root / "composition_receipt.json"
     receipt_path.write_text(json.dumps(receipt.model_dump(mode="json"), indent=2, ensure_ascii=False), encoding="utf-8")
     await update(stage="complete", progress=1.0, status="complete", outputs=outputs, plan=receipt.model_dump(mode="json"), receipt_path=str(receipt_path), completed_at=_now(), work_dir=str(work_root))
-
-
