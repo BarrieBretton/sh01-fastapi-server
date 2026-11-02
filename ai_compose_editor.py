@@ -369,6 +369,7 @@ async def run_editor(request, job, update):
             raise
         warnings.append('Design pass unavailable; using grounded templates: '+str(exc)[:160])
     best = None
+    failed_searches = set()
     total = request.refinement_iterations+1
     for iteration in range(total):
         draft = root/f'draft_{iteration:02d}'; draft.mkdir(exist_ok=True)
@@ -376,7 +377,7 @@ async def run_editor(request, job, update):
         plan = finish_plan(effective,plan,media,words)
         policy = resolve_editorial_policy(effective,media,words)
         await update(stage='asset_retrieval',asset_queries=len(plan.asset_requests))
-        layers, manifest, notes = await asyncio.to_thread(resolve_assets,effective,plan,draft)
+        layers, manifest, notes = await asyncio.to_thread(resolve_assets,effective,plan,draft,failed_searches=failed_searches)
         warnings.extend(notes)
         # One bounded alternate-type search for empty video results.
         if plan.asset_requests and len(layers) < max(1,effective.editor.min_visual_layers) and effective.fetch_assets:
@@ -387,7 +388,7 @@ async def run_editor(request, job, update):
                 asset.kind = 'image' if asset.kind == 'video' else 'video'
             alternate_root = draft/'alternate_assets'
             alternate_root.mkdir(exist_ok=True)
-            more_layers, more_manifest, notes = await asyncio.to_thread(resolve_assets,effective,alternate,alternate_root)
+            more_layers, more_manifest, notes = await asyncio.to_thread(resolve_assets,effective,alternate,alternate_root,failed_searches=failed_searches)
             warnings.extend(notes)
             used_ids = {layer.asset_id for layer in layers}
             accepted_ids = {layer.asset_id for layer in more_layers if layer.asset_id not in used_ids}
@@ -397,7 +398,10 @@ async def run_editor(request, job, update):
         visible = [g.start for g in plan.graphics] + [l.start for l in layers]
         plan.sfx_events = [s for s in plan.sfx_events if any(abs(s.at-t)<.35 for t in visible)]
         review = editorial_review(effective,plan,layers,words)
-        save(draft/'storyboard.json',{'plan':plan.model_dump(),'assets':manifest,'review':review})
+        retrieval = []
+        for report_path in sorted(draft.rglob('retrieval_report.json')):
+            retrieval.extend(json.loads(report_path.read_text(encoding='utf-8')))
+        save(draft/'storyboard.json',{'plan':plan.model_dump(),'assets':manifest,'review':review,'retrieval':retrieval})
         outputs, edits = [], []
         if not review['ok'] and request.editor.strict_requirements:
             warnings.extend(review['errors'])
@@ -419,7 +423,7 @@ async def run_editor(request, job, update):
                 if iteration+1 >= total:
                     raise
                 revised = effective.model_copy(update={'brief':request.brief+'\nFix these render errors. Return a complete plan. '+json.dumps(review)+'\nPrevious plan: '+plan.model_dump_json()})
-                plan, notes = await asyncio.to_thread(LocalDirector(revised).plan,media,words,frames)
+                plan, notes = await asyncio.to_thread(LocalDirector(revised, narrative_plan=plan, failed_searches=failed_searches).plan,media,words,frames)
                 warnings.extend(notes)
                 continue
             review['render_issues'] = [o['quality_review'] for o in outputs]
@@ -452,10 +456,11 @@ async def run_editor(request, job, update):
         history.append({'round':iteration,'review':review,'outputs':outputs})
         save(root/'review_history.json',history)
         if iteration+1 < total:
-            context = json.dumps({'review':review,'current_plan':plan.model_dump()},ensure_ascii=False)
-            revised = effective.model_copy(update={'brief':request.brief+'\nRevise this draft using review evidence. Preserve factual wording; return a complete plan. '+context[:16000]})
+            context = json.dumps({'retrieval':[{**item, 'candidates':item.get('candidates', [])[:5]} for item in retrieval], 'failed_searches':sorted(failed_searches),
+                                  'review':review,'current_plan':plan.model_dump()},ensure_ascii=False)
+            revised = effective.model_copy(update={'brief':request.brief+'\nRevise using retrieval evidence. Replace failed searches with concrete people, places, objects or actions explicitly supported by the selected transcript. Explain visual benefit and evidence_refs. Do not imply illustrative stock depicts the actual reported event. Preserve factual wording; return a complete plan. '+context[:16000]})
             try:
-                plan, notes = await asyncio.to_thread(LocalDirector(revised).plan,media,words,frames)
+                plan, notes = await asyncio.to_thread(LocalDirector(revised, narrative_plan=plan, failed_searches=failed_searches).plan,media,words,frames)
                 warnings.extend(notes)
             except Exception as exc:
                 if best is None or request.refinement_strict:

@@ -35,13 +35,16 @@ jobs:
       - run: python -m pip install -r ci/requirements.txt
       - run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg fonts-dejavu-core
       - name: Lint correctness errors
+        id: lint
         run: python -m ruff check --config ci/ruff.toml .
       - name: Unit and real render tests (skips fail CI)
+        if: ${{ !cancelled() && (steps.lint.outcome == 'success' || steps.lint.outcome == 'failure') }}
         run: python -m coverage run --source=. --omit='tests/*,notebooks/*' ci/run_tests.py
       - name: Coverage report
-        if: always()
+        if: ${{ !cancelled() && hashFiles('.coverage') != '' }}
         run: python -m coverage report --skip-empty
       - name: Notebook and embedded source consistency
+        if: ${{ !cancelled() && (steps.lint.outcome == 'success' || steps.lint.outcome == 'failure') }}
         run: python ci/check_notebook.py
   workers:
     name: Cloudflare Worker tests

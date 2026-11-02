@@ -515,9 +515,15 @@ def fallback_plan(request: AIComposeRequest, media: dict[str, Any], words: list[
     )
 
 
+def asset_search_key(query: str, kind: str) -> tuple[str, str]:
+    """Ignore punctuation/case when detecting repeated failed searches."""
+    return (" ".join(re.findall(r"\w+", query.casefold())), kind)
+
+
 class LocalDirector:
-    def __init__(self, request: AIComposeRequest, *, narrative_plan: CompositionPlan | None = None):
+    def __init__(self, request: AIComposeRequest, *, narrative_plan: CompositionPlan | None = None, failed_searches=None):
         self.request = request
+        self._failed_searches = set(failed_searches or ())
         # Visual design owns graphics/assets/SFX, not already approved narration
         # or source cuts. Snapshot validated values so later mutations cannot
         # change this stage's input or silently replace the speaker's narrative.
@@ -655,6 +661,15 @@ class LocalDirector:
                     for field in ("base_segments", "narration_sections", "voiceovers"):
                         payload[field] = approved[field]
                 plan = CompositionPlan.model_validate(payload)
+                if self._failed_searches:
+                    repeated = [a.query for a in plan.asset_requests
+                                if asset_search_key(a.query, a.kind) in self._failed_searches]
+                    if repeated:
+                        raise ComposeError("Previously failed asset searches repeated: " + repr(repeated)
+                                           + "; choose different concrete subjects grounded in the selected transcript, "
+                                           "with benefit and evidence_refs. Changing confidence is not a correction.")
+                    if not plan.asset_requests and self.request.editor.min_visual_layers > 0:
+                        raise ComposeError("Required supporting visuals need new grounded asset_requests")
                 expected = {
                     "intro": {"intro"}, "intro_outro": {"intro", "outro"},
                     "intro_bridge_outro": {"intro", "bridge", "outro"},
@@ -970,7 +985,8 @@ def _search_local(library: Path, query: str, kind: str) -> list[dict[str, Any]]:
     return sorted(results, key=lambda item: item["score"], reverse=True)
 
 
-def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dict[str, Any]]:
+def _search_remote(query: str, kind: str, request: AIComposeRequest, *, diagnostics=None) -> list[dict[str, Any]]:
+    diagnostics = diagnostics if diagnostics is not None else []
     cfg = request.asset_sources
     configured = (
         (cfg.pexels and bool(os.getenv("PEXELS_API_KEY", "").strip()))
@@ -998,6 +1014,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                 if matches:
                     break
         except Exception as exc:
+            diagnostics.append({"provider": "wikimedia", "error_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)})
             logger.warning('Wikimedia search failed: %s', exc)
     if cfg.pexels and os.getenv("PEXELS_API_KEY", "").strip():
         try:
@@ -1018,6 +1035,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                 if download_url:
                     results.append({"asset_id": f"pexels_{item.get('id')}", "source": "pexels", "download_url": download_url, "title": title, "description": item.get("alt", ""), "tags": [], "license": "Pexels", "attribution": attribution, "kind": kind, "score": _score_candidate(query, {"title": title, "description": item.get("alt", ""), "tags": []})})
         except Exception as exc:
+            diagnostics.append({"provider": "pexels", "error_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)})
             logger.warning("Pexels search failed: %s", exc)
     if cfg.pixabay and os.getenv("PIXABAY_API_KEY", "").strip():
         try:
@@ -1037,6 +1055,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                     title = f"Pixabay {kind} {item.get('id')}"
                     results.append({"asset_id": f"pixabay_{item.get('id')}", "source": "pixabay", "download_url": download_url, "title": title, "description": item.get("tags", ""), "tags": item.get("tags", ""), "license": "Pixabay Content License", "attribution": "Source: Pixabay", "kind": kind, "score": _score_candidate(query, {"title": title, "description": item.get("tags", ""), "tags": item.get("tags", "")})})
         except Exception as exc:
+            diagnostics.append({"provider": "pixabay", "error_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)})
             logger.warning("Pixabay search failed: %s", exc)
     if cfg.unsplash and kind == "image" and os.getenv("UNSPLASH_ACCESS_KEY", "").strip():
         try:
@@ -1048,6 +1067,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                     photographer = item.get("user", {}).get("name", "unknown")
                     results.append({"asset_id": f"unsplash_{item.get('id')}", "source": "unsplash", "download_url": image_url, "title": item.get("alt_description") or item.get("description") or "Unsplash photo", "description": item.get("alt_description") or "", "tags": [], "license": "Unsplash", "attribution": f"Photo by {photographer} on Unsplash", "kind": kind, "score": _score_candidate(query, {"title": item.get("alt_description", ""), "description": item.get("description", ""), "tags": []})})
         except Exception as exc:
+            diagnostics.append({"provider": "unsplash", "error_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)})
             logger.warning("Unsplash search failed: %s", exc)
     return sorted(results, key=lambda item: item.get("score", 0.0), reverse=True)
 
@@ -1068,7 +1088,7 @@ def _placement(asset: AssetRequest) -> tuple[float, float, float, float | None]:
     return asset.x, asset.y, asset.width, asset.height
 
 
-def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path) -> tuple[list[ResolvedLayer], list[dict[str, Any]], list[str]]:
+def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path, *, failed_searches=None) -> tuple[list[ResolvedLayer], list[dict[str, Any]], list[str]]:
     if not request.fetch_assets:
         return [], [], []
     asset_root = root / "assets"
@@ -1079,15 +1099,31 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
     manifest: list[dict[str, Any]] = []
     warnings: list[str] = []
     minimum_score = min(1.0, max(0.0, float(os.getenv("AI_COMPOSE_MIN_ASSET_SCORE", "0.18"))))
+    failed_searches = failed_searches if failed_searches is not None else set()
+    reports = []
     for index, asset_request in enumerate(plan.asset_requests[: request.max_asset_layers]):
+        key = asset_search_key(asset_request.query, asset_request.kind)
+        report = {"query": asset_request.query, "kind": asset_request.kind,
+                  "minimum_score": minimum_score, "candidates": [], "outcome": "pending"}
+        reports.append(report)
+        if key in failed_searches:
+            report["outcome"] = "previously_failed_search_skipped"
+            continue
         candidates: list[dict[str, Any]] = []
         if request.asset_sources.local_library and library_setting:
             candidates.extend(_search_local(Path(library_setting), asset_request.query, asset_request.kind))
         if request.fetch_assets:
-            candidates.extend(_search_remote(asset_request.query, asset_request.kind, request))
+            candidates.extend(_search_remote(asset_request.query, asset_request.kind, request, diagnostics=report.setdefault("provider_errors", [])))
         candidates.sort(key=lambda item: (item.get("asset_id") in used, -float(item.get("score", 0.0))))
         eligible = [c for c in candidates if c.get('asset_id') not in used
                     and float(c.get('score',0) or 0) >= minimum_score][:3]
+        report["candidate_count"] = len(candidates)
+        report["eligible_count"] = len(eligible)
+        for c in candidates:
+            report["candidates"].append({"asset_id": c.get("asset_id"), "title": c.get("title"),
+                "score": c.get("score", 0), "source": c.get("source"),
+                "reason": "already_used" if c.get("asset_id") in used else
+                    ("below_score_floor" if float(c.get("score", 0) or 0) < minimum_score else "eligible")})
         candidate = None
         for attempt, choice in enumerate(eligible):
             try:
@@ -1107,8 +1143,14 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
                 candidate = choice
                 break
             except Exception as exc:
+                report.setdefault("download_decode_errors", []).append({
+                    "asset_id": choice.get("asset_id"), "error_type": type(exc).__name__})
                 warnings.append(f'Candidate rejected for {asset_request.query!r}: {str(exc)[:200]}')
         if candidate is None:
+            report["outcome"] = "no_candidates" if not candidates else "no_usable_candidate"
+            # Cache deterministic empty/score failures; allow transient download retries.
+            if not eligible and not report.get("provider_errors") and not any(c.get("asset_id") in used for c in candidates):
+                failed_searches.add(key)
             warnings.append(f'No usable relevant asset for {asset_request.query!r}; score floor {minimum_score:.3f}')
             continue
         candidate_score = float(candidate.get('score',0) or 0)
@@ -1119,6 +1161,7 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
                 asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=asset_request.animation, animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=candidate_score, reason=asset_request.reason,
             )
             layers.append(layer)
+            report["outcome"] = "resolved"
             manifest.append({
                 **candidate,
                 "local_path": str(local_path),
@@ -1133,6 +1176,7 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path)
             })
         except Exception as exc:
             warnings.append(f"Asset {asset_request.query!r} was rejected: {str(exc)[:220]}")
+    (root / "retrieval_report.json").write_text(json.dumps(reports, indent=2, ensure_ascii=False), encoding="utf-8")
     return layers, manifest, warnings
 
 

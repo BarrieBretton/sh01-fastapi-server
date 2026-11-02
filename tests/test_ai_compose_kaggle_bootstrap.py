@@ -126,6 +126,31 @@ class KaggleBootstrapTests(unittest.TestCase):
                 self.prepare()
         self.assertEqual(run.call_count, 1)
 
+    def test_host_backports_do_not_shadow_standard_library(self):
+        # Reproduce Windows user-site backports next to the host pip package.
+        # No host packages are modified and no network is used.
+        from types import SimpleNamespace
+        host = self.root / 'legacy' / 'site-packages'
+        host.mkdir(parents=True)
+        wheel = next(self.wheels.glob('pip-*.whl'))
+        with zipfile.ZipFile(wheel) as archive:
+            archive.extractall(host)
+        for name in ('dataclasses', 'typing'):
+            (host / (name + '.py')).write_text(
+                'raise RuntimeError("legacy backport shadowed stdlib")\n')
+        original_find = __import__('importlib.util', fromlist=['find_spec']).find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name == 'pip':
+                return SimpleNamespace(origin=str(host / 'pip' / '__init__.py'))
+            return original_find(name, *args, **kwargs)
+
+        with mock.patch('scripts.kaggle_bootstrap.importlib.util.find_spec', side_effect=find_spec):
+            python, env = self.prepare(host_paths=[str(host)])
+        data = self.query(python, 'import dataclasses,typing,json; print(json.dumps('
+                          '[dataclasses.__file__,typing.__file__]))', env)
+        self.assertTrue(all(not Path(p).resolve().is_relative_to(host) for p in data))
+
     def test_inherited_python_and_pip_overrides_are_removed(self):
         with mock.patch.dict(os.environ, {'PYTHONPATH':'/wrong', 'PIP_TARGET':'/wrong',
                                          'PIP_PREFIX':'/wrong', 'PIP_USER':'1'}):

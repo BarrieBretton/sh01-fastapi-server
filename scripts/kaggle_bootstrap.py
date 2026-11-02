@@ -106,11 +106,16 @@ def prepare_editor_environment(runtime, *, host_paths=None):
         spec = importlib.util.find_spec('pip')
         if spec is None or not spec.origin:
             raise RuntimeError('The notebook Python has no pip. Install pip for that interpreter first.')
-        # Executing pip's package directory also handles host sys.path differences.
+        # pip's directory __main__ prepends its entire site-packages directory,
+        # allowing legacy dataclasses/typing backports to shadow the stdlib.
+        # Its cross-interpreter runner redirects only the pip package instead.
+        runner = Path(spec.origin).parent / '__pip-runner__.py'
+        if not runner.is_file():
+            raise RuntimeError('Host pip needs its cross-interpreter runner (pip >=22.3).')
         # --ignore-installed makes both bootstrap packages local without removing
         # any globally installed version. --no-deps prevents unrelated changes.
         print('Repairing editor pip and startup dependency…', flush=True)
-        execute([sys.executable, str(Path(spec.origin).parent), '--python', python,
+        execute([sys.executable, '-I', runner, '--python', python,
                  'install', '--disable-pip-version-check', '--no-input',
                  '--ignore-installed', '--no-deps', 'pip>=23,<27', 'wrapt>=1.16,<3'])
         health = execute([python, '-I', '-c', health_code], check=False)

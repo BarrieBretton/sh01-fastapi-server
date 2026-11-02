@@ -43,6 +43,11 @@ def archive_run(root, outputs):
             path=root/name
             if path.is_file():
                 output.write(path,name)
+        for pattern in ('draft_*/storyboard.json', 'draft_*/retrieval_report.json',
+                        'draft_*/alternate_assets/retrieval_report.json'):
+            for path in sorted(root.glob(pattern)):
+                if path.is_file() and not path.is_symlink():
+                    output.write(path, path.relative_to(root))
         for item in outputs:
             path=Path(item['local_path'])
             if path.is_file() and path.parent.resolve()==root.resolve():

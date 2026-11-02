@@ -66,14 +66,14 @@ def run_setup(command, *, env=None):
         raise RuntimeError(f'Setup failed; full log: {setup_log}')
 
 stamp = RUNTIME / 'dependencies-ready'
-setup_version = 'bootstrap-v2;torch=' + importlib.metadata.version('torch')
+setup_version = 'bootstrap-v3-av18;torch=' + importlib.metadata.version('torch')
 if not stamp.exists() or stamp.read_text() != setup_version:
     print('Installing isolated editor dependencies…', flush=True)
     run_setup([PYTHON,'-m','pip','install','--disable-pip-version-check','-q','-c',constraints,
         'fastapi>=0.115,<1','uvicorn>=0.30,<1','pydantic>=2.9,<3','requests>=2.32,<3',
         'httpx>=0.27,<1','python-dotenv>=1,<2','Pillow>=10','numpy>=1.26',
         'transformers>=4.51,<5','accelerate>=1,<2','bitsandbytes>=0.45,<1',
-        'json-repair>=0.30,<1','faster-whisper>=1.1,<2','sentencepiece'])
+        'json-repair>=0.30,<1','faster-whisper>=1.1,<2','av==18.1.0','sentencepiece'])
 check = subprocess.check_output([str(PYTHON),'-c',
     'import torch, bitsandbytes, transformers, json, pathlib, site; '
     'assert torch.cuda.is_available(), "CUDA unavailable in fresh subprocess"; '
@@ -82,6 +82,19 @@ check = subprocess.check_output([str(PYTHON),'-c',
     'print(json.dumps({"torch":torch.__version__,"gpu":torch.cuda.get_device_name(0),"libraries":libs}))'],
     text=True,env=setup_environment)
 gpu = json.loads(check.strip().splitlines()[-1])
+# Test the actual decoder in the isolated interpreter before loading any models.
+run_setup([PYTHON, '-c', """
+import io, wave
+from faster_whisper.audio import decode_audio
+buffer = io.BytesIO()
+with wave.open(buffer, 'wb') as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(16000)
+    wav.writeframes(b'\\x00\\x00' * 16000)
+buffer.seek(0)
+assert len(decode_audio(buffer, sampling_rate=16000)) == 16000
+"""])
 stamp.write_text(setup_version)
 print('GPU ready:', gpu['gpu'], '| Torch', gpu['torch'], flush=True)
 if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
