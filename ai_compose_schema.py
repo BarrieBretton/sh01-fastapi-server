@@ -58,6 +58,24 @@ class EditorialPolicy(BaseModel):
     review_level: Literal["mechanical", "visual", "strict"] = "visual"
 
 
+class EditorOptions(BaseModel):
+    """Automatic production controls. Explicit off switches remain authoritative."""
+
+    enabled: bool = False  # opt in; existing clients retain their behavior
+    caption_style: Literal["phrase", "highlight", "karaoke", "off"] = "highlight"
+    theme: Literal["editorial", "bold", "minimal"] = "editorial"
+    progress_bar: bool = True
+    procedural_sfx: bool = True
+    music: Literal["auto", "off", "library", "procedural"] = "auto"
+    min_visual_layers: int = Field(default=0, ge=0, le=12)
+    min_graphics: int = Field(default=1, ge=0, le=8)
+    strict_requirements: bool = True
+    planning_window_seconds: int = Field(default=120, ge=30, le=600)
+    max_planning_windows: int = Field(default=24, ge=1, le=60)
+    visual_review_required: bool = False
+    publish_outputs: bool = False
+
+
 class AIComposeRequest(BaseModel):
     """Public request accepted by POST /media/ai-compose."""
 
@@ -94,6 +112,7 @@ class AIComposeRequest(BaseModel):
     local_sfx_library: str | None = None
     max_asset_layers: int = Field(default=8, ge=0, le=12)
     editorial_policy: EditorialPolicy = Field(default_factory=EditorialPolicy)
+    editor: EditorOptions = Field(default_factory=EditorOptions)
 
     voiceover: VoiceoverOptions = Field(default_factory=VoiceoverOptions)
     sfx: SfxOptions = Field(default_factory=SfxOptions)
@@ -171,7 +190,7 @@ class VoiceoverPlan(BaseModel):
 class GraphicPlan(BaseModel):
     """A model-directed text/graphic cue rendered by the compositor."""
 
-    kind: Literal["hook", "outro", "lower_third", "quote_card", "callout", "cta"] = "callout"
+    kind: Literal["hook", "outro", "lower_third", "quote_card", "callout", "cta", "checklist", "stat", "timeline", "badge"] = "callout"
     start: float = Field(ge=0.0)
     end: float = Field(gt=0.0)
     text: str = Field(min_length=1, max_length=500)

@@ -244,10 +244,17 @@ async def ai_compose_capabilities(x_api_key: str | None = Header(default=None, a
     _require_key(x_api_key)
     return {
         "workflow": "sh01/ai-compose@1",
-        "local_director": bool(os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
+        "local_director": bool(os.getenv("AI_COMPOSE_HF_MODEL", "").strip() or os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
         "local_director_url_configured": bool(os.getenv("AI_COMPOSE_LLM_URL", "").strip() or os.getenv("LLAMA_SERVER_URL", "").strip()),
         "asset_sources": {"local_library": True, "pexels": bool(os.getenv("PEXELS_API_KEY", "")), "pixabay": bool(os.getenv("PIXABAY_API_KEY", "")), "unsplash": bool(os.getenv("UNSPLASH_ACCESS_KEY", "")), "freesound": bool(os.getenv("FREESOUND_API_KEY", ""))},
         "features": [
+            "automatic-editor-v1",
+            "kinetic-captions",
+            "vector-cards-checklists-timelines",
+            "procedural-sfx",
+            "music-ducking",
+            "optional-local-visual-review",
+            "isolated-drafts-best-selection",
             "long-source-chunking",
             "word-timed-captions",
             "semantic-asset-requests",

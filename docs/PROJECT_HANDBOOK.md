@@ -96,6 +96,24 @@ The `REDIS_URL` path in `app.py` attempts a Redis `cron_master_lock` and schedul
 
 ## Media production contract and the tested notebook
 
+### Automatic editor feature update (1 November 2026)
+
+**Code:** `ai_compose_editor.py` adds an opt-in narrative/design/render/review
+workflow under the existing `/media/ai-compose` route. `editor.enabled=true`
+activates vector graphics, kinetic captions, timed overlays, sound design and
+bounded review. See [automatic editor instructions](../AUTOMATIC_EDITOR_README.md).
+
+**Code:** `notebooks/sh01_automatic_editor.ipynb` starts the existing compose
+router via `ai_compose_local_app:app`, on loopback with one worker and SQLite
+receipts. Production `app.py`, the dispatcher and caption routes retain their
+wiring; this notebook does not initialize production infrastructure services.
+
+**Observed in development:** CPU FFmpeg fixtures render graphics, captions,
+audio and delayed overlays, with pixel checks for overlay/dissolve timing.
+**Unverified:** Kaggle T4 model inference, provider credentials, Piper execution
+and HTTP startup in the user's environment. Model/ASR boundaries are mocked in
+offline tests. No production deployment is implied.
+
 `POST /media/auto-edit` accepts **exactly one** `source_url`, `telegram_file_id`, or `source_path`. Its durable job is enqueued through the infra-control D1 queue and picked up by an opted-in SH01 consumer. Poll `GET /media/auto-edit-jobs/{job_id}`; finished results include video URLs, source/output edit intervals, and per-shot zoom metadata. `GET /media/auto-edit-presets` returns preset starting values and `GET /media/auto-edit-capabilities` reports instance settings. See `auto_editor.py`, `media_branding.py`, and `caption_router.py` for exact validation.
 
 The sample notebook in this documentation package exercises a synced video, user-selected source window, Whisper transcription and VAD, silence cuts, phrase-bounce captions with word highlighting, portrait crop, selected-shot zoom, gradients, four corner logos, moving edge text, an image template, and B2 output. The operator confirmed a successful result on Kaggle on 20 October 2026. This verifies **that run**, not all inputs, Render's 512 MiB performance, every UI workflow, or all preset combinations.

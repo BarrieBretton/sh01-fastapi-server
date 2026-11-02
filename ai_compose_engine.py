@@ -205,6 +205,7 @@ def _validated_local_source(source_path: str) -> Path:
 
 
 async def _telegram_download(file_id: str, destination: Path) -> None:
+    import httpx
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise ComposeError("TELEGRAM_BOT_TOKEN is not configured")
@@ -527,7 +528,7 @@ class LocalDirector:
     @staticmethod
     def _allow_deterministic_recovery() -> bool:
         """Allow a valid deterministic plan when a configured model emits unusable output."""
-        return os.getenv("AI_COMPOSE_ALLOW_DETERMINISTIC_RECOVERY", "true").lower() in {
+        return os.getenv("AI_COMPOSE_ALLOW_DETERMINISTIC_RECOVERY", "false").lower() in {
             "1", "true", "yes"
         }
 
@@ -715,7 +716,7 @@ class LocalDirector:
                 item["confidence"] = 0.0
 
         graphic_enums = {
-            "kind": {"hook", "outro", "lower_third", "quote_card", "callout", "cta"},
+            "kind": {"hook", "outro", "lower_third", "quote_card", "callout", "cta", "checklist", "stat", "timeline", "badge"},
             "placement": {"top", "upper_left", "center", "lower_left", "bottom"},
             "animation": {"none", "fade", "slide_up", "slide_down", "pop", "reveal"},
             "style": {"default", "accent", "warning", "quote", "cta"},
@@ -765,6 +766,8 @@ class LocalDirector:
             "When supporting visuals are allowed and a concrete visual opportunity exists, emit one or more "
             "asset_requests with query, benefit, confidence, evidence_refs, and must_not_cover. "
             "When motion graphics are allowed, emit concise graphics entries with kind, start, end, text, "
+            "kind is hook/outro/lower_third/quote_card/callout/cta/checklist/stat/timeline/badge. "
+            "For checklist/timeline use | separated short labels. For stat use only numbers present in evidence. "
             "placement, animation, and style. Keep graphics clear of speaker faces and captions; do not use "
             "graphics as a substitute for source dialogue. "
             "Use adaptive SFX sparingly: only for meaningful visual entrances, transitions, or payoffs. "
@@ -774,7 +777,7 @@ class LocalDirector:
             f"Brief: {request.brief}\nPreset: {request.preset}\nTarget output seconds: {request.target_seconds}\n"
             f"Voiceover mode: {request.voiceover.mode}\nSFX mode: {request.sfx.mode}\n"
             f"Media metadata: {json.dumps(media, separators=(',', ':'))}\n"
-            f"Transcript: {transcript_text(words, 6000 if compact else 12000)}\n"
+            f"Timestamped transcript: {json.dumps([{'start':round(float(w['start']),2),'end':round(float(w['end']),2),'text':w.get('word','')} for w in words], ensure_ascii=False)[:14000 if compact else 26000]}\n"
             f"Representative frames: {json.dumps(scene_summary, separators=(',', ':'))}\n"
             "Choose a small number of high-confidence segments and keep all arrays concise."
         )
@@ -841,7 +844,7 @@ class LocalDirector:
 
 
 def _candidate_tokens(candidate: dict[str, Any]) -> set[str]:
-    text = " ".join(str(candidate.get(key, "")) for key in ("title", "description", "tags", "filename", "query"))
+    text = " ".join(str(candidate.get(key, "")) for key in ("title", "description", "tags", "filename"))
     return set(_keywords(text, 80))
 
 
@@ -914,7 +917,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
     limit = cfg.max_candidates_per_query
     if cfg.pexels and os.getenv("PEXELS_API_KEY", "").strip():
         try:
-            endpoint = "https://api.pexels.com/v1/videos/search" if kind == "video" else "https://api.pexels.com/v1/search"
+            endpoint = "https://api.pexels.com/videos/search" if kind == "video" else "https://api.pexels.com/v1/search"
             response = requests.get(endpoint, headers={"Authorization": os.getenv("PEXELS_API_KEY", "").strip()}, params={"query": query, "per_page": limit, "orientation": "portrait"}, timeout=(20, 60))
             response.raise_for_status()
             payload = response.json()
@@ -922,14 +925,14 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                 if kind == "video":
                     files = sorted(item.get("video_files", []), key=lambda value: (value.get("width", 0) < 1080, -value.get("width", 0)))
                     download_url = files[0].get("link") if files else None
-                    title = f"Pexels video {item.get('id')}"
+                    title = urlparse(item.get('url', '')).path.replace('-', ' ')
                     attribution = f"Video by {item.get('user', {}).get('name', 'unknown')} on Pexels"
                 else:
                     download_url = item.get("src", {}).get("portrait") or item.get("src", {}).get("large2x")
                     title = item.get("alt") or f"Pexels photo {item.get('id')}"
                     attribution = f"Photo by {item.get('photographer', 'unknown')} on Pexels"
                 if download_url:
-                    results.append({"asset_id": f"pexels_{item.get('id')}", "source": "pexels", "download_url": download_url, "title": title, "description": item.get("alt", ""), "tags": query, "license": "Pexels", "attribution": attribution, "kind": kind, "score": _score_candidate(query, {"title": title, "description": item.get("alt", ""), "tags": query})})
+                    results.append({"asset_id": f"pexels_{item.get('id')}", "source": "pexels", "download_url": download_url, "title": title, "description": item.get("alt", ""), "tags": [], "license": "Pexels", "attribution": attribution, "kind": kind, "score": _score_candidate(query, {"title": title, "description": item.get("alt", ""), "tags": []})})
         except Exception as exc:
             logger.warning("Pexels search failed: %s", exc)
     if cfg.pixabay and os.getenv("PIXABAY_API_KEY", "").strip():
@@ -959,7 +962,7 @@ def _search_remote(query: str, kind: str, request: AIComposeRequest) -> list[dic
                 image_url = item.get("urls", {}).get("regular")
                 if image_url:
                     photographer = item.get("user", {}).get("name", "unknown")
-                    results.append({"asset_id": f"unsplash_{item.get('id')}", "source": "unsplash", "download_url": image_url, "title": item.get("alt_description") or item.get("description") or "Unsplash photo", "description": item.get("alt_description") or "", "tags": query, "license": "Unsplash", "attribution": f"Photo by {photographer} on Unsplash", "kind": kind, "score": _score_candidate(query, {"title": item.get("alt_description", ""), "description": item.get("description", ""), "tags": query})})
+                    results.append({"asset_id": f"unsplash_{item.get('id')}", "source": "unsplash", "download_url": image_url, "title": item.get("alt_description") or item.get("description") or "Unsplash photo", "description": item.get("alt_description") or "", "tags": [], "license": "Unsplash", "attribution": f"Photo by {photographer} on Unsplash", "kind": kind, "score": _score_candidate(query, {"title": item.get("alt_description", ""), "description": item.get("description", ""), "tags": []})})
         except Exception as exc:
             logger.warning("Unsplash search failed: %s", exc)
     return sorted(results, key=lambda item: item.get("score", 0.0), reverse=True)
@@ -982,6 +985,8 @@ def _placement(asset: AssetRequest) -> tuple[float, float, float, float | None]:
 
 
 def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path) -> tuple[list[ResolvedLayer], list[dict[str, Any]], list[str]]:
+    if not request.fetch_assets:
+        return [], [], []
     asset_root = root / "assets"
     asset_root.mkdir(parents=True, exist_ok=True)
     library_setting = request.local_asset_library or os.getenv("AI_COMPOSE_ASSET_LIBRARY", "").strip()
@@ -1195,7 +1200,7 @@ def _sfx_path(library: str | None, kind: str) -> Path | None:
     exact = [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS and kind.lower() in path.stem.lower()]
     if exact:
         return exact[0]
-    return next((path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS), None)
+    return None
 
 
 def _download_freesound_sfx(kind: str, root: Path, warnings: list[str]) -> Path | None:
@@ -1262,20 +1267,28 @@ def _build_audio_inputs(request: AIComposeRequest, plan: CompositionPlan, root: 
         path = _sfx_path(request.sfx.local_library or request.local_sfx_library, event.kind)
         if not path and request.asset_sources.freesound:
             path = _download_freesound_sfx(event.kind, root, warnings)
+        if not path and request.editor.enabled and request.editor.procedural_sfx:
+            from ai_compose_sound import synthesize
+            path = synthesize(root / 'sfx' / (event.kind + '.wav'), event.kind, .35)
         if path:
             inputs.append((path, event.at, event.volume, "sfx"))
         else:
             warnings.append(f"No local SFX matched {event.kind}; event skipped")
     music = os.getenv("AI_COMPOSE_MUSIC_PATH", "").strip()
-    if request.music_url:
+    music_allowed = not request.editor.enabled or (request.editor.music != 'off' and request.editorial_policy.music != 'off')
+    if request.music_url and music_allowed:
         path = root / ("music" + _safe_filename(request.music_url, ".mp3"))
         try:
             _download_sync(request.music_url, path)
             inputs.append((path, 0.0, request.music_volume, "music"))
         except Exception as exc:
             warnings.append(f"Music download failed: {str(exc)[:220]}")
-    elif music and Path(music).exists():
+    elif music and Path(music).exists() and music_allowed:
         inputs.append((Path(music), 0.0, request.music_volume, "music"))
+    elif request.editor.enabled and request.editor.music == 'procedural' and music_allowed:
+        from ai_compose_sound import synthesize
+        duration = sum(s.source_end-s.source_start for s in plan.base_segments)
+        inputs.append((synthesize(root / 'score.wav', 'music', duration), 0., request.music_volume, 'music'))
     inputs.extend(_synthesize_voiceovers(request, plan, root, warnings))
     return inputs
 
@@ -1302,22 +1315,17 @@ def _piecewise_keyframe_expr(keyframes: list[Any], field: str, track_start: floa
 def _camera_visual_filter(camera: Any, width: int, height: int, fps: int) -> str:
     """Return a safe FFmpeg camera filter consuming the complete keyframe track.
 
-    FFmpeg's crop filter evaluates x/y expressions per frame, so the normalized
-    pan track is animated continuously. The peak scale is applied before the
-    crop to keep output dimensions stable and memory bounded.
+    zoompan evaluates scale and position for each output frame while keeping
+    the output dimensions stable. Track times are relative to the source clip.
     """
 
-    peak = min(1.28, max(1.0, max(float(item.scale) for item in camera.keyframes)))
-    scaled_width = max(width, int(math.ceil(width * peak / 2.0) * 2))
-    scaled_height = max(height, int(math.ceil(height * peak / 2.0) * 2))
-    x_offset = _piecewise_keyframe_expr(camera.keyframes, "x", float(camera.start))
-    y_offset = _piecewise_keyframe_expr(camera.keyframes, "y", float(camera.start))
-    crop_x = f"(in_w-out_w)/2+({x_offset})*(in_w-out_w)"
-    crop_y = f"(in_h-out_h)/2+({y_offset})*(in_h-out_h)"
-    return (
-        f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height}:x='{crop_x}':y='{crop_y}',fps={fps}"
-    )
+    zoom = _piecewise_keyframe_expr(camera.keyframes, 'scale', float(camera.start)).replace('t-', f'on/{fps}-').replace('lt(t,', f'lt(on/{fps},')
+    x = _piecewise_keyframe_expr(camera.keyframes, 'x', float(camera.start)).replace('t-', f'on/{fps}-').replace('lt(t,', f'lt(on/{fps},')
+    y = _piecewise_keyframe_expr(camera.keyframes, 'y', float(camera.start)).replace('t-', f'on/{fps}-').replace('lt(t,', f'lt(on/{fps},')
+    return (f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},zoompan=z='{zoom}':x='(iw-iw/zoom)*(.5+({x}))':"
+            f"y='(ih-ih/zoom)*(.5+({y}))':d=1:s={width}x{height}:fps={fps}")
+
 
 
 def _transition_name(kind: str) -> str | None:
@@ -1352,9 +1360,14 @@ def render_composition(
         edit_plan = compile_edit_plan(request, plan, layers, words, policy, media, variant=variant)
     output = root / f"variant_{variant:02d}.mp4"
     ass = root / f"variant_{variant:02d}.ass"
-    _make_ass(words, segments, duration, plan, ass, edit_plan)
+    motion_counts = {}
+    if request.editor.enabled:
+        from ai_compose_motion import write_motion_ass
+        motion_counts = write_motion_ass(ass, request, plan, edit_plan, words)
+    else:
+        _make_ass(words, segments, duration, plan, ass, edit_plan)
 
-    command: list[str] = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    command: list[str] = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-filter_complex_threads", "2" if request.editor.enabled else "1"]
     video_input_count = len(segments)
     input_index = 0
     for segment in segments:
@@ -1367,9 +1380,28 @@ def render_composition(
         layer_indices.append((layer, input_index))
         input_index += 1
     audio_inputs = _build_audio_inputs(request, plan, root, warnings)
+    voice_inputs = [item for item in audio_inputs if item[3] == 'voiceover']
+    if request.editor.enabled and voice_inputs:
+        import wave
+        voice_words = []
+        for index, (path, at, _volume, _kind) in enumerate(voice_inputs):
+            with wave.open(str(path), 'rb') as voice:
+                voice_duration = voice.getnframes()/voice.getframerate()
+            if at+voice_duration > duration+.05:
+                raise ComposeError('Generated narration exceeds its timeline slot; shorten the script')
+            if request.captions_enabled and plan.captions_enabled and request.editor.caption_style != 'off':
+                voice_root = root/f'voice_words_{index}'
+                voice_root.mkdir(exist_ok=True)
+                for word in transcribe_chunked(path,0,voice_duration,request.language,voice_root):
+                    voice_words.append(dict(word,start=word['start']+at,end=word['end']+at))
+        if voice_words and (not words or edit_plan.policy.get('source_audio') in {'mute','replace'}):
+            # Voiceover timestamps already use program time, unlike source ASR.
+            caption_plan = plan.model_copy(update={'base_segments':[BaseSegment(source_start=0,source_end=duration)]})
+            from ai_compose_motion import write_motion_ass
+            motion_counts = write_motion_ass(ass, request, caption_plan, edit_plan, voice_words)
     audio_indices: list[tuple[Path, float, float, str, int]] = []
     for path, at, volume, kind in audio_inputs:
-        command += ["-i", str(path)]
+        command += (["-stream_loop", "-1"] if kind == 'music' else []) + ["-i", str(path)]
         audio_indices.append((path, at, volume, kind, input_index))
         input_index += 1
     if not media.get("has_audio"):
@@ -1410,31 +1442,33 @@ def render_composition(
         video_label = base_video_labels[0]
         audio_label = base_audio_labels[0]
     elif can_xfade:
-        current_label = base_video_labels[0]
-        elapsed = float(segments[0].source_end - segments[0].source_start)
-        total_overlap = 0.0
-        for index, transition in enumerate(transition_specs, 1):
-            segment_duration = float(segments[index].source_end - segments[index].source_start)
-            previous_duration = float(segments[index - 1].source_end - segments[index - 1].source_start)
-            transition_duration = min(float(transition.duration), previous_duration - 0.05, segment_duration - 0.05)
-            if transition_duration <= 0.0:
-                can_xfade = False
-                break
-            output_label = f"[vtrans{index}]"
-            filters.append(
-                f"{current_label}{base_video_labels[index]}xfade="
-                f"transition={_transition_name(transition.kind)}:duration={transition_duration:.3f}:"
-                f"offset={max(0.0, elapsed - transition_duration):.3f}{output_label}"
-            )
-            current_label = output_label
-            elapsed += segment_duration - transition_duration
-            total_overlap += transition_duration
-            transitions_rendered += 1
-        if can_xfade and total_overlap > 0.0:
-            filters.append(f"{current_label}tpad=stop_mode=clone:stop_duration={total_overlap:.3f}[vbase]")
-            video_label = "[vbase]"
+        # Freeze the outgoing boundary during the incoming clip's first frames.
+        # Unlike overlapping source clips, this preserves every source/program
+        # timestamp, captions and dialogue sync, without a frozen output tail.
+        durations = [min(float(t.duration), float(segments[i].source_end-segments[i].source_start)-.05,
+                         float(segments[i+1].source_end-segments[i+1].source_start)-.05)
+                     for i,t in enumerate(transition_specs)]
+        if all(d > 0 for d in durations):
+            padded = []
+            for i, label in enumerate(base_video_labels):
+                if i < len(durations):
+                    padded_label = f'[vpad{i}]'
+                    filters.append(f'{label}tpad=stop_mode=clone:stop_duration={durations[i]:.3f}{padded_label}')
+                    padded.append(padded_label)
+                else:
+                    padded.append(label)
+            current_label = padded[0]
+            elapsed = float(segments[0].source_end-segments[0].source_start)
+            for index, transition in enumerate(transition_specs, 1):
+                output_label = f'[vtrans{index}]'
+                filters.append(f'{current_label}{padded[index]}xfade='
+                    f'transition={_transition_name(transition.kind)}:duration={durations[index-1]:.3f}:'
+                    f'offset={elapsed:.3f}{output_label}')
+                current_label = output_label
+                elapsed += float(segments[index].source_end-segments[index].source_start)
+                transitions_rendered += 1
+            video_label = current_label
         else:
-            transitions_rendered = 0
             filters.append("".join(base_video_labels) + f"concat=n={len(segments)}:v=1:a=0[vbase]")
             video_label = "[vbase]"
         filters.append("".join(base_audio_labels) + f"concat=n={len(segments)}:v=0:a=1[abase]")
@@ -1444,6 +1478,10 @@ def render_composition(
         filters.append("".join(base_audio_labels) + f"concat=n={len(segments)}:v=0:a=1[abase]")
         video_label = "[vbase]"
         audio_label = "[abase]"
+
+    if edit_plan.policy.get('source_audio') in {'mute', 'replace'}:
+        filters.append(f"{audio_label}volume=0[mutedbase]")
+        audio_label = '[mutedbase]'
 
     for index, (layer, layer_input) in enumerate(layer_indices, 1):
         layer_duration = max(0.05, min(duration, layer.end) - max(0.0, layer.start))
@@ -1471,12 +1509,15 @@ def render_composition(
         if layer.animation in {"fade", "reveal"}:
             filters[-1] = filters[-1].replace(f"[ov{index}]", f"[ov{index}_raw]")
             filters.append(f"[ov{index}_raw]fade=t=in:st=0:d={min(layer.animation_seconds, layer_duration):.3f}:alpha=1[ov{index}]")
-        filters.append(f"[{video_label[1:-1]}][ov{index}]overlay=x='{x_expr}':y='{y_expr}':eof_action=pass:shortest=0:enable='between(t,{start:.3f},{min(duration, layer.end):.3f})'[vlay{index}]")
+        filters.append(f"[ov{index}]setpts=PTS+{start:.3f}/TB[ovtimed{index}]")
+        filters.append(f"[{video_label[1:-1]}][ovtimed{index}]overlay=x='{x_expr}':y='{y_expr}':eof_action=pass:shortest=0:enable='between(t,{start:.3f},{min(duration, layer.end):.3f})'[vlay{index}]")
         video_label = f"[vlay{index}]"
 
     graphics_rendered = len(edit_plan.graphics)
     should_burn_ass = ass.exists() and (
-        (plan.captions_enabled and request.captions_enabled and bool(words))
+        bool(motion_counts.get('progress_bars_rendered'))
+        or bool(motion_counts.get('caption_events'))
+        or (plan.captions_enabled and request.captions_enabled and bool(words))
         or bool(edit_plan.graphics)
         or (edit_plan is None and (bool(plan.hook_text) or bool(plan.outro_text)))
     )
@@ -1486,13 +1527,28 @@ def render_composition(
         video_label = "[vcaption]"
 
     mix_labels = [audio_label]
+    duck_music = request.editor.enabled and any(item[3] == 'music' for item in audio_indices)
+    voice_sidechains = [f'[voiceside{i}]' for i,item in enumerate(audio_indices,1) if item[3] == 'voiceover']
     for index, (_path, at, volume, kind, audio_index) in enumerate(audio_indices, 1):
         label = f"[aud{index}]"
         delay = max(0, int(round(at * 1000)))
         if kind == "music":
-            filters.append(f"[{audio_index}:a]aresample=48000,volume={volume:.3f},atrim=duration={duration:.3f},asetpts=PTS-STARTPTS{label}")
+            filters.append(f"[{audio_index}:a]aresample=48000,volume={volume:.3f},atrim=duration={duration:.3f},afade=t=out:st={max(0,duration-.8):.3f}:d=0.8,asetpts=PTS-STARTPTS{label}")
         else:
             filters.append(f"[{audio_index}:a]aresample=48000,volume={volume:.3f},adelay={delay}|{delay},atrim=duration={duration:.3f}{label}")
+        if duck_music and kind == 'voiceover':
+            filters.append(f'{label}asplit=2[voicemix{index}][voiceside{index}]')
+            label = f'[voicemix{index}]'
+        if duck_music and kind == 'music':
+            filters.append(f"{audio_label}asplit=2[dialoguemix{index}][sidechain{index}]")
+            mix_labels[0] = f'[dialoguemix{index}]'
+            sidechain = f'[sidechain{index}]'
+            if voice_sidechains:
+                filters.append(sidechain+''.join(voice_sidechains)+
+                    f'amix=inputs={len(voice_sidechains)+1}:normalize=0:duration=longest[allvoice{index}]')
+                sidechain = f'[allvoice{index}]'
+            filters.append(f"{label}{sidechain}sidechaincompress=threshold=.025:ratio=8:attack=20:release=250[duck{index}]")
+            label = f'[duck{index}]'
         mix_labels.append(label)
     if len(mix_labels) == 1:
         filters.append(f"{audio_label}aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
@@ -1519,6 +1575,10 @@ def render_composition(
             "visual_layers_rendered": len(layer_indices),
             "transitions_rendered": transitions_rendered,
             "captions_rendered": bool(plan.captions_enabled and request.captions_enabled and words),
+            "sfx_rendered": sum(kind == 'sfx' for _, _, _, kind in audio_inputs),
+            "voiceovers_rendered": sum(kind == 'voiceover' for _, _, _, kind in audio_inputs),
+            "music_rendered": sum(kind == 'music' for _, _, _, kind in audio_inputs),
+            **motion_counts,
         },
     }
 
@@ -1543,6 +1603,9 @@ def _upload_output(path: Path, request_id: str, variant: int) -> dict[str, Any]:
 
 
 async def run_composition(request: AIComposeRequest, job: dict[str, Any], update: Callable[..., Any]) -> None:
+    if request.editor.enabled:
+        from ai_compose_editor import run_editor
+        return await run_editor(request, job, update)
     work_root = Path(os.getenv("AI_COMPOSE_WORK_DIR", "media_jobs")) / str(job["job_id"])
     work_root.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []

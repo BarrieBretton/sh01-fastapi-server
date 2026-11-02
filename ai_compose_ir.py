@@ -70,7 +70,7 @@ class VisualLayerSpec(BaseModel):
 
 
 class GraphicCue(BaseModel):
-    kind: Literal["hook", "outro", "lower_third", "quote_card", "callout", "cta"]
+    kind: Literal["hook", "outro", "lower_third", "quote_card", "callout", "cta", "checklist", "stat", "timeline", "badge"]
     start: float = Field(ge=0.0)
     end: float = Field(gt=0.0)
     text: str = Field(min_length=1, max_length=500)
@@ -197,6 +197,13 @@ def compile_edit_plan(
         source_clips.append(clip)
         track = _camera_track(cursor, cursor + duration, camera_mode, index, variant, segment.reason)
         if track:
+            if request.editor.enabled:
+                anchors = [w for w in words if segment.source_start+.4 < w['end'] < segment.source_end-.4
+                           and str(w.get('word','')).rstrip().endswith(('.', '!', '?', ':'))]
+                if anchors:
+                    chosen = anchors[min(variant-1, len(anchors)-1)]
+                    track.keyframes[1].time = cursor + chosen['end']-segment.source_start
+                    track.motivation = 'phrase_boundary:' + str(chosen['word'])[:100]
             camera_tracks.append(track)
         if index:
             transitions.append(

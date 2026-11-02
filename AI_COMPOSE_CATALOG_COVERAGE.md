@@ -26,6 +26,14 @@ graphics, craft, and music.
   mechanical render QC.
 - A Kaggle notebook contact-sheet gate for human review of the actual MP4.
 
+## Automatic-editor additions
+
+`editor.enabled=true` now adds separate narrative/design passes, local VLM source
+and draft frame inspection, isolated drafts with winner selection, kinetic
+captions, vector checklist/timeline cards, procedural SFX and music ducking.
+These are implemented locally, not imported catalog runtimes. See
+[execution and verification limits](AUTOMATIC_EDITOR_README.md).
+
 ## Intentionally partial or future backends
 
 These are represented in the notebook as explicit boundaries rather than
@@ -33,8 +41,8 @@ being advertised as complete:
 
 - HTML/Remotion/HyperFrames rendering and browser/WebGL/Lottie scenes.
 - A true multitrack editable project with undo/redo and FCPXML/project export.
-- Beat-synchronous music editing and loudness/ducking automation.
-- Independent visual-critic agents and an interactive storyboard approval UI.
+- Beat-synchronous music editing and measured loudness mastering.
+- Interactive storyboard approval UI and full-frame temporal quality inspection.
 - Reusable style-skill packs with a large template catalog.
 - Avatar, lip-sync, generated-scene, and provider-specific video generation.
 

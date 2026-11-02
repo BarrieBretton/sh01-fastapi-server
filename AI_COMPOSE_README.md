@@ -1,5 +1,10 @@
 # SH01 local AI composition patch
 
+For the integrated automatic editing workflow, start with
+[AUTOMATIC_EDITOR_README.md](AUTOMATIC_EDITOR_README.md) and
+`notebooks/sh01_automatic_editor.ipynb`. It uses the existing endpoint with
+`editor.enabled=true`. Earlier notebooks exercise the legacy path.
+
 This package adds a local-first `ai_compose` workflow to the SH01 FastAPI
 server. It is designed for a GPU Kaggle worker and uses:
 

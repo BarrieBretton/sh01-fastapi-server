@@ -1,6 +1,6 @@
 # The core patch uses dependencies already present in SH01 requirements.txt.
 # Install these only when using an in-process Hugging Face director on Kaggle.
-transformers>=4.45
+transformers>=4.51,<6
 accelerate>=0.34
 bitsandbytes>=0.43; platform_system != "Windows"
 json-repair>=0.30
