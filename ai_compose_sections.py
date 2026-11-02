@@ -120,10 +120,20 @@ def prepare_sections(request, plan, layers, root: Path, warnings):
                 return clip['program_start'] + at - clip['body_start']
         raise ComposeError(f'Audio cue {at}s is outside the body timeline')
 
-    expanded.graphics = [cue.model_copy(update={'start':a,'end':b}) for cue in plan.graphics
-                         for a,b in pieces(cue.start,cue.end)] + cards
+    expanded.graphics = []
+    for cue in plan.graphics:
+        spans = list(pieces(cue.start, cue.end))
+        if len(spans) > 1:
+            readable = [(a,b) for a,b in spans if b-a >= max(.8, len(cue.text)/24)]
+            if not readable:
+                raise ComposeError('Graphic crosses narration and has no readable interval; shorten or move: '+cue.text[:100])
+            # A single readable appearance beats repeating the full quote as a flash.
+            spans = [max(readable, key=lambda span: span[1]-span[0])]
+            warnings.append('Kept one readable graphic interval across narration: '+cue.text[:100])
+        expanded.graphics.extend(cue.model_copy(update={'start':a,'end':b}) for a,b in spans)
+    expanded.graphics += cards
     expanded.hook_text = expanded.outro_text = None
     expanded.sfx_events = [cue.model_copy(update={'at':point(cue.at)}) for cue in plan.sfx_events if cue.at < body]
     expanded.asset_requests = []  # retrieval already happened on the body timeline
-    mapped_layers = [layer.model_copy(update={'start':a,'end':b}) for layer in layers for a,b in pieces(layer.start,layer.end)]
+    mapped_layers = [layer.model_copy(update={'start':a,'end':b, 'source_offset':layer.source_offset + max(0., next(c['body_start']+a-c['program_start'] for c in mapping if c['kind']=='source' and c['program_start'] <= a < c['program_end'])-layer.start)}) for layer in layers for a,b in pieces(layer.start,layer.end)]
     return PreparedProgram(expanded, mapped_layers, audio, mapping)

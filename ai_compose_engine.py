@@ -689,6 +689,11 @@ class LocalDirector:
                                        + "; each section needs position and non-empty text")
                 if any(not section.text.strip() for section in plan.narration_sections):
                     raise ComposeError("Every narration_sections text must contain spoken words")
+                if self.request.editor.enabled:
+                    from ai_compose_editorial import narrative_errors
+                    defects = narrative_errors(self.request, plan, getattr(self, '_planning_words', []))
+                    if defects:
+                        raise ComposeError('; '.join(defects))
                 return plan
             except (ComposeError, ValueError, TypeError) as exc:
                 if hasattr(exc, "errors"):
@@ -818,6 +823,9 @@ class LocalDirector:
         compact: bool = False,
     ) -> str:
         policy = resolve_editorial_policy(self.request, media, words)
+        from ai_compose_editorial import speech_units
+        units = [{'start':u[0]['start'],'end':u[-1]['end'],'text':' '.join(w['word'] for w in u)}
+                 for u in speech_units(words)]
         scene_summary = [{"time": frame["time"], "frame_available": True} for frame in frames[:24 if compact else 48]]
         output_contract = (
             "Return one concrete JSON object, not a JSON Schema. Top-level keys are "
@@ -870,10 +878,19 @@ class LocalDirector:
                "to the validated narrative plan supplied in the brief. Do not rewrite them. "
                "Design graphics, supplementary assets and SFX for that existing narrative.\n"
                if self._narrative_plan is not None else "") +
-            "Choose a small number of high-confidence segments and keep all arrays concise."
+            "Choose a small number of high-confidence segments and keep all arrays concise. "
+            "Optimize for a clear opening promise, context, evidence and a complete payoff; no invented stakes or claims. "
+            "Never select evenly spaced snippets. A source excerpt must begin/end at a sentence or pause boundary, "
+            "unless it directly continues the preceding/following source excerpt. Prefer one coherent passage to disconnected highlights. "
+            "Narration must add distinct context, connection and takeaway; never repeat the title as the script. "
+            "Use 4-8 words per inserted section with source:start-end evidence_refs overlapping selected clips. "
+            "Avoid long quotes on screen; keep graphic copy under 90 characters. "
+            f"Available speech units (absolute source times): {json.dumps(units,ensure_ascii=False)[:14000]}"
+
         )
 
     def plan(self, media: dict[str, Any], words: list[dict[str, Any]], frames: list[dict[str, Any]]) -> tuple[CompositionPlan, list[str]]:
+        self._planning_words = words
         endpoint = self._endpoint()
         warnings: list[str] = []
         hf_model = os.getenv("AI_COMPOSE_HF_MODEL", "").strip()
@@ -1097,7 +1114,7 @@ def _placement(asset: AssetRequest) -> tuple[float, float, float, float | None]:
     return asset.x, asset.y, asset.width, asset.height
 
 
-def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path, *, failed_searches=None) -> tuple[list[ResolvedLayer], list[dict[str, Any]], list[str]]:
+def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path, *, failed_searches=None, words=None) -> tuple[list[ResolvedLayer], list[dict[str, Any]], list[str]]:
     if not request.fetch_assets:
         return [], [], []
     asset_root = root / "assets"
@@ -1134,6 +1151,7 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path,
                 "reason": "already_used" if c.get("asset_id") in used else
                     ("below_score_floor" if float(c.get("score", 0) or 0) < minimum_score else "eligible")})
         candidate = None
+        source_offset = 0.0
         for attempt, choice in enumerate(eligible):
             try:
                 local_path = Path(str(choice['local_path'])) if choice.get('local_path') else asset_root / (
@@ -1149,6 +1167,15 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path,
                         picture.verify()
                 else:
                     probe_media(local_path)
+                if request.editor.enabled and request.editor.asset_visual_review:
+                    from ai_compose_asset_review import select_asset_window
+                    review_root = asset_root/f'review_{index:02d}_{attempt}'
+                    review_root.mkdir(exist_ok=True)
+                    offset, observations = select_asset_window(request, asset_request, local_path, plan, words, review_root)
+                    report.setdefault('visual_reviews', []).append({'asset_id':choice.get('asset_id'), 'windows':observations})
+                    if offset is None:
+                        continue
+                    source_offset = offset
                 candidate = choice
                 break
             except Exception as exc:
@@ -1160,6 +1187,9 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path,
             report["outcome"] = "no_candidates" if not candidates else "no_usable_candidate"
             if any(e.get("error_type") == "MediaHTTPBackoff" for e in report.get("download_decode_errors", [])):
                 report["outcome"] = "host_cooldown"
+            if eligible and len(report.get('visual_reviews', [])) == len(eligible) and not report.get('download_decode_errors'):
+                report['outcome'] = 'visual_content_rejected'
+                failed_searches.add(key)
             # Cache deterministic empty/score failures; allow transient download retries.
             if not eligible and not report.get("provider_errors") and not any(c.get("asset_id") in used for c in candidates):
                 failed_searches.add(key)
@@ -1169,18 +1199,23 @@ def resolve_assets(request: AIComposeRequest, plan: CompositionPlan, root: Path,
         used.add(str(candidate['asset_id']))
         try:
             x, y, width, height = _placement(asset_request)
+            from ai_compose_editorial import speaker_safe
+            if speaker_safe(request):
+                x, y, width, height = .04, .66, .92, .14
             layer = ResolvedLayer(
-                asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=asset_request.animation, animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=candidate_score, reason=asset_request.reason,
+                asset_id=str(candidate["asset_id"]), local_path=str(local_path), source=str(candidate.get("source", "unknown")), license=candidate.get("license"), attribution=candidate.get("attribution"), query=asset_request.query, kind=asset_request.kind, start=asset_request.start, end=asset_request.end, x=x, y=y, width=width, height=height, animation=("fade" if speaker_safe(request) else asset_request.animation), animation_seconds=asset_request.animation_seconds, opacity=asset_request.opacity, score=candidate_score, reason=asset_request.reason, source_offset=source_offset,
             )
             layers.append(layer)
             report["outcome"] = "resolved"
             manifest.append({
                 **candidate,
                 "local_path": str(local_path),
+                "source_offset": source_offset,
+                "visual_review": report.get("visual_reviews", []),
                 "sha256": _sha256(local_path),
                 "timeline": {"start": asset_request.start, "end": asset_request.end},
                 "geometry": {"x": x, "y": y, "width": width, "height": height},
-                "animation": asset_request.animation,
+                "animation": layer.animation,
                 "benefit": asset_request.benefit,
                 "confidence": asset_request.confidence,
                 "evidence_refs": asset_request.evidence_refs,
@@ -1527,7 +1562,7 @@ def render_composition(
     layer_indices: list[tuple[ResolvedLayer, int]] = []
     for layer in layers:
         path = Path(layer.local_path)
-        command += (["-stream_loop", "-1", "-i", str(path)] if _is_video(path) else ["-loop", "1", "-i", str(path)])
+        command += (["-stream_loop", "-1", "-ss", str(layer.source_offset), "-i", str(path)] if _is_video(path) else ["-loop", "1", "-i", str(path)])
         layer_indices.append((layer, input_index))
         input_index += 1
     if prepared_voiceovers is None:
@@ -1552,7 +1587,8 @@ def render_composition(
                 if not transcribed_voice:
                     raise ComposeError('Generated narration could not be transcribed for required captions')
                 for word in transcribed_voice:
-                    voice_words.append(dict(word,start=word['start']+at,end=word['end']+at))
+                    voice_words.append(dict(word,start=word['start']+at,end=word['end']+at,
+                                            caption_section=f'narration:{index}'))
         if voice_words:
             # Voiceover timestamps already use program time, unlike source ASR.
             caption_plan = plan.model_copy(update={'base_segments':[BaseSegment(source_start=0,source_end=duration)]})
@@ -1579,11 +1615,18 @@ def render_composition(
     for i, segment in enumerate(segments):
         d = segment.source_end - segment.source_start
         camera = camera_for_clip(edit_plan, i)
+        from ai_compose_editorial import speaker_safe
+        safe = speaker_safe(request) and segment.kind == 'source'
+        pane_height = max(2, int(height * .48 / 2)*2) if safe else height
         if camera and camera.keyframes:
-            visual_filter = _camera_visual_filter(camera, width, height, fps)
+            visual_filter = _camera_visual_filter(camera, width, pane_height, fps)
             camera_tracks_rendered += 1
         else:
             visual_filter = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,fps={fps}"
+        if safe:
+            if not (camera and camera.keyframes):
+                visual_filter = f"scale={width}:{pane_height}:force_original_aspect_ratio=decrease,pad={width}:{pane_height}:(ow-iw)/2:(oh-ih)/2:color=0x101b2c,fps={fps}"
+            visual_filter += f",pad={width}:{height}:0:{int(height*.16)//2*2}:color=0x101b2c"
         filters.append(f"[{i}:v]{visual_filter},setsar=1,setpts=PTS-STARTPTS[vseg{i}]")
         base_video_labels.append(f"[vseg{i}]")
         if segment.kind == 'narration':

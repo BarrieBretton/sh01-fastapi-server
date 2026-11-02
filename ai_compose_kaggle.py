@@ -36,7 +36,7 @@ def archive_run(root, outputs):
         for asset in json.loads(receipt.read_text()).get('asset_manifest',[]):
             credits.append('\n'.join(str(asset.get(k) or '') for k in
                 ('asset_id','title','attribution','license','license_url','source_url')))
-    (root/'ASSET_CREDITS.txt').write_text('\n\n'.join(credits) or 'No external assets used.\n')
+    (root/'ASSET_CREDITS.txt').write_text('\n\n'.join(credits) or ('No external assets used.\n' if receipt.is_file() else 'No accepted final. Consult draft storyboards for asset attribution.\n'),encoding='utf-8')
     archive=root.parent/(root.name+'-output.zip')
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
         for name in ('composition_receipt.json','evidence.json','review_history.json','ASSET_CREDITS.txt','status.json','request.json','runtime.json'):
@@ -48,6 +48,18 @@ def archive_run(root, outputs):
             for path in sorted(root.glob(pattern)):
                 if path.is_file() and not path.is_symlink():
                     output.write(path, path.relative_to(root))
+        if not outputs:
+            # Export the latest rejected preview for human inspection, never as a final.
+            drafts = sorted(root.glob('draft_*'),reverse=True)
+            latest = next((d for d in drafts if any(d.glob('variant_*.mp4'))),None)
+            if latest:
+                output.writestr('REJECTED_PREVIEW.txt','These previews failed acceptance checks. They are not approved final videos. See review_history.json and draft storyboards.\n')
+                remaining = 150*1024*1024
+                for path in sorted(latest.glob('variant_*')):
+                    if (path.suffix in {'.mp4','.ass'} and path.is_file() and not path.is_symlink()
+                            and path.resolve().is_relative_to(root.resolve()) and path.stat().st_size <= remaining):
+                        output.write(path, 'rejected_previews/'+path.name)
+                        remaining -= path.stat().st_size
         for item in outputs:
             path=Path(item['local_path'])
             if path.is_file() and path.parent.resolve()==root.resolve():

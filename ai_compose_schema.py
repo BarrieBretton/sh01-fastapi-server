@@ -63,6 +63,12 @@ class EditorOptions(BaseModel):
     """Automatic production controls. Explicit off switches remain authoritative."""
 
     enabled: bool = False  # opt in; existing clients retain their behavior
+    quality_profile: Literal["standard", "polished"] = "standard"
+    narrative_revision: Literal["design_only", "replan"] = "design_only"
+    layout: Literal["auto", "speaker_safe", "director"] = "auto"
+    caption_font_size: int = Field(default=62, ge=36, le=96)
+    asset_visual_review: bool = False
+    visual_review_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
     caption_style: Literal["phrase", "highlight", "karaoke", "off"] = "highlight"
     theme: Literal["editorial", "bold", "minimal"] = "editorial"
     progress_bar: bool = True
@@ -258,6 +264,7 @@ class ResolvedLayer(BaseModel):
     opacity: float = 1.0
     score: float = 0.0
     reason: str = "semantic_support"
+    source_offset: float = Field(default=0.0, ge=0.0)
 
 
 class AIComposePlan(BaseModel):

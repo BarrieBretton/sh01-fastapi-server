@@ -36,7 +36,7 @@ def describe_frames(instruction, frames):
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[text], images=images, padding=True, return_tensors='pt').to(model.device)
         with torch.inference_mode():
-            outputs = model.generate(**inputs, max_new_tokens=700, do_sample=False)
+            outputs = model.generate(**inputs, max_new_tokens=1400, do_sample=False)
         return processor.batch_decode(outputs[:,inputs['input_ids'].shape[-1]:], skip_special_tokens=True)[0]
     finally:
         del outputs, inputs, model, processor, images

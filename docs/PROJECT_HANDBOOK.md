@@ -280,3 +280,61 @@ invalid Retry-After on a 429 defaults to 600 seconds. Restarting the server
 loses this in-memory deadline; operators must still honor the reported delay.
 Retrieval reports record status, host and retry delay without URL queries or
 response bodies. Rebuild the one-cell notebook to embed this module and fix.
+
+### Editorial polish corrections (3 November 2026)
+
+**Observed:** operator draft `7e7645e2c2d257e7bdbcdfd2a108b7b6` rendered a
+19.1-second vertical video but placed quotes over the speaker's eyes, used stock
+logo/title openings, repeated a generic narration label, and merged subtitles
+across speech sections. Successful feature counts did not establish editorial quality.
+
+**Code:** `ai_compose_editorial.py`, `ai_compose_asset_review.py` and the existing
+editor/compositor add the following opt-in controls in `EditorOptions`:
+
+| Control | Default for existing API callers | Updated one-cell notebook |
+| --- | --- | --- |
+| `quality_profile` | `standard` | `polished` |
+| `narrative_revision` | `design_only` | `replan` |
+| `layout` | `auto` (legacy layout under standard profile) | `speaker_safe` |
+| `caption_font_size` | 62 design pixels | 78 design pixels |
+| `asset_visual_review` | false | true |
+| `visual_review_threshold` | 0.70 | 0.70 |
+
+Polished narrative validation checks discontinuous cuts against ASR sentence/pause
+boundaries, checks the body time budget before normalization can truncate speech,
+and rejects duplicated narration labels or scripts without selected-source interval
+references. These are necessary coherence checks, not proof of factual accuracy or
+story appeal. Director validation returns failures to the model for correction.
+`replan` allows new source cuts and scripts when narrative checks fail during
+revision; `design_only` retains the approved narrative. The design stage itself
+continues to preserve cuts and narration. Existing brief, time window, audio,
+caption, music, SFX, transition, variant and required-feature controls remain.
+
+The protected layout reserves separate header, speaker, media and caption regions;
+it is a deterministic composition, **not face tracking**. `director` restores free
+placement. Protected media uses fades so entrance motion cannot cross into the
+speaker/subtitle regions. Captions retain source/narration provenance and split at
+section boundaries. Quotes crossing an inserted narration slot use one readable
+interval instead of flashing the complete quote again for a tiny remainder.
+
+Asset review decodes samples of at most two candidate windows, rejects sampled
+logo-only or unrelated material, and stores the selected source offset and review
+in retrieval reports/receipts. The renderer seeks to that offset; split overlays
+advance within the same asset. Per-job caches avoid repeating completed checks.
+This adds local VLM inference cost and does not certify unseen frames or the truth
+of a depicted event. Required media still fails honestly if none is acceptable.
+
+Draft visual reviews require timestamped visible observations. Invalid evidence
+(including audio assertions from stills) gets one correction attempt, then fails.
+Each output variant is reviewed; review motion/audio remain unassessed. Aggregated
+status, score, duration and causes reflect rendered reviews, rather than labelling
+an editorial failure as a visual-score failure. Failed-job ZIPs include the latest
+rejected previews up to a 150 MiB export budget with an explicit rejection label;
+these are not published as passing outputs.
+
+**Validation:** synthetic regression tests cover caption boundaries, quote splits,
+narrative retries, visual evidence checks, independent review aggregation, selected
+asset offsets and a real FFmpeg render of protected regions. Prior AI-compose tests
+are rerun with FFmpeg. Local model outputs, the operator's raw military source,
+watchability, audience retention and virality remain **unverified** until the rebuilt
+notebook runs on Kaggle and the resulting video is inspected. No paid API is added.

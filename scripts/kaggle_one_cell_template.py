@@ -9,6 +9,12 @@ TARGET_SECONDS = 35
 NARRATION = 'intro_bridge_outro'   # 'intro_outro', 'intro', 'auto', or 'off'
 REQUIRED_FEATURES = ['voiceover','sfx','music','camera_motion','transitions','graphics','supplementary_media','captions']
 REFINEMENT_ROUNDS = 2
+QUALITY_PROFILE = 'polished'     # 'standard' retains earlier, less strict editorial checks.
+NARRATIVE_REVISION = 'replan'    # 'design_only' locks the chosen source cuts and narration.
+LAYOUT = 'speaker_safe'         # 'director' respects free overlay geometry instead.
+CAPTION_FONT_SIZE = 78          # Design-canvas pixels (1080x1920), scaled with output.
+ASSET_VISUAL_REVIEW = True      # Inspect actual media windows; costs extra local VLM calls.
+VISUAL_REVIEW_THRESHOLD = 0.70
 OUTPUT_SIZE = (1080, 1920)       # Use (720,1280) for a faster draft.
 LOCAL_ASSET_LIBRARY = ''        # Optional annotated media directory; uses Commons otherwise.
 MUSIC_PATH = ''                 # Optional local track; empty => original procedural ambient bed.
@@ -162,7 +168,9 @@ payload = {
     'asset_sources':{'local_library':True,'wikimedia':True,'pexels':True,'pixabay':True},
     'editorial_policy':{'source_audio':'preserve','supplementary_visuals':'require',
         'camera_motion':'dynamic','motion_graphics':'hero'},
-    'editor':{'enabled':True,'narration':NARRATION,'narration_budget_seconds':12,
+    'editor':{'enabled':True,'quality_profile':QUALITY_PROFILE,'narrative_revision':NARRATIVE_REVISION,
+        'layout':LAYOUT,'caption_font_size':CAPTION_FONT_SIZE,'asset_visual_review':ASSET_VISUAL_REVIEW,
+        'visual_review_threshold':VISUAL_REVIEW_THRESHOLD,'narration':NARRATION,'narration_budget_seconds':12,
         'caption_style':'highlight','theme':'editorial','progress_bar':True,
         'music':'library' if MUSIC_PATH else 'procedural','procedural_sfx':True,
         'transition':'dissolve','min_graphics':2,'min_visual_layers':1,

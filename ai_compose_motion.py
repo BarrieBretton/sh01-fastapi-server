@@ -22,7 +22,7 @@ def clock(value):
 
 def map_words(words, segments):
     result, cursor = [], 0.0
-    for segment in segments:
+    for segment_index, segment in enumerate(segments):
         if getattr(segment, 'kind', 'source') == 'narration':
             cursor += segment.source_end-segment.source_start
             continue
@@ -32,7 +32,8 @@ def map_words(words, segments):
                 end = min(b, segment.source_end)
                 if end > a:
                     result.append(dict(word, start=cursor+a-segment.source_start,
-                                       end=cursor+end-segment.source_start))
+                                       end=cursor+end-segment.source_start,
+                                       caption_section=word.get("caption_section", f"source:{segment_index}")))
         cursor += segment.source_end-segment.source_start
     return sorted(result, key=lambda w: w["start"])
 
@@ -43,6 +44,8 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
     Returns counts from events actually emitted, rather than plan lengths.
     Captions and graphics have separate tracks and explicit off switches.
     """
+    from ai_compose_editorial import speaker_safe
+    safe = speaker_safe(request)
     theme = {"editorial": "&H00D7F066", "bold": "&H003BDFFF", "minimal": "&H00FFFFFF"}[request.editor.theme]
     lines = ["[Script Info]", "ScriptType: v4.00+", "PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2",
              "[V4+ Styles]", "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
@@ -64,7 +67,7 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
         mapped = map_words(words, plan.base_segments)
         groups, group = [], []
         for word in mapped:
-            if group and (len(group) >= 4 or len(" ".join(str(w['word']) for w in group)) > 24
+            if group and (word.get("caption_section") != group[-1].get("caption_section") or len(group) >= 4 or len(" ".join(str(w['word']) for w in group+[word])) > max(16, int(1480/request.editor.caption_font_size))
                           or word["start"]-group[-1]["end"] > .5):
                 groups.append(group); group = []
             group.append(word)
@@ -74,6 +77,9 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
             # Fixed caption band, clear of the supporting visual band.
             a, b = group[0]["start"], group[-1]["end"]
             style = request.editor.caption_style
+            # Fit unusually long words without letting subtitles escape their band.
+            length = len(" ".join(str(w['word']).strip() for w in group))
+            font = min(request.editor.caption_font_size, max(30, int(1480/max(1,length))))
             indices = range(len(group)) if style != "phrase" else [0]
             for i in indices:
                 start = a if style == "phrase" else group[i]["start"]
@@ -82,7 +88,7 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
                 for j, word in enumerate(group):
                     active = style != "phrase" and (j == i or style == "karaoke" and j <= i)
                     pieces.append((f"{{\\1c{theme}}}" if active else "{\\1c&H00FFFFFF}") + escape(word['word']).strip())
-                event(20, start, end, "\\an5\\pos(540,1510)\\fs62", " ".join(pieces))
+                event(20, start, end, f"\\an5\\pos(540,{1650 if safe else 1510})\\fs{font}", " ".join(pieces))
                 counts["caption_events"] += 1
 
     for cue in edit_plan.graphics:
@@ -107,8 +113,8 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
             counts['graphics_rendered'] += 1
             continue
         labels = [part.strip() for part in text.split('|') if part.strip()]
-        if cue.kind in {'checklist', 'timeline'} and len(labels) <= 5 and all(len(label)<=43 for label in labels):
-            y = 220 if cue.placement in {'top','upper_left'} else 1000
+        if not safe and cue.kind in {'checklist', 'timeline'} and len(labels) <= 5 and all(len(label)<=43 for label in labels):
+            y = 20 if safe else (220 if cue.placement in {'top','upper_left'} else 1000)
             h = 70 + len(labels)*80
             rect(cue.start,cue.end,80,y,920,h,'&H00201A16','\\1a&H24\\fad(100,140)')
             if cue.kind == 'timeline':
@@ -119,7 +125,7 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
                 event(7,a,cue.end,f'\\an4\\pos(155,{y+55+index*80})\\fs42\\bord0\\fad(100,120)',label)
             counts['graphics_rendered'] += 1
             continue
-        if cue.kind == 'badge' and len(text) <= 40:
+        if not safe and cue.kind == 'badge' and len(text) <= 40:
             rect(cue.start,cue.end,80,240,920,100,theme,'\\fad(100,140)')
             event(7,cue.start,cue.end,'\\an5\\pos(540,290)\\fs46\\bord0\\1c&H00101010\\fad(100,140)',text)
             counts['graphics_rendered'] += 1
@@ -130,10 +136,17 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
         y = {"top": 175, "upper_left": 280, "center": 700,
              "lower_left": 1100, "bottom": 1140}.get(cue.placement, 700)
         y = min(y, 1380-h)  # reserve caption band even for a tall card
+        if safe:
+            wrapped = textwrap.wrap(text, 32, break_long_words=True) or [text]
+            font = min(60, max(30, int(190 / max(1, len(wrapped)))-10))
+            h = 40 + len(wrapped)*(font+10)
+            if h > 265:
+                raise ValueError('Graphic cannot fit protected header; shorten copy')
+            y = 25
         x, w = 80, 920
         ms = min(280, int((cue.end-cue.start)*1000*.25))
         anim = "\\fad(100,140)"
-        if cue.animation in {"slide_up", "slide_down"}:
+        if not safe and cue.animation in {"slide_up", "slide_down"}:
             delta = 70 if cue.animation == "slide_up" else -70
             pos = f"\\move(540,{y+h/2+delta},540,{y+h/2},0,{ms})"
         else:
@@ -145,8 +158,8 @@ def write_motion_ass(path: Path, request, plan, edit_plan, words):
         event(7, cue.start, cue.end, f"\\an5{pos}\\fs{font}\\bord0"+anim, r"\N".join(wrapped))
         counts["graphics_rendered"] += 1
     if request.editor.progress_bar:
-        rect(0, edit_plan.duration, 80, 1670, 920, 7, "&H00444444")
-        rect(0, edit_plan.duration, 80, 1670, 920, 7, theme,
+        rect(0, edit_plan.duration, 80, 1790 if safe else 1670, 920, 7, "&H00444444")
+        rect(0, edit_plan.duration, 80, 1790 if safe else 1670, 920, 7, theme,
              f"\\fscx0\\t(0,{int(edit_plan.duration*1000)},1,\\fscx100)", 6)
         counts["progress_bars_rendered"] = 1
     path.write_text("\n".join(lines)+"\n", encoding="utf-8")
