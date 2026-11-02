@@ -250,3 +250,11 @@ Generated Python and notebook files use UTF-8 and LF, independent of the Windows
 locale. Rebuild both artifacts with `python scripts/build_one_cell.py` after
 source changes; CI still rejects any difference in decoded notebook/Python code.
 Regression tests simulate Windows-1252 defaults and verify Unicode and LF output.
+
+### CI render memory budget
+
+The Python/FFmpeg test step sets `MEDIA_FFMPEG_MAX_RSS_MB=1024` for composite
+render fixtures on GitHub-hosted runners. This is a finite per-process RSS
+budget, scoped to that CI step; production retains its 256 MiB default.
+Cgroup headroom checks and subprocess timeouts remain enabled. Passing these
+render tests does not establish suitability for a 512 MiB production host.

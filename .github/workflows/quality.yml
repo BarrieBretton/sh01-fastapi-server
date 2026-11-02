@@ -39,6 +39,10 @@ jobs:
         run: python -m ruff check --config ci/ruff.toml .
       - name: Unit and real render tests (skips fail CI)
         if: ${{ !cancelled() && (steps.lint.outcome == 'success' || steps.lint.outcome == 'failure') }}
+        env:
+          # Composite render fixtures exceed the small-host 256 MiB default.
+          # Keep a finite CI budget; production defaults and cgroup checks remain.
+          MEDIA_FFMPEG_MAX_RSS_MB: '1024'
         run: python -m coverage run --source=. --omit='tests/*,notebooks/*' ci/run_tests.py
       - name: Coverage report
         if: ${{ !cancelled() && hashFiles('.coverage') != '' }}
