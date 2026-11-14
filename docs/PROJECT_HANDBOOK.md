@@ -239,3 +239,11 @@ Validation: 59 Python backend tests, 97 JavaScript dashboard tests and four dash
 Dashboard fingerprint and duplicate-group writes now retry transient failures up to three total attempts with jitter and Retry-After handling within the existing delivery budget. Retries reuse computed fingerprints, and validation or permission failures are not retried. Unacknowledged writes retain checkpoint rewind behavior. Safe diagnostics expose HTTP status, allowlisted dashboard error codes and attempt counts, never response bodies or credentials.
 
 Observed: three accounts acknowledged six saved fingerprints; the next account processed two items but its save was unacknowledged. The underlying HTTP failure remains unverified until the detailed live response is available. Local verification: 67 backend tests passed. No live deployment or scan was performed by this patch.
+
+## Scanner quota recovery
+
+Code: scanner reads and deterministic writes share process-local request pacing and a 75-second minimum storage-rate-limit cooldown, honoring longer Retry-After values. Reads retry transient errors up to three attempts within their budget; permanent errors stop. Every unsuccessful catalogue batch retains its original cursor. The PowerShell runner scripts/run_catalogue_scans.ps1 keeps the existing progress file, waits 75 seconds between batches, retries explicit throttles up to three times with jitter, and stops on ambiguous timeouts or permanent failures. One round is the default; no unattended schedule is installed.
+
+Worker read snapshots coalesce metadata reads for ten seconds, are credential/workbook scoped, and invalidate after fingerprint writes. Writes always revalidate through storage transactions. Other writers may be reflected up to ten seconds later. These are process/isolate-local controls, not a distributed quota coordinator; collector and UI traffic still share Google quota. Operator observed Erika recover after a 75-second pause; global quota headroom and full-catalogue duplicate accuracy remain unverified.
+
+Local regression evidence: 74 backend tests and 99 dashboard tests passed. PowerShell execution is pending the operator Windows run; installer checks support LF and CRLF. No live scan or deployment was performed here.

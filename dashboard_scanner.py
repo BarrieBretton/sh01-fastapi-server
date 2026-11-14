@@ -3,9 +3,12 @@ from urllib.parse import urlencode
 import random
 import time
 import social_inventory as core
+from scanner_quota import QuotaHTTP, scope
 
 def bridge_client():
-    return core.Dashboard(core.SafeHTTP(core.Budget(seconds=60, max_bytes=8*1024*1024)))
+    client = core.Dashboard(core.SafeHTTP(core.Budget(seconds=60, max_bytes=8*1024*1024)))
+    client.http = QuotaHTTP(client.http, scope(client.base, client.headers))
+    return client
 
 def read_bridge(client, path, params=None):
     url = client.base + '/api/ingest/scanner/' + path
@@ -33,6 +36,9 @@ def connection_diagnostics():
                 'code':'diagnostic_failed'}, 'cdn_access_verified':False}
 
 class FingerprintSink(core.Dashboard):
+    def delivery_http(self):
+        return QuotaHTTP(core.SafeHTTP(core.Budget(seconds=30, max_bytes=8*1024*1024)), scope(self.base, self.headers))
+
     def write_batch(self, endpoint, payload):
         # Only deterministic fingerprint updates and group upserts use this retry path.
         transient = {'store_rate_limited', 'store_network_unavailable', 'store_google_unavailable',
@@ -48,6 +54,7 @@ class FingerprintSink(core.Dashboard):
                 status = diagnostic.get('http_status')
                 category = diagnostic.get('dashboard_code')
                 retry = (category in transient if category else status in (429,500,502,503,504)) or isinstance(exc,core.TransportError)
+                if str(exc) == 'scanner_storage_cooldown': raise
                 if not retry or attempt==2: raise
                 delay = max(diagnostic.get('retry_after_seconds',0),2**attempt) + random.uniform(0,2**attempt)
                 try:
@@ -143,6 +150,13 @@ def scan_catalogue(request):
     provider=CatalogueProvider(cfg,client)
     sink=FingerprintSink(client.http)
     result=core.scan(request,cfg=cfg,provider=provider,dashboard=sink,normalizer=provider.normalize,cursor_scope='catalogue-v1:')
+    if not result['ok']:
+        # Keep every failed batch replayable, including failures before ingestion.
+        result['resume_cursor'] = request.cursor
+        result['coverage']['provider_exhausted'] = False
+        result['coverage']['pagination_truncated'] = True
+    result['retry_after_seconds'] = max([0] + [float(e.get('diagnostic', {}).get('retry_after_seconds', 0)) for e in result['errors']])
+    result['next_batch_after_seconds'] = 75
     coverage=result['coverage']
     coverage['catalogue_exhausted']=coverage.pop('provider_exhausted')
     coverage['provider_exhausted']=False

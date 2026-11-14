@@ -894,7 +894,9 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
     try:
         known, cache_truncated = dashboard.cache(cfg)
     except SafeError as exc:
-        raise SafeError("dashboard_cache_unavailable") from None
+        failure = SafeError("dashboard_cache_unavailable")
+        failure.diagnostic = dict(getattr(exc, "diagnostic", {}))
+        raise failure from None
     posts, scanned_ids = [], set()
     counts = {"visited": 0, "media_posts": 0, "unsupported_posts": 0, "fingerprinted": 0, "reused": 0,
               "carousels_metadata_only": 0, "failed_items": 0, "missing_permalink_skipped": 0, "posts_ingested": 0, "duplicate_groups_ingested": 0}
@@ -985,7 +987,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
         errors.append({"stage": "comparison", "code": "comparison_budget_exhausted"})
     # Reserve an independent 30-second, 8 MiB delivery budget even when media budget ran out.
     if isinstance(dashboard, Dashboard):
-        dashboard.http = SafeHTTP(Budget(seconds=30, max_bytes=8 * 1024 * 1024))
+        dashboard.http = dashboard.delivery_http() if hasattr(dashboard, "delivery_http") else SafeHTTP(Budget(seconds=30, max_bytes=8 * 1024 * 1024))
     try:
         counts["posts_ingested"] = dashboard.ingest("posts", posts)
         counts["duplicate_groups_ingested"] = dashboard.ingest("groups", groups)
@@ -1027,7 +1029,9 @@ async def scan_route(request: ScanRequest, x_api_key: str | None = Header(defaul
     except SafeError as exc:
         code = str(exc)
         status = 400 if code in ("account_not_configured", "invalid_or_expired_cursor") else 503
-        raise HTTPException(status_code=status, detail=code) from None
+        diagnostic = getattr(exc, "diagnostic", {})
+        raise HTTPException(status_code=status, detail={"code": code, **diagnostic} if diagnostic else code,
+                            headers={"Retry-After": str(int(diagnostic["retry_after_seconds"]))} if diagnostic.get("retry_after_seconds") else None) from None
     except Exception:
         raise HTTPException(status_code=503, detail="social_inventory_failed") from None
 

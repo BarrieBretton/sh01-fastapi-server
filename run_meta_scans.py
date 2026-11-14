@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from urllib.request import Request, build_opener
 from urllib.parse import urlsplit
 from read_only_client import NoRedirect
@@ -33,21 +34,27 @@ def main():
     print(json.dumps(data, indent=2))
     if not a.scan: return
     # Validate all identities before using any as a checkpoint filename.
+    ran_batch = False
     for row in rows:
         if row.get('platform') not in ('facebook', 'instagram') or not str(row.get('account_id', '')).isascii() or not str(row.get('account_id', '')).isdigit():
             raise SystemExit('Invalid account identity; no scans started.')
     env = dict(os.environ, SOCIAL_INVENTORY_API_KEY=key)
+    ran_batch = False
     for row in rows:
         if row.get('stored_posts') == 0:
             print('No collected posts:', row['platform'], row['account_id']); continue
         checkpoint = a.checkpoint_dir / (row['platform'] + '-' + row['account_id'] + '.json')
         if checkpoint.exists() and json.loads(checkpoint.read_text()).get('complete'):
             print('Catalogue checkpoint complete:', row['platform'], row['account_id']); continue
+        if ran_batch:
+            print('Pacing: waiting 75 seconds before next batch.', flush=True)
+            time.sleep(75)
         print('Scanning:', row['platform'], row['account_id'], flush=True)
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('run_social_scan.py')),
                                  row['platform'], row['account_id'], '--batches', '1', '--max-posts', str(a.max_posts),
                                  '--checkpoint', str(checkpoint)], env=env)
         if result.returncode: raise SystemExit('Batch failed; stopped. Existing checkpoints retained.')
+        ran_batch = True
     print('One bounded pass finished. Re-run --scan to resume unfinished accounts; this only covers collected dashboard posts. Use a new checkpoint directory for a fresh catalogue pass.')
 
 if __name__ == '__main__': main()
