@@ -26,7 +26,7 @@ def main():
             with opener.open(req,timeout=360) as r:result=json.load(r)
         except Exception:raise SystemExit('Scan response unavailable. Check server status; checkpoint retained for idempotent replay.') from None
         if not isinstance(result.get('coverage'),dict) or 'resume_cursor' not in result:raise SystemExit('Invalid scan response; checkpoint retained')
-        state.update(cursor=result['resume_cursor'],complete=result['coverage'].get('provider_exhausted') is True)
+        state.update(cursor=result['resume_cursor'],complete=(result['coverage'].get('catalogue_exhausted') is True if result['coverage'].get('source')=='dashboard_catalogue' else result['coverage'].get('provider_exhausted') is True))
         path.parent.mkdir(parents=True,exist_ok=True);fd,tmp=tempfile.mkstemp(dir=path.parent,prefix='.scan-')
         try:
             with os.fdopen(fd,'w') as f:json.dump(state,f);f.flush();os.fsync(f.fileno())

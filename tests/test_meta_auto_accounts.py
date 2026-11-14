@@ -96,6 +96,8 @@ class AutoAccountsTests(unittest.TestCase):
         r = client.get('/social/inventory/status', headers={'X-API-KEY': 'media'}).json()
         self.assertFalse(r['meta_credential_configured'])
         self.assertFalse(r['dashboard_auth_verified'])
-        self.assertEqual(client.get('/social/inventory/accounts', headers={'X-API-KEY': 'media'}).status_code, 503)
+        self.assertFalse(r['meta_credential_required_for_scanner'])
+        with patch('dashboard_scanner.catalogue_accounts', return_value={'rows':[], 'source':'dashboard_catalogue'}):
+            self.assertEqual(client.get('/social/inventory/accounts', headers={'X-API-KEY': 'media'}).status_code, 200)
 
 if __name__ == '__main__': unittest.main()

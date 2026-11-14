@@ -345,7 +345,7 @@ class InventoryTest(unittest.TestCase):
             self.assertEqual(client.post("/social/inventory/scan", json=body).status_code, 401)
             for invalid in (dict(body, max_posts=101), dict(body, url="https://arbitrary.test")):
                 self.assertEqual(client.post("/social/inventory/scan", json=invalid, headers={"X-API-KEY": "test-key-not-production"}).status_code, 422)
-            with patch.object(s, "scan", return_value={"ok": True}):
+            with patch("dashboard_scanner.scan_catalogue", return_value={"ok": True}):
                 self.assertEqual(client.post("/social/inventory/scan", json=body, headers={"X-API-KEY": "test-key-not-production"}).json(), {"ok": True})
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not available")

@@ -30,16 +30,12 @@ class DiscoveryDiagnosticsTests(unittest.TestCase):
         class Failed:
             def json(self, *args, **kwargs):
                 raise inv.GraphHTTPError('upstream_http_error',400,{'error':{'code':190,'message':'SECRET_VALUE'}})
-        app = FastAPI(); app.include_router(inv.router); client = TestClient(app)
-        with patch.object(inv,'SafeHTTP',return_value=Failed()):
-            self.assertEqual(client.get('/social/inventory/accounts').status_code,401)
-            r = client.get('/social/inventory/accounts',headers={'X-API-KEY':'test-key'})
-        self.assertEqual(r.status_code,503)
-        errors = r.json()['detail']['errors']
+        with self.assertRaises(meta.DiscoveryError) as caught:
+            meta.discover(Failed())
+        errors = caught.exception.errors
         self.assertEqual([e['edge'] for e in errors],['me/accounts','me/assigned_pages'])
         self.assertTrue(all(e['graph_code']==190 for e in errors))
-        self.assertNotIn('SECRET_VALUE',r.text)
-        self.assertNotIn('test-key',r.text)
+        self.assertNotIn('SECRET_VALUE',str(errors))
     def test_transport_errors_are_reported_per_edge(self):
         class Failed:
             def json(self, *args, **kwargs): raise inv.SafeError('upstream_transport_error')

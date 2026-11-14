@@ -105,7 +105,7 @@ def host_allowed(host: str, allowed: tuple[str, ...], suffix: bool = False) -> b
 
 
 def validate_url(url: str, allowed: tuple[str, ...], *, suffix: bool = False,
-                 resolver=socket.getaddrinfo) -> tuple[str, str, str]:
+                 resolver=socket.getaddrinfo, all_addresses=False) -> tuple[str, str, str]:
     """Validate and pin one public address; the connection never resolves it again."""
     try:
         p = urlsplit(url)
@@ -115,10 +115,10 @@ def validate_url(url: str, allowed: tuple[str, ...], *, suffix: bool = False,
                 not host_allowed(host, allowed, suffix)):
             raise SafeError("url_not_allowed")
         records = resolver(host, 443, type=socket.SOCK_STREAM)
-        addresses = sorted({r[4][0] for r in records})
+        addresses = sorted({r[4][0] for r in records}, key=lambda a: (ipaddress.ip_address(a).version, a))
         if not addresses or any(not ipaddress.ip_address(a).is_global for a in addresses):
             raise SafeError("nonpublic_address")
-        return host, addresses[0], p.path + ("?" + p.query if p.query else "") or "/"
+        return host, addresses if all_addresses else addresses[0], p.path + ("?" + p.query if p.query else "") or "/"
     except SafeError:
         raise
     except Exception:
@@ -131,12 +131,40 @@ class PinnedHTTPS(http.client.HTTPSConnection):
         self.address = address
 
     def connect(self):
-        raw = socket.create_connection((self.address, 443), self.timeout)
-        try:
-            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
-        except Exception:
-            raw.close()
-            raise
+        addresses = self.address if isinstance(self.address, list) else [self.address]
+        deadline = time.monotonic() + self.timeout
+        last = None
+        for address in addresses[:4]:
+            left = deadline - time.monotonic()
+            if left <= 0: break
+            raw = None
+            try:
+                self.failure_stage = "tcp_connect"
+                raw = socket.create_connection((address, 443), min(left, 4))
+                self.failure_stage = "tls_handshake"
+                raw.settimeout(max(0.1, deadline - time.monotonic()))
+                self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+                self.failure_stage = None
+                return
+            except Exception as exc:
+                if raw is not None: raw.close()
+                if not isinstance(exc, OSError): raise
+                last = exc
+        if last is not None: raise last
+        raise TimeoutError("connect_budget_exhausted")
+
+
+class TransportError(SafeError):
+    def __init__(self, exc, stage):
+        super().__init__("upstream_transport_error")
+        name = type(exc).__name__
+        allowed = {"TimeoutError", "SSLError", "SSLCertVerificationError", "ConnectionRefusedError",
+                   "ConnectionResetError", "ConnectionAbortedError", "OSError", "RemoteDisconnected",
+                   "BadStatusLine", "IncompleteRead", "AttributeError", "ValueError"}
+        self.diagnostic = {"stage":stage, "exception":name if name in allowed else "other_transport_exception"}
+        for attr in ("errno", "verify_code"):
+            value = getattr(exc, attr, None)
+            if type(value) is int: self.diagnostic[attr] = value
 
 
 class SafeHTTP:
@@ -153,10 +181,12 @@ class SafeHTTP:
             headers["Content-Type"] = "application/json"
         for hop in range(redirects + 1):
             self.budget.remaining()
-            host, address, path = validate_url(url, allowed, suffix=suffix)
+            host, address, path = validate_url(url, allowed, suffix=suffix, all_addresses=True)
             conn = PinnedHTTPS(host, address, min(12, self.budget.remaining()))
+            stage = "request_send"
             try:
                 conn.request(method, path, body=body, headers=headers)
+                stage = "response_headers"
                 response = conn.getresponse()
                 if response.status in (301, 302, 303, 307, 308):
                     location = response.getheader("Location")
@@ -178,11 +208,8 @@ class SafeHTTP:
                         except Exception:
                             pass  # Preserve HTTP status even if the error body cannot be read.
                         raise GraphHTTPError(code, response.status, payload)
-                    if response.status == 429:
-                        raise SafeError("upstream_rate_limited")
-                    if response.status in (401, 403):
-                        raise SafeError("upstream_permission_denied")
-                    raise SafeError("upstream_http_error")
+                    raise GraphHTTPError(code, response.status)
+                stage = "response_body"
                 declared = response.getheader("Content-Length")
                 if declared and int(declared) > limit:
                     raise SafeError("media_too_large")
@@ -201,8 +228,8 @@ class SafeHTTP:
                     chunks.append(chunk)
             except SafeError:
                 raise
-            except Exception:
-                raise SafeError("upstream_transport_error") from None
+            except Exception as exc:
+                raise TransportError(exc, getattr(conn, "failure_stage", None) or stage) from None
             finally:
                 conn.close()
         raise SafeError("redirect_refused")
@@ -815,13 +842,14 @@ class ScanRequest(BaseModel):
         extra = "forbid"
 
 
-def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=None, budget=None) -> dict:
+def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=None, budget=None, normalizer=None, cursor_scope="") -> dict:
     cfg = cfg or config_for(request.account_id, request.platform)
     budget = budget or Budget(seconds=max(15, min(300, int(os.environ.get("SOCIAL_SCAN_MAX_SECONDS", "120")))))
     http = http or SafeHTTP(budget)
     provider = provider or Provider(cfg, http)
     dashboard = dashboard or Dashboard(http)
-    state = decode_cursor(request.cursor, request.account_id, request.platform)
+    cursor_account = cursor_scope + request.account_id
+    state = decode_cursor(request.cursor, cursor_account, request.platform)
     errors, known, cache_truncated = [], {}, False
     try:
         known, cache_truncated = dashboard.cache(cfg)
@@ -855,10 +883,11 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
                 if counts["visited"] >= request.max_posts:
                     break
                 budget.remaining()
-                checkpoint = {"after": state["after"], "skip": index}
+                if not hasattr(provider, "checkpoint"):
+                    checkpoint = {"after": state["after"], "skip": index}
                 post = None
                 try:
-                    post = normalize_post(raw_posts[index], cfg)
+                    post = (normalizer or normalize_post)(raw_posts[index], cfg)
                     if post is None:
                         counts["unsupported_posts"] += 1
                     else:
@@ -873,7 +902,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
                             scanned_ids.add(post_id)
                         else:
                             url = provider.media_url(post)
-                            data = http.request(url, CDNS[request.platform], suffix=True, redirects=3,
+                            data = provider.download(post, url, http) if hasattr(provider, "download") else http.request(url, CDNS[request.platform], suffix=True, redirects=3,
                                                 limit=(10 if kind == "IMAGE" else 40) * 1024 * 1024)
                             fp = fingerprint_bytes(data, kind, budget, use_orb=use_orb)
                             metadata["fingerprint"] = known[post_id] = fp
@@ -883,7 +912,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
                 except Exception as exc:
                     code = str(exc) if isinstance(exc, SafeError) else "item_processing_failed"
                     failed_id = post.metadata["post_id"] if post else str(raw_posts[index].get("id_string", raw_posts[index].get("id", ""))) if isinstance(raw_posts[index], dict) else ""
-                    errors.append({"stage": "item", "code": code, **({"post_id": failed_id} if re.fullmatch(r"[A-Za-z0-9_-]{1,150}", failed_id) else {})})
+                    errors.append({"stage": "item", "code": code, **({"diagnostic":exc.diagnostic} if hasattr(exc, "diagnostic") else {}), **({"post_id": failed_id} if re.fullmatch(r"[A-Za-z0-9_-]{1,150}", failed_id) else {})})
                     counts["failed_items"] += 1
                     if code == "missing_or_unsupported_permalink":
                         counts["missing_permalink_skipped"] += 1
@@ -893,7 +922,10 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
                         stop_reason = code
                         raise SafeError(code)
                 counts["visited"] += 1
-                checkpoint = {"after": state["after"], "skip": index + 1}
+                checkpoint = provider.checkpoint(raw_posts[index]) if hasattr(provider, "checkpoint") else {"after": state["after"], "skip": index + 1}
+            if hasattr(provider, "checkpoint") and checkpoint.get("after") == raw_posts[-1].get("post_id") and next_after is None:
+                exhausted, stop_reason = True, "provider_exhausted"
+                break
             if checkpoint["skip"] >= len(raw_posts):
                 checkpoint = {"after": next_after, "skip": 0}
                 if next_after is None:
@@ -904,7 +936,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
             state = dict(checkpoint)
     except SafeError as exc:
         stop_reason = str(exc)
-        errors.append({"stage": "scan", "code": str(exc)})
+        errors.append({"stage": "scan", "code": str(exc), "diagnostic":getattr(exc, "diagnostic", {})})
     groups, comparisons, comparison_truncated = [], 0, False
     try:
         groups, comparisons, comparison_truncated = build_groups(known, scanned_ids, cfg, budget)
@@ -922,7 +954,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
             counts["posts_ingested" if exc.kind == "posts" else "duplicate_groups_ingested"] = exc.accepted
         errors.append({"stage": "dashboard_ingest", "code": str(exc)})
         # Replaying from request cursor recovers unacknowledged/partial batches idempotently.
-        checkpoint = decode_cursor(request.cursor, request.account_id, request.platform)
+        checkpoint = decode_cursor(request.cursor, cursor_account, request.platform)
         exhausted, stop_reason = False, "dashboard_ingest_failed_replay"
     return {"ok": not errors, "platform": request.platform, "account_id": request.account_id, "counts": counts,
             "coverage": {"provider_exhausted": exhausted, "full_history_verified": False, "pagination_truncated": not exhausted,
@@ -930,7 +962,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
                          "comparison_truncated": comparison_truncated, "cache_limit": MAX_CACHE, "pair_limit": MAX_PAIRS,
                          "group_member_limit": MAX_GROUP_MEMBERS, "group_limit": MAX_GROUPS,
                          "candidate_suggestions_only": True, "orb_requested": use_orb},
-            "resume_cursor": None if exhausted else encode_cursor(checkpoint, request.account_id, request.platform),
+            "resume_cursor": None if exhausted else encode_cursor(checkpoint, cursor_account, request.platform),
             "errors": errors[:110]}
 
 
@@ -945,7 +977,8 @@ async def scan_route(request: ScanRequest, x_api_key: str | None = Header(defaul
         raise HTTPException(status_code=409, detail="scan_already_running")
     def run_and_release():
         try:
-            return scan(request)
+            from dashboard_scanner import scan_catalogue
+            return scan_catalogue(request) if request.platform in ("facebook", "instagram") else scan(request)
         finally:
             _SCAN_LOCK.release()
     # Shield prevents client cancellation releasing the lock while its thread is still running.
@@ -977,8 +1010,8 @@ async def inventory_status(x_api_key: str | None = Header(default=None, alias="X
         ingest_ready = True
     except SafeError:
         ingest_ready = False
-    return {"configured_accounts":configured,"account_mode":"automatic_meta_discovery_with_optional_overrides",
-            **discovery, "dashboard_url":dashboard_url(), "dashboard_auth_verified":False,
+    return {"configured_accounts":configured,"account_mode":"dashboard_catalogue",
+            **discovery, "meta_credential_required_for_scanner":False, "dashboard_url":dashboard_url(), "dashboard_auth_verified":False,
             "scan_running":_SCAN_LOCK.locked(),
             "ffmpeg_available":bool(shutil.which("ffmpeg")),"ffprobe_available":bool(shutil.which("ffprobe")),
             "dashboard_configured":ingest_ready,
@@ -993,12 +1026,20 @@ async def inventory_accounts(x_api_key: str | None = Header(default=None, alias=
         raise HTTPException(status_code=503, detail="social_inventory_not_configured")
     if not x_api_key or not hmac.compare_digest(expected, x_api_key):
         raise HTTPException(status_code=401, detail="invalid_api_key")
-    from social_meta_accounts import public_accounts, DiscoveryError
+    from dashboard_scanner import catalogue_accounts
     try:
-        return await asyncio.to_thread(public_accounts)
-    except DiscoveryError as exc:
-        raise HTTPException(status_code=503, detail={"code": "meta_discovery_failed", "errors": exc.errors}) from None
+        return await asyncio.to_thread(catalogue_accounts)
     except SafeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from None
+        raise HTTPException(status_code=503, detail={"code":str(exc), **getattr(exc, "diagnostic", {})}) from None
     except Exception:
-        raise HTTPException(status_code=503, detail="meta_discovery_failed") from None
+        raise HTTPException(status_code=503, detail="dashboard_catalogue_failed") from None
+
+
+@router.get("/diagnostics")
+async def inventory_diagnostics(x_api_key: str | None = Header(default=None, alias="X-API-KEY")):
+    expected = inventory_api_key()
+    if not expected: raise HTTPException(status_code=503, detail="social_inventory_not_configured")
+    if not x_api_key or not hmac.compare_digest(expected, x_api_key):
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+    from dashboard_scanner import connection_diagnostics
+    return await asyncio.to_thread(connection_diagnostics)

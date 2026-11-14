@@ -20,7 +20,7 @@ class KeyFallbackTests(unittest.TestCase):
         self.assertEqual(self.client.get('/social/inventory/status').status_code,401)
         response=self.client.get('/social/inventory/status',headers=headers)
         self.assertEqual(response.status_code,200);self.assertNotIn('media-test',response.text)
-        with patch.object(inventory,'scan',return_value={'ok':True}) as scan:
+        with patch('dashboard_scanner.scan_catalogue',return_value={'ok':True}) as scan:
             r=self.client.post('/social/inventory/scan',headers=headers,json={'platform':'instagram','account_id':'123','max_posts':1})
             self.assertEqual(r.status_code,200);scan.assert_called_once()
     def test_explicit_override_takes_precedence(self):
