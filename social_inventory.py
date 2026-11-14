@@ -185,6 +185,18 @@ class SafeHTTP:
 
 
 def config_for(account_id: str, platform: str) -> dict:
+    # Explicit legacy registries remain supported, but Meta needs no manual list.
+    try:
+        registry = json.loads(os.environ.get("SOCIAL_ACCOUNTS_JSON", "{}"))
+        if not isinstance(registry, dict): raise ValueError()
+    except Exception:
+        raise SafeError("social_accounts_config_invalid") from None
+    if account_id not in registry and platform in ("facebook", "instagram"):
+        from social_meta_accounts import discover
+        accounts, _ = discover()
+        cfg = accounts.get((platform, account_id))
+        if cfg is None: raise SafeError("account_not_configured")
+        return dict(cfg)
     try:
         accounts = json.loads(os.environ.get("SOCIAL_ACCOUNTS_JSON", "{}"))
         cfg = dict(accounts[account_id])
@@ -214,8 +226,15 @@ def inventory_cursor_key() -> str:
     return key
 
 
+DEFAULT_DASHBOARD_URL = "https://sh01-operations-dashboard-cloudflare.vivojaymail.workers.dev"
+
+def dashboard_url() -> str:
+    return (os.environ.get("OPS_DASHBOARD_URL", "").strip() or DEFAULT_DASHBOARD_URL).rstrip("/")
+
 def dashboard_ingest_key() -> str:
     key = os.environ.get("INGEST_TOKEN", "").strip() or os.environ.get("OPS_INGEST_TOKEN", "").strip()
+    if not key and dashboard_url() == DEFAULT_DASHBOARD_URL:
+        key = os.environ.get("MEDIA_CLIP_API_KEY", "").strip()
     if not key:
         raise SafeError("credential_not_configured")
     return key
@@ -364,7 +383,7 @@ class Provider:
         host = "api.tumblr.com" if platform == "tumblr" else "graph.facebook.com"
         url = f"https://{host}/{path}?{urlencode(params)}"
         if platform != "tumblr" or self.cfg.get("token_env"):
-            headers = {"Authorization": "Bearer " + env_secret(self.cfg.get("token_env", ""))}
+            headers = {"Authorization": "Bearer " + (self.cfg.get("_meta_token") or env_secret(self.cfg.get("token_env", "")))}
         else:
             try:
                 from oauthlib.oauth1 import Client, SIGNATURE_TYPE_AUTH_HEADER
@@ -684,7 +703,7 @@ def build_groups(records: dict[str, dict], scanned_ids: set[str], cfg: dict, bud
 class Dashboard:
     def __init__(self, http: SafeHTTP):
         self.http = http
-        self.base = os.environ.get("OPS_DASHBOARD_URL", "").rstrip("/")
+        self.base = dashboard_url()
         p = urlsplit(self.base)
         if p.scheme != "https" or not p.hostname or p.path or p.query or p.fragment or p.username or p.password or p.port not in (None, 443):
             raise SafeError("dashboard_not_configured")
@@ -772,8 +791,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
     try:
         known, cache_truncated = dashboard.cache(cfg)
     except SafeError as exc:
-        errors.append({"stage": "fingerprint_cache", "code": str(exc)})
-        cache_truncated = True
+        raise SafeError("dashboard_cache_unavailable") from None
     posts, scanned_ids = [], set()
     counts = {"visited": 0, "media_posts": 0, "unsupported_posts": 0, "fingerprinted": 0, "reused": 0,
               "carousels_metadata_only": 0, "failed_items": 0, "missing_permalink_skipped": 0, "posts_ingested": 0, "duplicate_groups_ingested": 0}
@@ -917,8 +935,33 @@ async def inventory_status(x_api_key: str | None = Header(default=None, alias="X
         if not isinstance(configs,dict):raise ValueError()
         configured=len(configs)
     except Exception:raise HTTPException(status_code=503,detail="social_accounts_config_invalid") from None
-    return {"configured_accounts":configured,"scan_running":_SCAN_LOCK.locked(),
+    from social_meta_accounts import snapshot
+    discovery = snapshot()
+    try:
+        dashboard_ingest_key()
+        ingest_ready = True
+    except SafeError:
+        ingest_ready = False
+    return {"configured_accounts":configured,"account_mode":"automatic_meta_discovery_with_optional_overrides",
+            **discovery, "dashboard_url":dashboard_url(), "dashboard_auth_verified":False,
+            "scan_running":_SCAN_LOCK.locked(),
             "ffmpeg_available":bool(shutil.which("ffmpeg")),"ffprobe_available":bool(shutil.which("ffprobe")),
-            "dashboard_configured":bool(os.environ.get("OPS_DASHBOARD_URL") and (os.environ.get("INGEST_TOKEN", "").strip() or os.environ.get("OPS_INGEST_TOKEN", "").strip())),
+            "dashboard_configured":ingest_ready,
             "delete_enabled":os.environ.get("SOCIAL_DELETE_ENABLED")=="1",
             "live_provider_access_verified":False,"limits":{"cache":MAX_CACHE,"pairs":MAX_PAIRS,"groups":MAX_GROUPS}}
+
+
+@router.get("/accounts")
+async def inventory_accounts(x_api_key: str | None = Header(default=None, alias="X-API-KEY")):
+    expected = inventory_api_key()
+    if not expected:
+        raise HTTPException(status_code=503, detail="social_inventory_not_configured")
+    if not x_api_key or not hmac.compare_digest(expected, x_api_key):
+        raise HTTPException(status_code=401, detail="invalid_api_key")
+    from social_meta_accounts import public_accounts
+    try:
+        return await asyncio.to_thread(public_accounts)
+    except SafeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="meta_discovery_failed") from None
