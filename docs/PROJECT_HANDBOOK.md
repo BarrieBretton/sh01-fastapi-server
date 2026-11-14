@@ -193,3 +193,11 @@ Do not assume that source code's `DEFAULT_WORKFLOWS` list in `app.py` is the cur
 Scanner/status routes, gated deletion, error telemetry and runtime collection tools now belong to sh01-fastapi-server. app.py mounts GET /social/inventory/status, POST /social/inventory/scan and POST /social/posts/delete. Existing Dockerfile already supplies FFmpeg/FFprobe, Pillow and FastAPI; oauthlib is explicitly declared. No new hosting service is introduced.
 Environment configuration remains required: SOCIAL_INVENTORY_API_KEY, SOCIAL_ACCOUNTS_JSON, OPS_DASHBOARD_URL and OPS_INGEST_TOKEN, plus each account's provider credentials. SOCIAL_DELETE_ENABLED remains off unless explicitly enabled. Deployment does not automatically schedule scans, populate groups, set secrets, or enable deletion. Both serving/standby Render instances must receive the code and configuration. In-process scan locking is per worker; schedule one caller and avoid overlapping batches across instances.
 Run `python -m unittest discover -s tests -p 'test_social*.py'` and integration tests before release. Check authenticated status after deployment, then a bounded scan and dashboard group response. Successful repository/build tests are not live provider acceptance. See docs/SOCIAL_INVENTORY.md.
+
+## Scanner credential reuse
+
+Scanner scan/status authentication and cursor signing use SOCIAL_INVENTORY_API_KEY when nonempty, otherwise MEDIA_CLIP_API_KEY. An explicit scanner key overrides the media key. Changing the selected key invalidates existing scan cursors. No key configured continues to fail closed.
+
+The scanner ingest client accepts INGEST_TOKEN first, then OPS_INGEST_TOKEN. OPS_DASHBOARD_URL and SOCIAL_ACCOUNTS_JSON remain required for ingestion and account selection. Provider token_env references can reuse existing provider credentials. This change does not alter the separate telemetry helper configuration.
+
+Deletion authentication is unchanged: media-key fallback does not authorize deletion. The scan runner accepts the same scanner/media key precedence.

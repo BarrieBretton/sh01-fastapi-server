@@ -202,6 +202,25 @@ def config_for(account_id: str, platform: str) -> dict:
         raise SafeError("account_not_configured") from None
 
 
+def inventory_api_key() -> str:
+    """Explicit scanner key wins; otherwise reuse the existing media credential."""
+    return os.environ.get("SOCIAL_INVENTORY_API_KEY", "").strip() or os.environ.get("MEDIA_CLIP_API_KEY", "").strip()
+
+
+def inventory_cursor_key() -> str:
+    key = inventory_api_key()
+    if not key:
+        raise SafeError("credential_not_configured")
+    return key
+
+
+def dashboard_ingest_key() -> str:
+    key = os.environ.get("INGEST_TOKEN", "").strip() or os.environ.get("OPS_INGEST_TOKEN", "").strip()
+    if not key:
+        raise SafeError("credential_not_configured")
+    return key
+
+
 def env_secret(name: str) -> str:
     if not isinstance(name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,100}", name):
         raise SafeError("credential_not_configured")
@@ -670,7 +689,7 @@ class Dashboard:
         if p.scheme != "https" or not p.hostname or p.path or p.query or p.fragment or p.username or p.password or p.port not in (None, 443):
             raise SafeError("dashboard_not_configured")
         self.hosts = (p.hostname,)
-        self.headers = {"X-INGEST-KEY": env_secret("INGEST_TOKEN")}
+        self.headers = {"X-INGEST-KEY": dashboard_ingest_key()}
 
     def cache(self, cfg: dict) -> tuple[dict, bool]:
         records, offset = {}, 0
@@ -710,7 +729,7 @@ class Dashboard:
 def encode_cursor(state: dict, account_id: str, platform: str) -> str:
     payload = dict(state, account=account_id, platform=platform, expires=int(time.time()) + 86400)
     raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
-    signature = hmac.new(env_secret("SOCIAL_INVENTORY_API_KEY").encode(), raw.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(inventory_cursor_key().encode(), raw.encode(), hashlib.sha256).hexdigest()
     return raw + "." + signature
 
 
@@ -719,7 +738,7 @@ def decode_cursor(cursor: str | None, account_id: str, platform: str) -> dict:
         return {"after": None, "skip": 0}
     try:
         raw, signature = cursor.rsplit(".", 1)
-        expected = hmac.new(env_secret("SOCIAL_INVENTORY_API_KEY").encode(), raw.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(inventory_cursor_key().encode(), raw.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise ValueError()
         data = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
@@ -864,7 +883,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
 
 @router.post("/scan")
 async def scan_route(request: ScanRequest, x_api_key: str | None = Header(default=None, alias="X-API-KEY")):
-    expected = os.environ.get("SOCIAL_INVENTORY_API_KEY", "")
+    expected = inventory_api_key()
     if not expected:
         raise HTTPException(status_code=503, detail="social_inventory_not_configured")
     if not x_api_key or not hmac.compare_digest(expected, x_api_key):
@@ -889,7 +908,7 @@ async def scan_route(request: ScanRequest, x_api_key: str | None = Header(defaul
 
 @router.get("/status")
 async def inventory_status(x_api_key: str | None = Header(default=None, alias="X-API-KEY")):
-    expected = os.environ.get("SOCIAL_INVENTORY_API_KEY", "")
+    expected = inventory_api_key()
     if not expected:raise HTTPException(status_code=503, detail="social_inventory_not_configured")
     if not x_api_key or not hmac.compare_digest(expected,x_api_key):raise HTTPException(status_code=401, detail="invalid_api_key")
     import shutil
@@ -900,6 +919,6 @@ async def inventory_status(x_api_key: str | None = Header(default=None, alias="X
     except Exception:raise HTTPException(status_code=503,detail="social_accounts_config_invalid") from None
     return {"configured_accounts":configured,"scan_running":_SCAN_LOCK.locked(),
             "ffmpeg_available":bool(shutil.which("ffmpeg")),"ffprobe_available":bool(shutil.which("ffprobe")),
-            "dashboard_configured":bool(os.environ.get("OPS_DASHBOARD_URL") and os.environ.get("OPS_INGEST_TOKEN")),
+            "dashboard_configured":bool(os.environ.get("OPS_DASHBOARD_URL") and (os.environ.get("INGEST_TOKEN", "").strip() or os.environ.get("OPS_INGEST_TOKEN", "").strip())),
             "delete_enabled":os.environ.get("SOCIAL_DELETE_ENABLED")=="1",
             "live_provider_access_verified":False,"limits":{"cache":MAX_CACHE,"pairs":MAX_PAIRS,"groups":MAX_GROUPS}}

@@ -14,8 +14,8 @@ def main():
     if not 1<=a.batches<=10:raise SystemExit('Use 1–10 bounded batches per invocation')
     host=os.getenv('SOCIAL_API_URL','https://sh01.vivojaymail.workers.dev').rstrip('/');u=urlsplit(host)
     if u.scheme!='https' or not u.hostname or u.username or u.password or u.query or u.fragment or u.path:raise SystemExit('HTTPS social API origin required')
-    token=os.environ.get('SOCIAL_INVENTORY_API_KEY');path=Path(a.checkpoint)
-    if not token:raise SystemExit('Set SOCIAL_INVENTORY_API_KEY locally')
+    token=os.environ.get('SOCIAL_INVENTORY_API_KEY','').strip() or os.environ.get('MEDIA_CLIP_API_KEY','').strip();path=Path(a.checkpoint)
+    if not token:raise SystemExit('Set MEDIA_CLIP_API_KEY locally (or an explicit SOCIAL_INVENTORY_API_KEY override)')
     state=json.loads(path.read_text()) if path.exists() else {'platform':a.platform,'account_id':a.account_id,'cursor':None}
     if (state['platform'],state['account_id'])!=(a.platform,a.account_id):raise SystemExit('Checkpoint belongs to another account')
     if state.get('complete'):raise SystemExit('Checkpoint is complete. Choose a new checkpoint for a new scan.')
