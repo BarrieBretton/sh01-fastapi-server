@@ -233,3 +233,9 @@ The HTTPS client validates all resolved addresses as public, prefers IPv4 and tr
 Catalogue cursors use a new signed namespace and checkpoint directory, separate from old provider cursors. run_meta_scans.py lists accounts by default; --scan runs one bounded sequential batch per account with collected posts. It resumes checkpoints; a fresh directory starts a new catalogue pass after exhaustion. Catalogue exhaustion is not provider-history exhaustion. Scheduling and automatic browser-triggered scanning are not installed.
 
 Validation: 59 Python backend tests, 97 JavaScript dashboard tests and four dashboard completion tests passed locally. Tests cover catalogue identity/pagination, fingerprint reuse, signed-cursor isolation, actual video-source handling, fingerprint-only persistence, scoped auth and validated-address fallback. Operator observed prior Render Meta calls failing with upstream_transport_error; the actual production transport cause remains unverified until the new diagnostic response. No live scan, provider deletion, deployment or credential change was performed during development.
+
+## Scanner save retries and diagnostics
+
+Dashboard fingerprint and duplicate-group writes now retry transient failures up to three total attempts with jitter and Retry-After handling within the existing delivery budget. Retries reuse computed fingerprints, and validation or permission failures are not retried. Unacknowledged writes retain checkpoint rewind behavior. Safe diagnostics expose HTTP status, allowlisted dashboard error codes and attempt counts, never response bodies or credentials.
+
+Observed: three accounts acknowledged six saved fingerprints; the next account processed two items but its save was unacknowledged. The underlying HTTP failure remains unverified until the detailed live response is available. Local verification: 67 backend tests passed. No live deployment or scan was performed by this patch.

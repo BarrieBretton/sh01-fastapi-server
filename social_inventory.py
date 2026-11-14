@@ -75,10 +75,40 @@ class GraphHTTPError(SafeError):
                 self.diagnostic["hint"] = "business_parameter_may_be_required"
 
 
+class DashboardHTTPError(GraphHTTPError):
+    def __init__(self, code, status, payload=None, retry_after=None):
+        super().__init__(code, status)
+        allowed = {
+            "store_rate_limited", "store_network_unavailable", "store_google_unavailable",
+            "store_read_conflict_retry", "store_revision_conflict", "store_read_incomplete",
+            "store_response_not_json", "store_google_scope_missing", "store_google_oauth_rejected",
+            "store_google_permission_denied", "store_workbook_not_found", "store_google_invalid_request",
+            "store_google_oauth_failed", "store_guard_verification_required", "store_not_initialized",
+            "store_transaction_too_large", "store_record_too_large", "store_invalid_record",
+            "store_header_mismatch", "store_control_corrupt", "store_table_missing",
+            "store_key_mismatch", "store_replay_mismatch", "store_operation_rejected",
+            "sheets_storage_not_configured", "sheets_migration_not_verified",
+            "scanner_post_missing_or_unpublished", "scanner_media_type_mismatch",
+            "invalid_fingerprint", "maximum_10_fingerprints", "mixed_or_missing_group_members",
+            "invalid_duplicate_group", "maximum_10_groups", "request_failed"
+        }
+        value = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(value, str) and value in allowed:
+            self.diagnostic["dashboard_code"] = value
+        if isinstance(retry_after, str):
+            try:
+                from email.utils import parsedate_to_datetime
+                delay = float(retry_after) if re.fullmatch(r"\d+(?:\.\d+)?", retry_after) else (parsedate_to_datetime(retry_after)-datetime.now(timezone.utc)).total_seconds()
+                if math.isfinite(delay): self.diagnostic["retry_after_seconds"] = max(0, delay)
+            except (ValueError, TypeError, OverflowError):
+                pass
+
+
 class IngestError(SafeError):
-    def __init__(self, code: str, accepted: int, kind: str):
+    def __init__(self, code: str, accepted: int, kind: str, diagnostic=None):
         super().__init__(code)
         self.accepted, self.kind = accepted, kind
+        self.diagnostic = dict(diagnostic or {})
 
 
 @dataclass
@@ -208,6 +238,16 @@ class SafeHTTP:
                         except Exception:
                             pass  # Preserve HTTP status even if the error body cannot be read.
                         raise GraphHTTPError(code, response.status, payload)
+                    if host == urlsplit(dashboard_url()).hostname:
+                        payload = None
+                        try:
+                            self.budget.remaining()
+                            raw_error = response.read(16385)
+                            self.budget.consume(len(raw_error))
+                            if len(raw_error) <= 16384: payload = json.loads(raw_error)
+                        except Exception:
+                            pass
+                        raise DashboardHTTPError(code, response.status, payload, response.getheader("Retry-After"))
                     raise GraphHTTPError(code, response.status)
                 stage = "response_body"
                 declared = response.getheader("Content-Length")
@@ -802,7 +842,7 @@ class Dashboard:
                 if ack.get("accepted") != len(batch):
                     raise SafeError("dashboard_ingest_unacknowledged")
             except SafeError as exc:
-                raise IngestError(str(exc), count, kind) from None
+                raise IngestError(str(exc), count, kind, getattr(exc, "diagnostic", {})) from None
             count += len(batch)
         return count
 
@@ -952,7 +992,7 @@ def scan(request: ScanRequest, *, cfg=None, provider=None, dashboard=None, http=
     except SafeError as exc:
         if isinstance(exc, IngestError):
             counts["posts_ingested" if exc.kind == "posts" else "duplicate_groups_ingested"] = exc.accepted
-        errors.append({"stage": "dashboard_ingest", "code": str(exc)})
+        errors.append({"stage": "dashboard_ingest", "code": str(exc), **({"diagnostic":exc.diagnostic} if getattr(exc,"diagnostic",None) else {})})
         # Replaying from request cursor recovers unacknowledged/partial batches idempotently.
         checkpoint = decode_cursor(request.cursor, cursor_account, request.platform)
         exhausted, stop_reason = False, "dashboard_ingest_failed_replay"

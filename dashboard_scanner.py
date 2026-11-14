@@ -1,5 +1,7 @@
 """Fingerprint dashboard-owned catalogue rows; never call Meta from Render."""
 from urllib.parse import urlencode
+import random
+import time
 import social_inventory as core
 
 def bridge_client():
@@ -31,19 +33,46 @@ def connection_diagnostics():
                 'code':'diagnostic_failed'}, 'cdn_access_verified':False}
 
 class FingerprintSink(core.Dashboard):
+    def write_batch(self, endpoint, payload):
+        # Only deterministic fingerprint updates and group upserts use this retry path.
+        transient = {'store_rate_limited', 'store_network_unavailable', 'store_google_unavailable',
+                     'store_read_conflict_retry', 'store_revision_conflict', 'store_read_incomplete',
+                     'store_response_not_json'}
+        for attempt in range(3):
+            try:
+                return self.http.json(self.base+endpoint,self.hosts,method='POST',headers=self.headers,payload=payload)
+            except core.SafeError as exc:
+                diagnostic = dict(getattr(exc,'diagnostic',{}))
+                diagnostic['write_attempts'] = attempt+1
+                exc.diagnostic = diagnostic
+                status = diagnostic.get('http_status')
+                category = diagnostic.get('dashboard_code')
+                retry = (category in transient if category else status in (429,500,502,503,504)) or isinstance(exc,core.TransportError)
+                if not retry or attempt==2: raise
+                delay = max(diagnostic.get('retry_after_seconds',0),2**attempt) + random.uniform(0,2**attempt)
+                try:
+                    remaining = self.http.budget.remaining()
+                except core.SafeError:
+                    diagnostic['retry_deferred'] = 'delivery_budget_insufficient'
+                    raise exc
+                if remaining <= delay+1:
+                    diagnostic['retry_deferred'] = 'delivery_budget_insufficient'
+                    raise
+                time.sleep(delay)
+
     def ingest(self, kind, rows):
-        if kind != 'posts': return super().ingest(kind, rows)
-        values = [{k:row[k] for k in ('platform','account_id','post_id','fingerprint')}
-                  for row in rows if row.get('fingerprint')]
+        if kind not in ('posts','groups'): raise core.SafeError('unsupported_scanner_ingest_kind')
+        values = ([{k:row[k] for k in ('platform','account_id','post_id','fingerprint')}
+                  for row in rows if row.get('fingerprint')] if kind=='posts' else rows)
         count = 0
         for i in range(0, len(values), 10):
             batch=values[i:i+10]
             try:
-                ack=self.http.json(self.base+'/api/ingest/scanner/fingerprints',self.hosts,
-                                   method='POST',headers=self.headers,payload={'rows':batch})
+                ack=self.write_batch('/api/ingest/scanner/fingerprints' if kind=='posts' else '/api/ingest/duplicate-groups',
+                                     {'rows':batch} if kind=='posts' else {'groups':batch})
                 if ack.get('accepted')!=len(batch): raise core.SafeError('dashboard_ingest_unacknowledged')
             except core.SafeError as exc:
-                raise core.IngestError(str(exc), count, kind) from None
+                raise core.IngestError(str(exc), count, kind, getattr(exc,'diagnostic',{})) from None
             count += len(batch)
         return count
 
