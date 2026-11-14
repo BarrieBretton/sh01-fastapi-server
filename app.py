@@ -39,6 +39,9 @@ from infra.media_job_store_routes import router as media_job_store_router
 from media_router import router as media_router
 from caption_router import router as caption_router
 from auto_editor import router as auto_editor_router
+from social_inventory import router as social_inventory_router
+from social_delete import router as social_delete_router
+from sh01_error_handler import install_ops_handler
 from threads_feature.router import router as threads_router
 from tumblr_feature.router import router as tumblr_router, require_internal_key as require_tumblr_internal_key
 from x_feature.router import router as x_router, require_internal_key as require_x_internal_key
@@ -320,6 +323,9 @@ app.include_router(media_job_store_router)
 app.include_router(media_router)
 app.include_router(caption_router)
 app.include_router(auto_editor_router)
+app.include_router(social_inventory_router)
+app.include_router(social_delete_router)
+install_ops_handler(logging.getLogger())
 app.include_router(threads_router)
 app.include_router(tumblr_router)
 app.include_router(x_router)

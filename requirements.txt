@@ -26,3 +26,7 @@ requests-toolbelt==1.0.0
 
 faster-whisper
 av<19
+
+
+# OAuth signing for bounded social inventory/deletion
+oauthlib>=3.3,<4

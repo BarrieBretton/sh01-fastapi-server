@@ -1,0 +1,7 @@
+# Install in the existing SH01 virtual environment, never globally.
+fastapi>=0.115,<1
+pydantic>=2.9,<3
+Pillow>=11.1,<14
+oauthlib>=3.3,<4
+# Optional crop verification: pip install 'opencv-python-headless>=4.10,<5'
+# ffmpeg + ffprobe are system executables already used by SH01, not pip packages.
