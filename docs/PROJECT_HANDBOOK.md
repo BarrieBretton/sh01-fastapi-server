@@ -213,3 +213,9 @@ FB_PAGE_ACCESS_TOKEN or META_SYSVAR must actually exist on Render for discovery;
 run_meta_scans.py lists discovered accounts by default and prompts for the existing media key. --scan runs one sequential bounded batch (default three posts) per discovered account. Checkpoints live outside the repository under the user's home directory and persist for later runs. Exhausted accounts are skipped; select a new --checkpoint-dir for a new pass after exhaustion. Partial discovery errors remain visible. No automatic schedule is installed. Carousel media remains metadata-only; similarity groups are candidates, not proof of identity.
 
 Local validation: automatic discovery/credential/pagination/cache tests plus existing social tests and dashboard JavaScript tests passed. Operator-observed deployment, live provider permissions, successful ingestion and populated duplicate groups remain unverified for this change. Deploy both repositories, add the existing media key once to Cloudflare, then check status, discovery and a bounded scan. Do not infer all-account/full-history coverage from deployment or unit tests.
+
+## Meta discovery diagnostics — 15 November 2026
+
+Operator observed authenticated status HTTP 200 with FB_PAGE_ACCESS_TOKEN present and discovery HTTP 503/meta_discovery_failed. Credential presence is not proof of valid provider authentication or all-account permissions.
+
+Discovery now preserves per-edge failures in the authenticated HTTP 503 detail: fixed error code, HTTP status and numeric Meta code/subcode. Known Graph exception types and fixed Page-node/business-parameter hints may be included. Raw messages, trace IDs, tokens and request URLs are never returned. Error-body parsing is limited to 16 KiB. Successful/partial discovery behavior, auth and deletion controls are unchanged. The root cause of the live discovery failure is unverified pending the next deployed response.

@@ -53,6 +53,28 @@ class SafeError(Exception):
     """Only static codes, never upstream response text or URLs."""
 
 
+class GraphHTTPError(SafeError):
+    def __init__(self, code, status, payload=None):
+        super().__init__(code)
+        self.diagnostic = {"http_status": int(status)}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            return
+        for source, target in (("code", "graph_code"), ("error_subcode", "graph_subcode")):
+            value = error.get(source)
+            if type(value) is int and 0 <= value <= 2147483647:
+                self.diagnostic[target] = value
+        if error.get("type") in ("OAuthException", "GraphMethodException"):
+            self.diagnostic["graph_type"] = error["type"]
+        # Inspect text only to select fixed hints; never return raw provider text.
+        message = error.get("message")
+        if isinstance(message, str):
+            if re.search(r"node type\s*\(Page\)", message, re.I):
+                self.diagnostic["hint"] = "request_resolved_to_page_node"
+            elif re.search(r"(?:business.*required|required.*business)", message, re.I):
+                self.diagnostic["hint"] = "business_parameter_may_be_required"
+
+
 class IngestError(SafeError):
     def __init__(self, code: str, accepted: int, kind: str):
         super().__init__(code)
@@ -143,6 +165,19 @@ class SafeHTTP:
                     url = urljoin(url, location)
                     continue  # Next iteration revalidates DNS, host and scheme.
                 if response.status != 200:
+                    code = ("upstream_rate_limited" if response.status == 429 else
+                            "upstream_permission_denied" if response.status in (401, 403) else "upstream_http_error")
+                    if host == "graph.facebook.com":
+                        payload = None
+                        try:
+                            self.budget.remaining()
+                            raw_error = response.read(16385)
+                            self.budget.consume(len(raw_error))
+                            if len(raw_error) <= 16384:
+                                payload = json.loads(raw_error)
+                        except Exception:
+                            pass  # Preserve HTTP status even if the error body cannot be read.
+                        raise GraphHTTPError(code, response.status, payload)
                     if response.status == 429:
                         raise SafeError("upstream_rate_limited")
                     if response.status in (401, 403):
@@ -958,9 +993,11 @@ async def inventory_accounts(x_api_key: str | None = Header(default=None, alias=
         raise HTTPException(status_code=503, detail="social_inventory_not_configured")
     if not x_api_key or not hmac.compare_digest(expected, x_api_key):
         raise HTTPException(status_code=401, detail="invalid_api_key")
-    from social_meta_accounts import public_accounts
+    from social_meta_accounts import public_accounts, DiscoveryError
     try:
         return await asyncio.to_thread(public_accounts)
+    except DiscoveryError as exc:
+        raise HTTPException(status_code=503, detail={"code": "meta_discovery_failed", "errors": exc.errors}) from None
     except SafeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     except Exception:

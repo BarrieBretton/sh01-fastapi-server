@@ -11,6 +11,13 @@ _lock = threading.Lock()
 _cache = {}
 TTL = 300
 
+from social_inventory import SafeError, GraphHTTPError
+
+class DiscoveryError(SafeError):
+    def __init__(self, errors):
+        super().__init__('meta_discovery_failed')
+        self.errors = errors
+
 def credential():
     from social_inventory import SafeError
     value = os.getenv('META_SYSVAR', '').strip() or os.getenv('FB_PAGE_ACCESS_TOKEN', '').strip()
@@ -59,7 +66,9 @@ def discover(http=None):
                         params['after'] = after
                     data = http.json('https://graph.facebook.com/' + version + '/' + edge + '?' + urlencode(params),
                                      ('graph.facebook.com',), headers={'Authorization': 'Bearer ' + token})
-                    if data.get('error') or not isinstance(data.get('data'), list):
+                    if data.get('error'):
+                        raise GraphHTTPError('meta_discovery_response_invalid', 200, data)
+                    if not isinstance(data.get('data'), list):
                         raise SafeError('meta_discovery_response_invalid')
                     for page in data['data']:
                         pid = str(page.get('id', ''))
@@ -87,11 +96,11 @@ def discover(http=None):
                 else:
                     raise SafeError('meta_discovery_page_limit')
             except SafeError as exc:
-                errors.append({'edge': edge, 'code': str(exc)})
+                errors.append({'edge': edge, 'code': str(exc), **(exc.diagnostic if isinstance(exc, GraphHTTPError) else {})})
         coverage = {'completed_edges': completed, 'errors': errors, 'all_accessible_accounts_verified': False,
                     'cache_seconds': TTL, 'scope': 'Facebook Pages and their linked Instagram business accounts'}
         if not accounts and not completed:
-            raise SafeError('meta_discovery_failed')
+            raise DiscoveryError(errors)
         # Cache partial results briefly to avoid repeated failed-edge calls on every post.
         expires = time.monotonic() + (60 if errors else TTL)
         from datetime import datetime, timezone
