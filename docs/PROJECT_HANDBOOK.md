@@ -26,6 +26,15 @@ Existing Google credentials, `SPREADSHEET_ID`, shared
 `REDIS_URL`, and Meta credentials are reused. Operations Desk receipts require
 its existing ingest credential (`OPS_INGEST_TOKEN` on SH01).
 
+**Status diagnostics correction:** Based on remote `main`
+`00198feb0dde9890beedcd611b27a3421784115e`, read-only preview no longer depends on
+Redis, and `/social/clickouts/status` checks Google setup, queue reads, schedule
+reads and Redis separately. `diagnostics_version: 2` reports partial evidence and
+static failure codes; HTTP 200 with `ok: false` is a degraded diagnostic report.
+Destructive execution retains Redis coordination and the existing enable checks.
+The operator reported `clickouts_unavailable_no_automatic_delete_retry` from the
+old authenticated status endpoint; the failing live dependency remains unverified.
+
 **Unverified:** live deployment, Redis persistence, the workbook schedule row,
 Meta deletion permissions/app eligibility, and actual deletions. Offline tests
 are not production execution evidence. Full setup, failure states, API limits,

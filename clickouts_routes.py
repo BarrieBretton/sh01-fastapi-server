@@ -5,12 +5,13 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from clickouts_state import ClickoutError, RedisState, google_store
-from clickouts_worker import ClickoutsWorker
+from clickouts_state import ClickoutError, RedisState, google_store, redis_failure
+from clickouts_worker import ClickoutsWorker, read_schedule
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix='/social/clickouts', tags=['Clickouts deletion'])
@@ -28,17 +29,121 @@ def authorize(x_api_key: str | None = Header(default=None, alias='X-API-KEY')):
         raise HTTPException(status_code=401, detail='invalid_api_key')
 
 
-def worker():
-    import redis
+def configured_workbook():
     workbook = os.getenv('SPREADSHEET_ID', '').strip()
     if not workbook:
         raise ClickoutError('spreadsheet_not_configured')
+    return workbook
+
+
+def redis_state(workbook):
     redis_url = os.getenv('REDIS_URL', '').strip()
     if not redis_url:
         raise ClickoutError('shared_redis_not_configured')
-    client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2,
-                            socket_timeout=3, retry_on_timeout=False)
-    return ClickoutsWorker(google_store(workbook), RedisState(client, workbook))
+    try:
+        import redis
+    except ImportError:
+        raise ClickoutError('redis_dependency_missing') from None
+    try:
+        client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2,
+                                socket_timeout=3, retry_on_timeout=False)
+    except (ValueError, TypeError):
+        raise ClickoutError('redis_configuration_invalid') from None
+    except Exception as exc:
+        raise redis_failure(exc) from None
+    return RedisState(client, workbook)
+
+
+def worker(read_only=False):
+    workbook = configured_workbook()
+    state = None if read_only else redis_state(workbook)
+    return ClickoutsWorker(google_store(workbook), state)
+
+
+def check_failure(error, fallback):
+    """Only static codes and bounded exception categories, never exception text."""
+    result = {'status': 'error', 'code': str(error) if isinstance(error, ClickoutError) else fallback}
+    if isinstance(error, ClickoutError) and error.retry_after:
+        result['retry_after'] = error.retry_after
+    if not isinstance(error, ClickoutError):
+        kind = type(error).__name__
+        result['error_type'] = kind if kind in {'KeyError', 'TypeError', 'ValueError', 'RuntimeError',
+            'ImportError', 'ModuleNotFoundError', 'TimeoutError', 'ConnectionError'} else 'Exception'
+    return result
+
+
+def last_run_summary(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ClickoutError('redis_state_invalid_shape')
+    result = {}
+    if value.get('status') in {'completed', 'more_pending', 'idle', 'disabled', 'busy', 'waiting', 'paused', 'cooldown'}:
+        result['status'] = value['status']
+    for field in ('done', 'remaining', 'blocked', 'invalid_rows', 'manual_required',
+                  'unverified_receipts', 'acknowledgements', 'deferred', 'retry_after'):
+        number = value.get(field)
+        if type(number) is int and number >= 0:
+            result[field] = number
+    if isinstance(value.get('checked_at'), str):
+        from datetime import datetime
+        try:
+            result['checked_at'] = datetime.fromisoformat(value['checked_at'].replace('Z', '+00:00')).isoformat()
+        except ValueError:
+            pass
+    return result
+
+
+def inspect_status():
+    """Independent read-only checks. An unavailable dependency cannot erase other evidence."""
+    result = {'diagnostics_version': 2, 'dry_run': True, 'enabled': os.getenv('SOCIAL_DELETE_ENABLED') == '1',
+              'scheduler_enabled': os.getenv('SOCIAL_DELETE_ENABLED') == '1',
+              'dashboard_receipts_configured': bool(os.getenv('OPS_INGEST_TOKEN') or os.getenv('INGEST_TOKEN')),
+              'provider_permissions': 'not_checked', 'rows': None, 'eligible': None,
+              'status_counts': None, 'blocked_counts': None, 'schedule': None, 'last_run': None, 'checks': {}}
+    # Render supplies these automatically; validate and expose only public identifiers.
+    result['runtime'] = {}
+    for field, name, pattern in (('commit', 'RENDER_GIT_COMMIT', r'[a-fA-F0-9]{40}'),
+                                 ('service_id', 'RENDER_SERVICE_ID', r'srv-[a-zA-Z0-9_-]{1,100}'),
+                                 ('instance_id', 'RENDER_INSTANCE_ID', r'[a-zA-Z0-9_-]{1,128}')):
+        value = os.getenv(name, '')
+        result['runtime'][field] = value if re.fullmatch(pattern, value) else None
+    checks = result['checks']
+    service = None
+    try:
+        service = worker(read_only=True)
+        checks['google_client'] = {'status': 'ok'}
+    except Exception as exc:
+        checks['google_client'] = check_failure(exc, 'google_client_initialization_failed')
+    if service is None:
+        checks['queue'] = {'status': 'skipped', 'code': 'google_client_unavailable'}
+        checks['schedule'] = {'status': 'skipped', 'code': 'google_client_unavailable'}
+    else:
+        try:
+            preview = service.preview(include_schedule=False)
+            for field in ('rows', 'eligible', 'status_counts', 'blocked_counts'):
+                if field in preview:
+                    result[field] = preview[field]
+            checks['queue'] = {'status': 'ok'}
+        except Exception as exc:
+            checks['queue'] = check_failure(exc, 'queue_read_failed')
+        if checks['queue'].get('retry_after'):
+            checks['schedule'] = {'status': 'skipped', 'code': 'sheets_cooldown'}
+        else:
+            try:
+                result['schedule'] = read_schedule(service.store.schedule_rows())
+                checks['schedule'] = {'status': 'ok'}
+            except Exception as exc:
+                checks['schedule'] = check_failure(exc, 'schedule_read_failed')
+    try:
+        state = redis_state(configured_workbook())
+        result['last_run'] = last_run_summary(state.get('last_result'))
+        checks['redis'] = {'status': 'ok'}
+    except Exception as exc:
+        checks['redis'] = check_failure(exc, 'redis_status_read_failed')
+    result['ok'] = all(check['status'] == 'ok' for check in checks.values())
+    result['status'] = 'ok' if result['ok'] else 'degraded'
+    return result
 
 
 class RunRequest(BaseModel):
@@ -58,23 +163,18 @@ async def invoke(callback):
 
 @router.get('/status', dependencies=[Depends(authorize)])
 async def get_status():
-    def inspect():
-        service = worker()
-        return {**service.preview(), 'last_run': service.state.get('last_result'),
-                'scheduler_enabled': os.getenv('SOCIAL_DELETE_ENABLED') == '1',
-                'dashboard_receipts_configured': bool(os.getenv('OPS_INGEST_TOKEN') or os.getenv('INGEST_TOKEN'))}
-    return await invoke(inspect)
+    return await invoke(inspect_status)
 
 
 @router.post('/preview', dependencies=[Depends(authorize)])
 async def preview():
-    return await invoke(lambda: worker().preview())
+    return await invoke(lambda: worker(read_only=True).preview())
 
 
 @router.post('/run', dependencies=[Depends(authorize)])
 async def run(request: RunRequest):
     """dry_run defaults true. false executes one batch irrespective of daily timing."""
-    return await invoke(lambda: worker().preview() if request.dry_run else worker().run(request.max_items))
+    return await invoke(lambda: worker(read_only=True).preview() if request.dry_run else worker().run(request.max_items))
 
 
 @router.post('/tick', dependencies=[Depends(authorize)])

@@ -26,6 +26,8 @@ for deletion: enable this only for the workbook containing confirmed removals.
 3. Retain a working **shared `REDIS_URL`** on every SH01 replica consuming this
    workbook. Configure Redis persistence and avoid eviction of the Clickouts keys.
    Missing/unavailable Redis prevents deletion. Process memory is not a substitute.
+   Read-only preview does not require Redis. The status endpoint reports Redis
+   failures separately while retaining successful queue and schedule reads.
 4. Use the server's existing **`MEDIA_CLIP_API_KEY`** for the protected Clickouts
    endpoints. No additional API-key variable is required. An already configured
    `SOCIAL_INVENTORY_API_KEY` is also accepted for compatibility; it does not
@@ -137,7 +139,7 @@ server deletion enable switch, and Sheet scheduling checks still apply.
 
 | Method and path | Behaviour |
 | --- | --- |
-| GET `/social/clickouts/status` | Read queue counts, schedule, enable flag and last completed batch. No deletion. |
+| GET `/social/clickouts/status` | Independent Google client, queue, schedule and Redis checks; preserve available evidence when another check fails. No deletion. |
 | POST `/social/clickouts/preview` | Read-only queue eligibility and blocked-reason counts. |
 | POST `/social/clickouts/run` | Defaults to `{"dry_run":true}`. `{"dry_run":false,"max_items":3}` executes one explicit batch, independent of the daily schedule, only with server deletion enabled. `max_items` is 1–5. |
 | POST `/social/clickouts/tick` | Check/run the configured daily occurrence; suitable for an external scheduler. |
@@ -145,6 +147,42 @@ server deletion enable switch, and Sheet scheduling checks still apply.
 Overlapping execution returns `busy`; disabled execution returns `disabled`.
 Upstream cooldown returns `cooldown` with `retry_after`. Transport failures return
 sanitised diagnostics. Clients must inspect the JSON result as well as HTTP status.
+
+### Diagnosing a deployed status failure
+
+The original status implementation could hide a Redis failure (after successful
+Sheet reads) or Google client/credential setup failure behind
+`clickouts_unavailable_no_automatic_delete_retry`. That message alone does not
+establish which dependency failed.
+
+The corrected endpoint returns `diagnostics_version: 2`, `ok`, `status` and
+`checks.google_client`, `checks.queue`, `checks.schedule`, `checks.redis`.
+`runtime` includes validated deployment/instance identifiers when Render already
+supplies them, so responses from different instances can be distinguished. These
+are optional diagnostics; no new settings are required.
+It returns HTTP 200 for a successfully assembled diagnostic report, including
+`status: degraded` / `ok: false` when a dependency failed. This is not an execution
+readiness or provider-permission guarantee. Unavailable counts are `null`;
+successful counts remain numeric. A Sheet quota response suppresses the next
+schedule read in the same status call. No diagnostic call creates a lease,
+writes rows, refreshes metrics, calls Meta, or executes deletion.
+
+| Diagnostic code | Interpretation |
+| --- | --- |
+| `redis_connection_failed` / `redis_timeout` | The server could not complete the Redis read. Existing `REDIS_URL` connectivity/service health needs checking. |
+| `redis_authentication_or_permission_failed` | Redis rejected the configured credentials or command permission. |
+| `shared_redis_not_configured` / `redis_configuration_invalid` | The existing Redis setting is absent or cannot be parsed. |
+| `redis_state_invalid_json` / `redis_state_invalid_shape` | Stored execution state needs investigation; it is not automatically erased. |
+| `google_credentials_refresh_rejected` | The existing Google credentials failed refresh. |
+| `google_credentials_invalid` / `google_credentials_unavailable` | The Google credential loader could not supply credentials. |
+| `google_client_dependency_missing` / `google_client_initialization_failed` | Google client initialization failed before a Sheet request. |
+| `sheets_permission_or_quota_denied` | Google returned 403; this code alone does not distinguish access from quota denial. |
+| `sheets_invalid_request` / `spreadsheet_not_found_or_inaccessible` | Google rejected the read or could not expose the configured workbook. |
+
+The report contains static error codes and limited exception categories, never
+connection strings, token values, credential JSON, or raw provider error text.
+Actual execution still requires shared Redis and the existing deletion gates.
+No additional environment variable was introduced by this correction.
 
 ### Read-only verification from PowerShell
 

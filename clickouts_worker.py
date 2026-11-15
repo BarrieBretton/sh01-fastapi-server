@@ -202,7 +202,7 @@ class ClickoutsWorker:
         self.store, self.state, self.provider_factory, self.ack = store, state, provider_factory, ack
         self.enabled = enabled or (lambda: os.getenv('SOCIAL_DELETE_ENABLED') == '1')
 
-    def preview(self):
+    def preview(self, include_schedule=True):
         rows = self.store.read()
         counts = Counter(status(row) or 'pending' for row in rows)
         reasons, eligible = Counter(), 0
@@ -217,9 +217,12 @@ class ClickoutsWorker:
                 eligible += 1
             except ClickoutError as exc:
                 reasons[str(exc)] += 1
-        return {'dry_run': True, 'enabled': self.enabled(), 'rows': len(rows), 'eligible': eligible,
-                'status_counts': dict(counts), 'blocked_counts': dict(reasons),
-                'provider_permissions': 'not_checked', 'schedule': read_schedule(self.store.schedule_rows())}
+        result = {'dry_run': True, 'enabled': self.enabled(), 'rows': len(rows), 'eligible': eligible,
+                  'status_counts': dict(counts), 'blocked_counts': dict(reasons),
+                  'provider_permissions': 'not_checked'}
+        if include_schedule:
+            result['schedule'] = read_schedule(self.store.schedule_rows())
+        return result
 
     def run(self, max_items=3, scheduled=False, now=None):
         if not self.enabled():

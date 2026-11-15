@@ -13,6 +13,29 @@ class ClickoutError(Exception):
         self.retry_after = retry_after
 
 
+def exception_types(error):
+    """Class names only, including wrapped causes; never inspect error text."""
+    names, seen = set(), set()
+    for _ in range(5):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        names.update(kind.__name__ for kind in type(error).__mro__)
+        error = error.__cause__ or error.__context__
+    return names
+
+
+def redis_failure(error):
+    names = exception_types(error)
+    if names & {'AuthenticationError', 'AuthorizationError', 'NoPermissionError'}:
+        return ClickoutError('redis_authentication_or_permission_failed')
+    if 'TimeoutError' in names:
+        return ClickoutError('redis_timeout')
+    if names & {'ConnectionError', 'ConnectionRefusedError', 'ConnectionResetError', 'gaierror'}:
+        return ClickoutError('redis_connection_failed')
+    return ClickoutError('redis_request_failed')
+
+
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -36,15 +59,21 @@ class RedisState:
         self.prefix = 'sh01:clickouts:v1:' + digest(workbook) + ':'
         self.owner = None
 
+    def call(self, method, *args, **kwargs):
+        try:
+            return getattr(self.client, method)(*args, **kwargs)
+        except Exception as exc:
+            raise redis_failure(exc) from None
+
     def acquire(self):
         owner = uuid.uuid4().hex
-        if not self.client.set(self.prefix + 'lease', owner, nx=True, ex=180):
+        if not self.call('set', self.prefix + 'lease', owner, nx=True, ex=180):
             return False
         self.owner = owner
         return True
 
     def guard(self):
-        if not self.owner or not self.client.eval(
+        if not self.owner or not self.call('eval',
             "if redis.call('get',KEYS[1]) == ARGV[1] then "
             "return redis.call('expire',KEYS[1],180) else return 0 end",
             1, self.prefix + 'lease', self.owner,
@@ -54,7 +83,7 @@ class RedisState:
     def release(self):
         if self.owner:
             try:
-                self.client.eval(
+                self.call('eval',
                     "if redis.call('get',KEYS[1]) == ARGV[1] then "
                     "return redis.call('del',KEYS[1]) else return 0 end",
                     1, self.prefix + 'lease', self.owner,
@@ -63,16 +92,19 @@ class RedisState:
                 self.owner = None
 
     def get(self, key):
-        raw = self.client.get(self.prefix + key)
-        return json.loads(raw) if raw else None
+        raw = self.call('get', self.prefix + key)
+        try:
+            return json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            raise ClickoutError('redis_state_invalid_json') from None
 
     def put(self, key, value):
         self.guard()
-        self.client.set(self.prefix + key, json.dumps(value, separators=(',', ':')))
+        self.call('set', self.prefix + key, json.dumps(value, separators=(',', ':')))
 
     def claim(self, key, value):
         self.guard()
-        return bool(self.client.set(self.prefix + key, json.dumps(value), nx=True))
+        return bool(self.call('set', self.prefix + key, json.dumps(value), nx=True))
 
 
 class GoogleClickouts:
@@ -97,7 +129,10 @@ class GoogleClickouts:
             if status in (429, 503):
                 from clickouts_worker import retry_seconds
                 delay = retry_seconds(getattr(exc, 'resp', {}).get('retry-after'), 60)
-            raise ClickoutError('sheets_rate_limited' if status == 429 else 'sheets_request_failed', delay) from None
+            code = {400: 'sheets_invalid_request', 401: 'google_credentials_rejected',
+                    403: 'sheets_permission_or_quota_denied', 404: 'spreadsheet_not_found_or_inaccessible',
+                    429: 'sheets_rate_limited', 503: 'sheets_service_unavailable'}.get(status, 'sheets_request_failed')
+            raise ClickoutError(code, delay) from None
 
     def properties(self, title):
         if self.book is None:
@@ -241,10 +276,29 @@ class GoogleClickouts:
 
 def google_store(workbook):
     # Build a private bounded transport per worker call; google clients are not thread-safe.
-    import httplib2
-    from google_auth_httplib2 import AuthorizedHttp
-    from googleapiclient.discovery import build
-    from sheets_helper import get_credentials
-    http = AuthorizedHttp(get_credentials(), http=httplib2.Http(timeout=12))
-    service = build('sheets', 'v4', http=http, cache_discovery=False)
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+        from googleapiclient.discovery import build
+        from sheets_helper import get_credentials
+    except ImportError:
+        raise ClickoutError('google_client_dependency_missing') from None
+    try:
+        credentials = get_credentials()
+    except Exception as exc:
+        names = exception_types(exc)
+        if 'RefreshError' in names:
+            code = 'google_credentials_refresh_rejected'
+        elif names & {'TransportError', 'ConnectionError', 'TimeoutError'}:
+            code = 'google_credentials_refresh_unavailable'
+        elif names & {'JSONDecodeError', 'ValueError', 'MalformedError'}:
+            code = 'google_credentials_invalid'
+        else:
+            code = 'google_credentials_unavailable'
+        raise ClickoutError(code) from None
+    try:
+        http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=12))
+        service = build('sheets', 'v4', http=http, cache_discovery=False)
+    except Exception:
+        raise ClickoutError('google_client_initialization_failed') from None
     return GoogleClickouts(service, workbook)
