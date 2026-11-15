@@ -1,5 +1,5 @@
 """Fingerprint dashboard-owned catalogue rows; never call Meta from Render."""
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 import random
 import time
 import social_inventory as core
@@ -104,6 +104,26 @@ class CatalogueProvider:
             ids=[str(r.get('post_id','')) for r in data['rows']]
             if set(ids)!=set(self.post_ids) or len(ids)!=len(self.post_ids) or data.get('next_after'):
                 raise core.SafeError('targeted_posts_missing_or_mismatched')
+        for row in data['rows']:
+            media = row.get('stored_media')
+            if (row.get('platform') != self.cfg['platform'] or row.get('account_id') != self.cfg['account_id']
+                    or not isinstance(media, dict) or media.get('available') is not True):
+                continue
+            kind = row.get('scan_kind')
+            if (kind not in ('IMAGE', 'VIDEO') or media.get('media_type') != kind
+                    or media.get('kind') != ('video' if kind == 'VIDEO' else 'image')):
+                continue
+            try:
+                value = media.get('url')
+                parsed = urlsplit(value) if isinstance(value, str) and len(value) <= 16384 else None
+                if (not parsed or parsed.scheme != 'https' or parsed.username or parsed.password or parsed.fragment
+                        or parsed.port not in (None, 443) or not core.host_allowed((parsed.hostname or '').lower(), core.CDNS[self.cfg['platform']], True)):
+                    continue
+            except ValueError:
+                continue
+            # CDN downloads still perform DNS/address validation in SafeHTTP. A 403/404
+            # refreshes through the authenticated bridge once, just like resolved URLs.
+            self.media[str(row.get('post_id', ''))] = dict(media)
         return data['rows'],data.get('next_after')
 
     def resolve(self, post_id, refresh=False):

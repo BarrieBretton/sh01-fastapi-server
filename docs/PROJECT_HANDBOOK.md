@@ -277,3 +277,30 @@ scanner, video, auth, retry and quota suites. Live deployment and background
 execution remain operator checks after both repository updates.
 
 Final local validation: 204 dashboard JavaScript tests, 73 backend scanner/auth/retry/video tests and four dashboard Python completion tests passed. Built HTML validation passed with 176 unique IDs. A real browser/rendering session and live scheduled execution were not available in this development environment.
+
+## Bounded account catch-up and stored original reuse — 15 November 2026
+
+The dashboard automatic scanner now sends up to eight explicit post IDs per batch.
+Its existing POST /social/inventory/scan request schema and authentication already
+support this size. Resource/time/byte limits, cached fingerprints, same-account
+complete-link groups, partial-save recovery and deletion gates are unchanged.
+The dashboard owns durable account priority and per-account progress; no Render
+environment setting or new background process is added.
+
+CatalogueProvider accepts an optional stored_media descriptor in authenticated
+catalogue rows. It checks account/platform identity, media type and HTTPS CDN
+hostname/port/userinfo before reusing it. SafeHTTP still validates resolved public
+addresses and TLS at download time. A video thumbnail is never accepted as an
+original video. CDN 403/404 triggers the existing single authenticated refresh.
+Older Workers without stored descriptors fall back to the existing media endpoint.
+This reduces repeated storage reads for supported stored media and does not imply
+persistent full-video caching in the browser.
+
+Observed before this update: Aand Cut eight fingerprints of 50 eligible posts;
+an automatic batch on another account succeeded. Local tests exercise eight
+originals without eight media-resolution reads, malformed descriptors, one refresh
+for expired originals, and 19 identical synthetic videos grouped across batches.
+Live execution speed, complete provider history and the operator's actual 19
+video uploads remain unverified until the updated deployment processes them.
+
+Catch-up validation: 211 dashboard JavaScript tests, 61 backend scanner/auth/retry/video tests and four dashboard Python completion tests passed locally. Live all-19 matching is still an operator check.
