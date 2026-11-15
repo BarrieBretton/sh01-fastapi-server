@@ -75,7 +75,9 @@ class Sheets:
 
 
 class SheetsTests(unittest.TestCase):
-    def setUp(self): self.api = Sheets(); self.store = GoogleClickouts(self.api, 'book')
+    def setUp(self):
+        GoogleClickouts._cooldowns.clear()
+        self.api = Sheets(); self.store = GoogleClickouts(self.api, 'book')
     def test_prepare_only_appends_missing_headers_and_preserves_custom_cells(self):
         rows = self.store.read(); self.store.prepare()
         self.assertEqual(self.api.headers[:6], ['URLS', 'platform', 'account_id', 'post_id', 'request_id', 'custom'])

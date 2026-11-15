@@ -4,7 +4,8 @@
 
 Implemented in the **SH01 FastAPI server**, based on remote `main` at
 `c82f0a47ad4c9d75c5ff27e4ed2334703bbfa3f1`. This adds a queue consumer to
-`clickouts_worker.py`, Google/Redis adapters to `clickouts_state.py`, and routes /
+`clickouts_worker.py`, Google adapters to `clickouts_state.py` and workbook coordination in
+`clickouts_sheet_state.py`, and routes /
 startup scheduling to `clickouts_routes.py`. The existing single-post deletion
 route and its account opt-in / exact confirmation rules remain separate.
 
@@ -15,7 +16,8 @@ dependencies already cover this feature; no requirements change is needed.
 The consumer supports **Instagram top-level media and Facebook Page posts**.
 Other platforms and rows containing only a permalink are blocked. It does not
 scrape URLs to guess provider IDs. Queued rows are treated as already authorised
-for deletion: enable this only for the workbook containing confirmed removals.
+for deletion. Deploying this update with a valid workflow schedule activates the
+consumer for those rows; it can catch up today's due time immediately.
 
 ## Setup
 
@@ -23,28 +25,31 @@ for deletion: enable this only for the workbook containing confirmed removals.
 2. Retain the existing `SPREADSHEET_ID` and Google credentials configured by
    `sheets_helper.get_credentials()`. The Google identity must be able to edit
    this workbook. No new workbook or Apps Script is needed.
-3. Retain a working **shared `REDIS_URL`** on every SH01 replica consuming this
-   workbook. Configure Redis persistence and avoid eviction of the Clickouts keys.
-   Missing/unavailable Redis prevents deletion. Process memory is not a substitute.
-   Read-only preview does not require Redis. The status endpoint reports Redis
-   failures separately while retaining successful queue and schedule reads.
+3. No Redis setup is needed. A hidden `_sh01_clickouts_state` tab is created in
+   the same workbook by the first executing batch. It stores shared execution
+   leases, attempted posts, confirmed receipts and daily progress. Status and
+   preview calls never create it. Do not edit or remove this internal tab.
 4. Use the server's existing **`MEDIA_CLIP_API_KEY`** for the protected Clickouts
    endpoints. No additional API-key variable is required. An already configured
    `SOCIAL_INVENTORY_API_KEY` is also accepted for compatibility; it does not
    override or disable the media key on instances where both exist.
 5. Verify the Meta token and app permissions described below. Use the existing
    `META_SYSVAR` (or `FB_PAGE_ACCESS_TOKEN` fallback) and `META_GRAPH_VERSION`.
-6. For Operations Desk status updates, set the server's `OPS_INGEST_TOKEN` to the
-   dashboard's existing `INGEST_TOKEN`. `INGEST_TOKEN` on the server is also
-   accepted. Retain `OPS_DASHBOARD_URL` if configured; the existing fixed dashboard
-   default is otherwise used. A scanner-only credential cannot report deletions.
+6. Operations Desk notifications are optional. If an existing `OPS_INGEST_TOKEN`
+   or `INGEST_TOKEN` is already configured on SH01, it is reused. Otherwise Sheet
+   rows still become `done` and `dashboard_ack` becomes `not_configured`; no new
+   Render variable is required for this consumer. A scanner-only credential does
+   not acquire dashboard write permission.
 7. Add **one** schedule row as shown below using `Workflow` and `Timings`.
    Inspect `POST /social/clickouts/preview`; it reads the queue without modifying
    rows or calling Meta. It validates row identities, not provider permissions.
-8. To activate actual deletion, set **`SOCIAL_DELETE_ENABLED=1`** on the SH01
-   service and restart/redeploy it. A matching workflow row with valid `Timings`
-   supplies its daily cadence. The first due run can consume existing queued rows
-   immediately. Clear `Timings` to pause the daily cadence.
+8. The scheduler starts with the existing workbook and API-key configuration.
+   **Do not add `SOCIAL_DELETE_ENABLED`: Clickouts ignores that variable.** A
+   matching workflow row with valid `Timings` is sufficient for daily execution.
+   Clear `Timings` to pause daily runs. An authenticated explicit non-dry-run
+   request still executes one manual batch independently of daily timing.
+   The separate legacy `/social/delete` route retains its own existing controls.
+
 
 No separate per-account registry is required by this consumer. Account ownership
 and the permalink are verified against Meta immediately before deletion. A blank
@@ -134,8 +139,11 @@ without deleting again; scheduled retries happen on a later due occurrence.
 Rows and schedule sheets are bounded to 10,000 allocated rows, and relevant
 headers to the first 52 columns. Larger grids return an explicit limit error;
 they are not silently truncated. Reduce unused allocated rows or deliberately
-review the bound before increasing it. API quota responses persist a cooldown
-and honour longer `Retry-After` values. This controls load but does not guarantee
+review the bound before increasing it. Provider quota responses persist a cooldown in the workbook. Google quota
+responses start a process-shared cooldown without trying another immediate
+Sheet read or write; the lease expires if release is temporarily unavailable.
+Longer `Retry-After` values are honoured. Other replicas can receive their own
+quota responses before learning of a quota limit. This controls load but does not guarantee
 that other services sharing the same Google/Meta quota cannot exhaust it.
 
 ## Endpoints
@@ -143,55 +151,75 @@ that other services sharing the same Google/Meta quota cannot exhaust it.
 All Clickouts routes accept `X-API-KEY: <MEDIA_CLIP_API_KEY>` using the existing
 server credential. An already configured `SOCIAL_INVENTORY_API_KEY` also works.
 Missing/incorrect credentials are rejected before storage access. This credential
-reuse is limited to these Clickouts routes; the existing provider ownership,
-server deletion enable switch, and Sheet scheduling checks still apply.
+reuse is limited to these Clickouts routes; provider ownership checks and the
+daily Sheet schedule still apply. No new environment variable or Cloudflare
+change is required.
 
 | Method and path | Behaviour |
 | --- | --- |
-| GET `/social/clickouts/status` | Independent Google client, queue, schedule and Redis checks; preserve available evidence when another check fails. No deletion. |
+| GET `/social/clickouts/status` | Independent Google client, queue, schedule and workbook-state checks; preserve available evidence when another check fails. No deletion. |
 | POST `/social/clickouts/preview` | Read-only queue eligibility and blocked-reason counts. |
-| POST `/social/clickouts/run` | Defaults to `{"dry_run":true}`. `{"dry_run":false,"max_items":3}` executes one explicit batch, independent of the daily schedule, only with server deletion enabled. `max_items` is 1–5. |
+| POST `/social/clickouts/run` | Defaults to `{"dry_run":true}`. `{"dry_run":false,"max_items":3}` executes one explicit batch, independent of the daily schedule. `max_items` is 1–5. |
 | POST `/social/clickouts/tick` | Check/run the configured daily occurrence; suitable for an external scheduler. |
 
-Overlapping execution returns `busy`; disabled execution returns `disabled`.
+Overlapping execution returns `busy`; an empty daily schedule returns `paused`.
 Upstream cooldown returns `cooldown` with `retry_after`. Transport failures return
 sanitised diagnostics. Clients must inspect the JSON result as well as HTTP status.
 
 ### Diagnosing a deployed status failure
 
-The original status implementation could hide a Redis failure (after successful
-Sheet reads) or Google client/credential setup failure behind
-`clickouts_unavailable_no_automatic_delete_retry`. That message alone does not
-establish which dependency failed.
+The endpoint returns `diagnostics_version: 3`, `state_backend: google_sheets`,
+`ok`, `status`, `checks.google_client`, `checks.queue`, `checks.schedule` and
+`checks.state`. There is no Redis check. `enabled` and `scheduler_enabled` reflect
+whether a valid daily schedule was read, not provider permission or live task
+liveness. They are `null` if that schedule could not be read.
 
-The corrected endpoint returns `diagnostics_version: 2`, `ok`, `status` and
-`checks.google_client`, `checks.queue`, `checks.schedule`, `checks.redis`.
-`runtime` includes validated deployment/instance identifiers when Render already
-supplies them, so responses from different instances can be distinguished. These
-are optional diagnostics; no new settings are required.
-It returns HTTP 200 for a successfully assembled diagnostic report, including
-`status: degraded` / `ok: false` when a dependency failed. This is not an execution
-readiness or provider-permission guarantee. Unavailable counts are `null`;
-successful counts remain numeric. A Sheet quota response suppresses the next
-schedule read in the same status call. No diagnostic call creates a lease,
-writes rows, refreshes metrics, calls Meta, or executes deletion.
+`checks.state.initialized: false` is normal before the first execution. A status
+request reads state without creating its tab or acquiring a lease. `runtime`
+contains validated Render identifiers when supplied by the platform.
+
+HTTP 200 with `status: degraded` / `ok: false` preserves partial diagnostics.
+Unavailable counts are `null`; successful counts remain numeric. Google quota
+responses suppress subsequent Sheet calls in the same process until cooldown.
+No status or preview call changes rows, calls Meta, or executes deletion.
 
 | Diagnostic code | Interpretation |
 | --- | --- |
-| `redis_connection_failed` / `redis_timeout` | The server could not complete the Redis read. Existing `REDIS_URL` connectivity/service health needs checking. |
-| `redis_authentication_or_permission_failed` | Redis rejected the configured credentials or command permission. |
-| `shared_redis_not_configured` / `redis_configuration_invalid` | The existing Redis setting is absent or cannot be parsed. |
-| `redis_state_invalid_json` / `redis_state_invalid_shape` | Stored execution state needs investigation; it is not automatically erased. |
-| `google_credentials_refresh_rejected` | The existing Google credentials failed refresh. |
-| `google_credentials_invalid` / `google_credentials_unavailable` | The Google credential loader could not supply credentials. |
-| `google_client_dependency_missing` / `google_client_initialization_failed` | Google client initialization failed before a Sheet request. |
-| `sheets_permission_or_quota_denied` | Google returned 403; this code alone does not distinguish access from quota denial. |
-| `sheets_invalid_request` / `spreadsheet_not_found_or_inaccessible` | Google rejected the read or could not expose the configured workbook. |
+| `clickouts_state_revision_conflict` | Another instance changed the shared revision; this batch stops before using stale state. |
+| `clickouts_state_guard_not_enforced` | The stale-guard validation probe did not fail as required. No deletion proceeds. |
+| `clickouts_state_corrupt` / `clickouts_state_grid_changed` | Internal workbook state was altered or cannot be validated; it is not automatically reset. |
+| `clickouts_state_write_unconfirmed` | A state write could not be reconciled; no blind destructive retry. |
+| `google_credentials_refresh_rejected` | Existing Google credentials failed refresh. |
+| `google_credentials_invalid` / `google_credentials_unavailable` | Google credential loading failed. |
+| `sheets_permission_or_quota_denied` | Google returned 403; access and quota denial need investigation. |
+| `sheets_cooldown` / `sheets_rate_limited` | Temporary Sheets quota cooldown. |
 
-The report contains static error codes and limited exception categories, never
-connection strings, token values, credential JSON, or raw provider error text.
-Actual execution still requires shared Redis and the existing deletion gates.
-No additional environment variable was introduced by this correction.
+### Shared workbook state
+
+A state mutation rotates the named range `SH01_CLICKOUTS_STATE_REVISION` and
+writes its control/record cells in one `spreadsheets.batchUpdate`. An old range
+ID must still exist before it can be updated/removed. Google documents atomic
+batches and rejection of invalid requests; see [batchUpdate](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/batchUpdate)
+and [named range requests](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets/request).
+This uses the project's existing guarded Sheets transaction pattern. Initialization
+also sends a stale guarded probe and refuses execution if it is accepted. Offline
+protocol tests are not proof of live service concurrency semantics; live behavior
+and Meta permissions remain unverified.
+
+Leases last 180 seconds. Every durable write checks the revision; a former owner
+cannot overwrite a replacement's state. Attempt records do not expire with the
+lease. A committed `delete_sent` record prevents another worker from issuing a
+second DELETE for that post. Lost write responses are reconciled only against
+the exact new revision. There are at most 10,000 state records; capacity errors
+stop processing rather than evicting old receipts. Do not clear the state tab to
+retry a post. Existing rows marked `processing` without a receipt require review.
+
+The update does not connect to or migrate an old Redis instance. If a previous
+version was used for actual deletion, its old receipts must be reconciled before
+running a separate new consumer. The operator's supplied response for `a49560c`
+reported deletion disabled, 34 pending rows, 3 `added` rows and no readable Redis.
+The three `added` rows remain excluded; this change does not reinterpret them as
+new deletion authorization.
 
 ### Read-only verification from PowerShell
 
@@ -231,13 +259,17 @@ try {
 ```powershell
 python -m unittest discover -s tests -p "test_clickouts*.py"
 python -m unittest discover -s tests -p "test_social_delete.py"
-python -m py_compile clickouts_state.py clickouts_worker.py clickouts_routes.py app.py
+python -m py_compile clickouts_state.py clickouts_sheet_state.py clickouts_worker.py clickouts_routes.py app.py
 ```
 
 Tests use fake Sheets/Redis/Meta transports; they do not require credentials or
 perform live deletion. Cases include same-post duplication, wrong-owner refusal,
 long numeric-ID rejection, loss of a DELETE response, loss of a Sheet update,
-Redis/lease failures, row/column movement, protected routes, daily aliases,
+workbook-lease failures, row/column movement, protected routes, daily aliases,
 restart catch-up, bounded backlog continuation and quota cooldown.
 Schedule regressions cover every job-override value, a missing override column,
 the supplied compact `h:mmpm` strings, noon/midnight, and native Sheet time values.
+
+Workbook-state tests cover atomic conflict rejection, concurrent claims, expired
+owners, loss of a commit response, stale-guard refusal, quota suppression, durable
+receipt recovery, and no repeat DELETE after an uncertain result.

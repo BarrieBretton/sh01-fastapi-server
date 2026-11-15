@@ -197,20 +197,20 @@ class WorkerTests(unittest.TestCase):
         self.store.rows = [row(str(i), str(200+i)) for i in range(4)]
         at = datetime(2026, 11, 15, 5, 0, tzinfo=timezone.utc)  # 10:30 IST, catches 10:00.
         self.service().run(2, True, at)
-        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.redis.data.pop(self.state.prefix + 'next_poll', None)
         self.service(RedisState(self.redis, 'book')).run(2, True, at)
-        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.redis.data.pop(self.state.prefix + 'next_poll', None)
         self.store.rows.append(row('new', '999'))
         self.assertEqual(self.service().run(2, True, at)['status'], 'waiting')
         self.assertEqual(len(self.provider.deleted), 4)
-        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.redis.data.pop(self.state.prefix + 'next_poll', None)
         evening = datetime(2026, 11, 15, 13, 0, tzinfo=timezone.utc)
         self.service().run(2, True, evening)
         self.assertEqual(self.provider.deleted[-1], '999')
     def test_missing_timings_or_unregistered_schedule_cannot_execute(self):
         self.store.schedule = schedule(timings='')
         self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
-        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.redis.data.pop(self.state.prefix + 'next_poll', None)
         self.store.schedule = schedule('Python::arbitrary_code')
         self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
         self.assertEqual(self.provider.deleted, [])
@@ -385,15 +385,17 @@ class RouteTests(unittest.TestCase):
             os.environ['MEDIA_CLIP_API_KEY'] = 'replacement-key'
             self.assertEqual(self.client.post('/social/clickouts/preview', headers={'X-API-KEY':'scanner-key'}).status_code, 401)
             self.assertEqual(self.client.post('/social/clickouts/preview', headers={'X-API-KEY':'replacement-key'}).status_code, 200)
-    def test_media_auth_cannot_bypass_disabled_deletion(self):
+    def test_existing_media_key_executes_without_new_flags_and_blank_schedule_stays_paused(self):
         os.environ.pop('SOCIAL_INVENTORY_API_KEY')
-        store = Mock(); state = Mock()
-        service = worker.ClickoutsWorker(store, state)
+        store=Store([row()]); provider=Provider(); state=RedisState(Redis(), 'book')
+        service=worker.ClickoutsWorker(store, state, provider_factory=lambda:provider, ack=lambda r:'not_configured')
         with patch.object(routes, 'worker', return_value=service):
-            for path, body in [('/run', {'dry_run':False}), ('/tick', {})]:
-                response = self.client.post('/social/clickouts'+path, json=body, headers={'X-API-KEY':'scanner-key'})
-                self.assertEqual(response.json()['status'], 'disabled')
-        store.read.assert_not_called(); state.acquire.assert_not_called()
+            response=self.client.post('/social/clickouts/run', json={'dry_run':False}, headers={'X-API-KEY':'scanner-key'})
+            self.assertEqual(response.json()['done'],1)
+            store.schedule=schedule(timings='')
+            response=self.client.post('/social/clickouts/tick', json={}, headers={'X-API-KEY':'scanner-key'})
+            self.assertEqual(response.json()['status'],'paused')
+        self.assertEqual(provider.deleted,['200'])
     def test_explicit_batch_limits_and_opaque_failures(self):
         with patch.object(routes, 'worker') as factory:
             headers = {'X-API-KEY':'delete-key'}
@@ -406,13 +408,13 @@ class RouteTests(unittest.TestCase):
         ast.parse(source)
         for name in ('clickouts_router', 'social_inventory_router', 'social_delete_router'):
             self.assertIn('app.include_router('+name+')', source)
-    def test_scheduler_is_opt_in_single_instance_and_stops_on_shutdown(self):
+    def test_scheduler_uses_existing_configuration_without_new_flag_and_stops_on_shutdown(self):
         scheduler = Mock()
         fake = types.SimpleNamespace(BackgroundScheduler=Mock(return_value=scheduler))
         with patch.dict(sys.modules, {'apscheduler.schedulers.background': fake}), patch.object(routes, '_scheduler', None):
             routes.start_clickouts_scheduler()
             fake.BackgroundScheduler.assert_not_called()
-            os.environ['SOCIAL_DELETE_ENABLED'] = '1'
+            os.environ['SPREADSHEET_ID'] = 'book'
             routes.start_clickouts_scheduler(); routes.start_clickouts_scheduler()
             fake.BackgroundScheduler.assert_called_once()
             self.assertEqual(scheduler.add_job.call_args.kwargs['seconds'], 60)
@@ -432,31 +434,31 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.service = worker.ClickoutsWorker(self.store, None)
         self.headers = {'X-API-KEY': 'existing-key'}
     def tearDown(self): self.env.stop()
-    def status(self, redis_error=None, last=None):
+    def status(self, state_error=None, last=None):
         state = Mock()
         state.get.return_value = last
-        if redis_error: state.get.side_effect = redis_error
-        with patch.object(routes, 'worker', return_value=self.service), patch.object(routes, 'redis_state', return_value=state):
+        state.load.return_value = True
+        if state_error: state.load.side_effect = state_error
+        with patch.object(routes, 'worker', return_value=self.service), patch.object(routes, 'sheet_state', return_value=state):
             response = self.client.get('/social/clickouts/status', headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.store.writes, []); self.assertFalse(self.store.prepared)
         state.acquire.assert_not_called(); state.put.assert_not_called()
         return response.json()
-    def test_failed_redis_read_preserves_queue_schedule_and_marks_degraded(self):
-        data = self.status(ClickoutError('redis_connection_failed'))
+    def test_failed_state_read_preserves_queue_schedule_and_marks_degraded(self):
+        data = self.status(ClickoutError('clickouts_state_corrupt'))
         self.assertEqual(data['rows'], 1); self.assertEqual(data['eligible'], 1)
         self.assertTrue(data['schedule']['enabled']); self.assertFalse(data['ok'])
-        self.assertEqual(data['checks']['redis']['code'], 'redis_connection_failed')
-        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 2)
-    def test_google_initialization_failure_does_not_hide_redis_result(self):
-        state = Mock(); state.get.return_value = {'status':'completed', 'done':2}
-        with patch.object(routes, 'worker', side_effect=ClickoutError('google_credentials_refresh_rejected')), patch.object(routes, 'redis_state', return_value=state):
+        self.assertEqual(data['checks']['state']['code'], 'clickouts_state_corrupt')
+        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 3)
+    def test_google_initialization_failure_skips_state_and_preserves_diagnostics(self):
+        with patch.object(routes, 'worker', side_effect=ClickoutError('google_credentials_refresh_rejected')), patch.object(routes, 'sheet_state') as state:
             data = self.client.get('/social/clickouts/status', headers=self.headers).json()
         self.assertIsNone(data['rows']); self.assertIsNone(data['eligible'])
         self.assertEqual(data['checks']['google_client']['code'], 'google_credentials_refresh_rejected')
         self.assertEqual(data['checks']['queue']['status'], 'skipped')
-        self.assertEqual(data['checks']['redis']['status'], 'ok')
-        self.assertEqual(data['last_run']['done'], 2)
+        self.assertEqual(data['checks']['state']['status'], 'skipped')
+        state.assert_not_called()
     def test_invalid_schedule_preserves_known_queue_counts(self):
         self.store.schedule = schedule(timings='not a time')
         data = self.status()
@@ -470,19 +472,20 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertEqual(data['checks']['queue']['retry_after'], 300)
         self.assertEqual(data['checks']['schedule']['code'], 'sheets_cooldown')
     def test_preview_and_default_run_need_no_redis_configuration(self):
-        with patch.object(routes, 'google_store', return_value=self.store), patch.object(routes, 'redis_state') as state_factory:
+        with patch.object(routes, 'google_store', return_value=self.store), patch.object(routes, 'sheet_state') as state_factory:
             for path in ('/preview', '/run'):
                 response = self.client.post('/social/clickouts'+path, json={}, headers=self.headers)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()['eligible'], 1)
             state_factory.assert_not_called()
         self.assertEqual(self.store.writes, [])
-    def test_real_execution_still_requires_redis(self):
-        with patch.object(routes, 'google_store') as google, patch.object(routes, 'redis_state', side_effect=ClickoutError('redis_connection_failed')):
-            response = self.client.post('/social/clickouts/run', json={'dry_run':False}, headers=self.headers)
-            self.assertEqual(response.status_code, 409)
-            self.assertEqual(response.json()['detail'], 'redis_connection_failed')
-            google.assert_not_called()
+    def test_real_worker_uses_sheet_state_without_importing_redis_or_reading_its_url(self):
+        with patch.object(routes, 'google_store', return_value=self.store), patch.object(routes, 'sheet_state') as state:
+            service=routes.worker()
+            self.assertIs(service.store,self.store)
+            self.assertIs(service.state,state.return_value)
+            state.assert_called_once_with(self.store)
+        self.assertTrue(service.enabled())
     def test_unexpected_exceptions_and_state_extras_never_leak_secrets(self):
         self.store.read = Mock(side_effect=KeyError('token=private-secret&url=redis://user:pass@host'))
         data = self.status(last={'status':'completed', 'done':2, 'private':'private-secret', 'checked_at':'private-secret'})
@@ -490,16 +493,17 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertEqual(data['checks']['queue']['error_type'], 'KeyError')
         self.assertEqual(data['last_run'], {'status':'completed', 'done':2})
     def test_missing_keys_stop_before_diagnostic_dependencies(self):
-        with patch.object(routes, 'worker') as service, patch.object(routes, 'redis_state') as state:
+        with patch.object(routes, 'worker') as service, patch.object(routes, 'sheet_state') as state:
             self.assertEqual(self.client.get('/social/clickouts/status').status_code, 401)
             service.assert_not_called(); state.assert_not_called()
     def test_healthy_diagnostics_are_not_a_claim_of_delete_permission(self):
         data = self.status()
-        self.assertTrue(data['ok']); self.assertFalse(data['enabled'])
+        self.assertTrue(data['ok']); self.assertTrue(data['enabled'])
+        self.assertEqual(data['state_backend'],'google_sheets')
         self.assertEqual(data['provider_permissions'], 'not_checked')
-    def test_corrupt_redis_state_is_explicit(self):
+    def test_corrupt_last_run_state_is_explicit(self):
         data = self.status(last='private-secret')
-        self.assertEqual(data['checks']['redis']['code'], 'redis_state_invalid_shape')
+        self.assertEqual(data['checks']['state']['code'], 'clickouts_state_invalid_shape')
         self.assertNotIn('private-secret', json.dumps(data))
     def test_runtime_reports_only_valid_existing_render_identifiers(self):
         with patch.dict(os.environ, {'RENDER_GIT_COMMIT':'a'*40, 'RENDER_SERVICE_ID':'srv-example',
@@ -540,11 +544,6 @@ class DependencyDiagnosticsTests(unittest.TestCase):
             get_credentials.side_effect = None; build.side_effect = RuntimeError('private URL')
             with self.assertRaisesRegex(ClickoutError, 'google_client_initialization_failed'):
                 state_module.google_store('book')
-    def test_redis_factory_handles_bad_url_without_echoing_it(self):
-        redis = types.SimpleNamespace(from_url=Mock(side_effect=ValueError('redis://private:secret@host')))
-        with patch.dict(sys.modules, {'redis':redis}), patch.dict(os.environ, {'REDIS_URL':'private'}, clear=True):
-            with self.assertRaisesRegex(ClickoutError, 'redis_configuration_invalid'):
-                routes.redis_state('book')
 
 
 if __name__ == '__main__':

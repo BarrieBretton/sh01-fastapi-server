@@ -202,7 +202,7 @@ def acknowledge(row):
 class ClickoutsWorker:
     def __init__(self, store, state, provider_factory=MetaDelete, ack=acknowledge, enabled=None):
         self.store, self.state, self.provider_factory, self.ack = store, state, provider_factory, ack
-        self.enabled = enabled or (lambda: os.getenv('SOCIAL_DELETE_ENABLED') == '1')
+        self.enabled = enabled or (lambda: True)
 
     def preview(self, include_schedule=True):
         rows = self.store.read()
@@ -229,10 +229,18 @@ class ClickoutsWorker:
     def run(self, max_items=3, scheduled=False, now=None):
         if not self.enabled():
             return {'status': 'disabled', 'done': 0}
+        schedule_snapshot = None
+        if scheduled:
+            if (self.state.get('next_poll') or 0) > time.time():
+                return {'status': 'waiting', 'done': 0}
+            schedule = read_schedule(self.store.schedule_rows())
+            if not schedule['enabled']:
+                return {'status': 'paused', 'done': 0}
+            schedule_snapshot = schedule
         if not self.state.acquire():
             return {'status': 'busy', 'done': 0}
         try:
-            return self._run(max_items, scheduled, now or datetime.now(timezone.utc))
+            return self._run(max_items, scheduled, now or datetime.now(timezone.utc), schedule_snapshot)
         except ClickoutError as exc:
             if exc.retry_after:
                 self.state.put('cooldown', time.time() + exc.retry_after)
@@ -240,7 +248,7 @@ class ClickoutsWorker:
         finally:
             self.state.release()
 
-    def _run(self, max_items, scheduled, now):
+    def _run(self, max_items, scheduled, now, schedule_snapshot=None):
         delay = (self.state.get('cooldown') or 0) - time.time()
         if delay > 0:
             return {'status': 'cooldown', 'retry_after': round(delay), 'done': 0}
@@ -250,7 +258,7 @@ class ClickoutsWorker:
             if (self.state.get('next_poll') or 0) > time.time():
                 return {'status': 'waiting', 'done': 0}
             self.state.put('next_poll', time.time() + 60)
-            schedule = read_schedule(self.store.schedule_rows())
+            schedule = schedule_snapshot if schedule_snapshot is not None else read_schedule(self.store.schedule_rows())
             if not schedule['enabled']:
                 return {'status': 'paused', 'done': 0}
             local = now.astimezone(IST)

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import time
 import uuid
 
 
@@ -108,6 +110,7 @@ class RedisState:
 
 
 class GoogleClickouts:
+    _cooldowns = {}
     REQUIRED = ('urls', 'platform', 'account_id', 'post_id', 'request_id')
     OWNED = ('status', 'deleted_at', 'last_attempt_at', 'error', 'dashboard_ack')
     META_KEY = 'sh01_clickout_identity_v1'
@@ -120,6 +123,9 @@ class GoogleClickouts:
         self.book = None
 
     def call(self, request):
+        remaining = self._cooldowns.get(self.workbook, 0) - time.time()
+        if remaining > 0:
+            raise ClickoutError('sheets_cooldown', math.ceil(remaining))
         try:
             return request.execute(num_retries=0)
         except Exception as exc:
@@ -129,6 +135,7 @@ class GoogleClickouts:
             if status in (429, 503):
                 from clickouts_worker import retry_seconds
                 delay = retry_seconds(getattr(exc, 'resp', {}).get('retry-after'), 60)
+                self._cooldowns[self.workbook] = max(self._cooldowns.get(self.workbook, 0), time.time() + delay)
             code = {400: 'sheets_invalid_request', 401: 'google_credentials_rejected',
                     403: 'sheets_permission_or_quota_denied', 404: 'spreadsheet_not_found_or_inaccessible',
                     429: 'sheets_rate_limited', 503: 'sheets_service_unavailable'}.get(status, 'sheets_request_failed')

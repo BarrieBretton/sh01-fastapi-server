@@ -6,49 +6,46 @@
 
 ## How to read and update this handbook
 
-### Clickouts consumer — source update 15 November 2026
+### Clickouts consumer — configuration correction, November 2026
 
-**Code:** Starting from remote `main` at `c82f0a47ad4c9d75c5ff27e4ed2334703bbfa3f1`,
-the SH01 server now mounts `/social/clickouts/{status,preview,run,tick}` via
-`clickouts_routes.py`. `clickouts_worker.py` consumes confirmed-queue identities
-from the existing workbook's `clickouts` tab; only provider-confirmed deletions
-are marked `status=done`, without removing rows. Google row metadata and shared
-Redis records support safe status recovery and prevent blind repeat DELETE calls.
+**Code:** Based on remote `main` at `a49560c9505e5114173f67c4798c35fc77491a68`,
+Clickouts now uses the existing Google workbook for coordination. It does not
+connect to Redis and does not require or read `SOCIAL_DELETE_ENABLED`. The
+separate legacy single-post deletion route retains its existing controls.
+
+`clickouts_routes.py` mounts `/social/clickouts/{status,preview,run,tick}`.
+`clickouts_worker.py` processes confirmed queue identities; only verified provider
+DELETE successes become `status=done`, and rows remain in the Sheet.
+`clickouts_sheet_state.py` uses a hidden `_sh01_clickouts_state` tab with guarded
+atomic mutations for leases, per-post attempts, receipts and daily progress.
+Attempt records survive lease expiry; uncertain DELETE outcomes are not retried.
+It uses existing Google credentials, `SPREADSHEET_ID`, Meta configuration and
+`MEDIA_CLIP_API_KEY`. No new Render variable or Cloudflare change is required.
 
 One `Server::Clickouts` (alias `Python::Clickouts`) row in `Workflow-Schedule`
-controls daily timings in Asia/Kolkata using only `Workflow` and `Timings`.
-`Run as Job Today` is an operator-owned one-time override field and is ignored
-by Clickouts daily scheduling; blank, `no`, and `yes` behave identically.
-`Associated Accounts` can be blank. The scheduler starts only when
-`SOCIAL_DELETE_ENABLED=1`; protected Clickouts routes reuse `MEDIA_CLIP_API_KEY`.
-An existing `SOCIAL_INVENTORY_API_KEY` is also accepted, without overriding the
-media key. No additional API-key variable is required on Render instances.
-This correction is based on remote `main` at `5c04906b589e0a533fa0161b8f63c48b5a2e0866`.
-Existing Google credentials, `SPREADSHEET_ID`, shared
-`REDIS_URL`, and Meta credentials are reused. Operations Desk receipts require
-its existing ingest credential (`OPS_INGEST_TOKEN` on SH01).
+provides daily timings in Asia/Kolkata. Only `Workflow` and `Timings` are used.
+Blank timings pause daily execution. `Run as Job Today` remains an operator-owned
+one-time override field and is ignored. `Associated Accounts` can be blank.
+Startup enables polling when existing workbook/key configuration is present;
+**deployment with a valid schedule activates daily execution**, including today's
+latest due occurrence. Authenticated manual non-dry-run requests execute one batch.
 
-**Status diagnostics correction:** Based on remote `main`
-`00198feb0dde9890beedcd611b27a3421784115e`, read-only preview no longer depends on
-Redis, and `/social/clickouts/status` checks Google setup, queue reads, schedule
-reads and Redis separately. `diagnostics_version: 2` reports partial evidence and
-static failure codes; HTTP 200 with `ok: false` is a degraded diagnostic report.
-Destructive execution retains Redis coordination and the existing enable checks.
-The operator reported `clickouts_unavailable_no_automatic_delete_retry` from the
-old authenticated status endpoint; the failing live dependency remains unverified.
+`diagnostics_version: 3` reports Google setup, queue, schedule and workbook state.
+Status/preview requests never create state or call Meta. A missing state tab is
+normal before first execution; damaged state stops execution. Optional dashboard
+receipts reuse existing `OPS_INGEST_TOKEN` / `INGEST_TOKEN` when configured. Without
+one, Sheet status still updates but the dashboard is not notified.
 
-**Schedule semantics correction — 16 November 2026:** The operator clarified that
-`Run as Job Today` must not gate ordinary Clickouts runs. Based on remote `main`
-`1e44cc25c1bbb11f6844f8fbeb1cc5d2f16bc155`, the daily parser now requires only
-`Workflow` and `Timings`; it leaves all override columns untouched. Compact times
-such as `9:00pm`, `11:45pm` and `11:58pm` are covered by tests. Blank `Timings`
-means no daily cadence. Existing API-key reuse, Redis coordination and the
-server-wide deletion enable switch remain in effect.
+**Operator-observed:** The response from commit `a49560c` reported 37 rows,
+34 eligible/pending, 3 `added`, schedule 10:30 AM Asia/Kolkata, deletion disabled,
+Redis connection failure, no dashboard receipts configured and no checked Meta
+permissions. This correction addresses those runtime configuration dependencies;
+it does not classify `added` as pending or claim those posts were deleted.
 
-**Unverified:** live deployment, Redis persistence, the workbook schedule row,
-Meta deletion permissions/app eligibility, and actual deletions. Offline tests
-are not production execution evidence. Full setup, failure states, API limits,
-and read-only verification: [Clickouts automation](CLICKOUTS_AUTOMATION.md).
+**Unverified:** deployment of this correction, the live Sheets concurrency guard,
+Meta permissions/app eligibility, and actual deletions. Offline protocol tests
+are not live provider evidence. See [Clickouts automation](CLICKOUTS_AUTOMATION.md)
+for schedule semantics, state recovery and diagnostic codes.
 
 Evidence labels in the tables:
 

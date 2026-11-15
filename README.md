@@ -1,8 +1,10 @@
 # SH01 FastAPI server
 
 **Clickouts queue deletion:** [setup, Sheet schedule and endpoints](docs/CLICKOUTS_AUTOMATION.md).
-The consumer retains rows and marks confirmed deletions `done`. Runtime activation
-and provider deletion permissions are required; patch installation is not activation.
+The consumer retains rows and marks confirmed deletions `done`. Daily runs use
+`Workflow-Schedule` and shared state in the existing workbook, without Redis or
+new Render variables. Deploying with a valid schedule enables execution when due;
+Meta deletion permissions still need to be valid.
 
 SH01 is a FastAPI service for media production, Telegram-backed media storage, Google Sheets utilities, and publishing integrations. The same repository also contains an infrastructure control plane that coordinates paired n8n and SH01 Render services, Postgres slots, Backblaze B2 slots, and Cloudflare routers.
 

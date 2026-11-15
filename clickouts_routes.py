@@ -10,7 +10,8 @@ import re
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from clickouts_state import ClickoutError, RedisState, google_store, redis_failure
+from clickouts_state import ClickoutError, google_store
+from clickouts_sheet_state import SheetsState
 from clickouts_worker import ClickoutsWorker, read_schedule
 
 log = logging.getLogger(__name__)
@@ -36,28 +37,13 @@ def configured_workbook():
     return workbook
 
 
-def redis_state(workbook):
-    redis_url = os.getenv('REDIS_URL', '').strip()
-    if not redis_url:
-        raise ClickoutError('shared_redis_not_configured')
-    try:
-        import redis
-    except ImportError:
-        raise ClickoutError('redis_dependency_missing') from None
-    try:
-        client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2,
-                                socket_timeout=3, retry_on_timeout=False)
-    except (ValueError, TypeError):
-        raise ClickoutError('redis_configuration_invalid') from None
-    except Exception as exc:
-        raise redis_failure(exc) from None
-    return RedisState(client, workbook)
+def sheet_state(store):
+    return SheetsState(store)
 
 
 def worker(read_only=False):
-    workbook = configured_workbook()
-    state = None if read_only else redis_state(workbook)
-    return ClickoutsWorker(google_store(workbook), state)
+    store = google_store(configured_workbook())
+    return ClickoutsWorker(store, None if read_only else sheet_state(store))
 
 
 def check_failure(error, fallback):
@@ -76,7 +62,7 @@ def last_run_summary(value):
     if value is None:
         return None
     if not isinstance(value, dict):
-        raise ClickoutError('redis_state_invalid_shape')
+        raise ClickoutError('clickouts_state_invalid_shape')
     result = {}
     if value.get('status') in {'completed', 'more_pending', 'idle', 'disabled', 'busy', 'waiting', 'paused', 'cooldown'}:
         result['status'] = value['status']
@@ -96,8 +82,8 @@ def last_run_summary(value):
 
 def inspect_status():
     """Independent read-only checks. An unavailable dependency cannot erase other evidence."""
-    result = {'diagnostics_version': 2, 'dry_run': True, 'enabled': os.getenv('SOCIAL_DELETE_ENABLED') == '1',
-              'scheduler_enabled': os.getenv('SOCIAL_DELETE_ENABLED') == '1',
+    result = {'diagnostics_version': 3, 'dry_run': True, 'enabled': None,
+              'scheduler_enabled': None, 'state_backend': 'google_sheets',
               'dashboard_receipts_configured': bool(os.getenv('OPS_INGEST_TOKEN') or os.getenv('INGEST_TOKEN')),
               'provider_permissions': 'not_checked', 'rows': None, 'eligible': None,
               'status_counts': None, 'blocked_counts': None, 'schedule': None, 'last_run': None, 'checks': {}}
@@ -133,14 +119,19 @@ def inspect_status():
             try:
                 result['schedule'] = read_schedule(service.store.schedule_rows())
                 checks['schedule'] = {'status': 'ok'}
+                result['enabled'] = result['scheduler_enabled'] = result['schedule']['enabled']
             except Exception as exc:
                 checks['schedule'] = check_failure(exc, 'schedule_read_failed')
-    try:
-        state = redis_state(configured_workbook())
-        result['last_run'] = last_run_summary(state.get('last_result'))
-        checks['redis'] = {'status': 'ok'}
-    except Exception as exc:
-        checks['redis'] = check_failure(exc, 'redis_status_read_failed')
+    if service is None or checks['queue'].get('retry_after') or checks['schedule'].get('retry_after'):
+        checks['state'] = {'status': 'skipped', 'code': 'google_client_unavailable' if service is None else 'sheets_cooldown'}
+    else:
+        try:
+            state = sheet_state(service.store)
+            initialized = state.load()
+            result['last_run'] = last_run_summary(state.get('last_result')) if initialized else None
+            checks['state'] = {'status': 'ok', 'initialized': initialized}
+        except Exception as exc:
+            checks['state'] = check_failure(exc, 'clickouts_state_read_failed')
     result['ok'] = all(check['status'] == 'ok' for check in checks.values())
     result['status'] = 'ok' if result['ok'] else 'degraded'
     return result
@@ -179,27 +170,26 @@ async def run(request: RunRequest):
 
 @router.post('/tick', dependencies=[Depends(authorize)])
 async def tick():
-    """External scheduler entry point. Honors the sheet schedule and server opt-in."""
+    """External scheduler entry point. Honors the daily sheet schedule."""
     return await invoke(lambda: worker().run(scheduled=True))
 
 
 def scheduled_tick():
-    if os.getenv('SOCIAL_DELETE_ENABLED') != '1':
-        return
     try:
         result = worker().run(scheduled=True)
         log.info('clickouts_tick status=%s done=%s', result['status'], result.get('done', 0))
     except ClickoutError as exc:
         log.warning('clickouts_tick code=%s', str(exc))
     except Exception:
-        # Never log Redis connection URLs, Google payloads, or token-bearing errors.
+        # Never log Google payloads or token-bearing errors.
         log.warning('clickouts_tick code=service_unavailable')
 
 
 @router.on_event('startup')
 def start_clickouts_scheduler():
     global _scheduler
-    if _scheduler is not None or os.getenv('SOCIAL_DELETE_ENABLED') != '1':
+    if _scheduler is not None or not os.getenv('SPREADSHEET_ID', '').strip() or not any(
+            os.getenv(name, '').strip() for name in ('MEDIA_CLIP_API_KEY', 'SOCIAL_INVENTORY_API_KEY')):
         return
     from apscheduler.schedulers.background import BackgroundScheduler
     _scheduler = BackgroundScheduler(timezone='Asia/Kolkata')
