@@ -16,8 +16,10 @@ are marked `status=done`, without removing rows. Google row metadata and shared
 Redis records support safe status recovery and prevent blind repeat DELETE calls.
 
 One `Server::Clickouts` (alias `Python::Clickouts`) row in `Workflow-Schedule`
-controls daily timings in Asia/Kolkata and uses `Run as Job Today` as its enable
-flag. `Associated Accounts` can be blank. The scheduler starts only when
+controls daily timings in Asia/Kolkata using only `Workflow` and `Timings`.
+`Run as Job Today` is an operator-owned one-time override field and is ignored
+by Clickouts daily scheduling; blank, `no`, and `yes` behave identically.
+`Associated Accounts` can be blank. The scheduler starts only when
 `SOCIAL_DELETE_ENABLED=1`; protected Clickouts routes reuse `MEDIA_CLIP_API_KEY`.
 An existing `SOCIAL_INVENTORY_API_KEY` is also accepted, without overriding the
 media key. No additional API-key variable is required on Render instances.
@@ -34,6 +36,14 @@ static failure codes; HTTP 200 with `ok: false` is a degraded diagnostic report.
 Destructive execution retains Redis coordination and the existing enable checks.
 The operator reported `clickouts_unavailable_no_automatic_delete_retry` from the
 old authenticated status endpoint; the failing live dependency remains unverified.
+
+**Schedule semantics correction — 16 November 2026:** The operator clarified that
+`Run as Job Today` must not gate ordinary Clickouts runs. Based on remote `main`
+`1e44cc25c1bbb11f6844f8fbeb1cc5d2f16bc155`, the daily parser now requires only
+`Workflow` and `Timings`; it leaves all override columns untouched. Compact times
+such as `9:00pm`, `11:45pm` and `11:58pm` are covered by tests. Blank `Timings`
+means no daily cadence. Existing API-key reuse, Redis coordination and the
+server-wide deletion enable switch remain in effect.
 
 **Unverified:** live deployment, Redis persistence, the workbook schedule row,
 Meta deletion permissions/app eligibility, and actual deletions. Offline tests

@@ -21,9 +21,9 @@ def row(request='r1', post='200', **extra):
             'account_id': '100', 'post_id': post, 'request_id': request, 'status': '', **extra}
 
 
-def schedule(workflow='Server::Clickouts', timings='10:00, 18:30', enabled='yes'):
+def schedule(workflow='Server::Clickouts', timings='10:00, 18:30', job_override=''):
     return [['Workflow', 'Timings', 'Associated Accounts', 'Run as Job Today'],
-            [workflow, timings, '', enabled]]
+            [workflow, timings, '', job_override]]
 
 
 class Redis:
@@ -207,13 +207,40 @@ class WorkerTests(unittest.TestCase):
         evening = datetime(2026, 11, 15, 13, 0, tzinfo=timezone.utc)
         self.service().run(2, True, evening)
         self.assertEqual(self.provider.deleted[-1], '999')
-    def test_paused_or_unregistered_schedule_cannot_execute(self):
-        self.store.schedule = schedule(enabled='no')
+    def test_missing_timings_or_unregistered_schedule_cannot_execute(self):
+        self.store.schedule = schedule(timings='')
         self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
         self.redis.data.pop(self.state.prefix + 'next_poll')
         self.store.schedule = schedule('Python::arbitrary_code')
         self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
         self.assertEqual(self.provider.deleted, [])
+    def test_due_clickouts_runs_with_blank_no_or_yes_job_override_and_keeps_cells(self):
+        at = datetime(2026, 11, 16, 15, 30, tzinfo=timezone.utc)  # 9:00pm IST.
+        for override in ('', 'no', 'yes', False, True, 0, 1):
+            with self.subTest(override=override):
+                store = Store([row()]); store.schedule = schedule(timings='9:00pm', job_override=override)
+                original = copy.deepcopy(store.schedule)
+                provider = Provider()
+                service = worker.ClickoutsWorker(store, RedisState(Redis(), 'book'),
+                    provider_factory=lambda: provider, ack=lambda r:'not_configured', enabled=lambda:True)
+                result = service.run(scheduled=True, now=at)
+                self.assertEqual(result['done'], 1)
+                self.assertEqual(provider.deleted, ['200'])
+                self.assertEqual(store.schedule, original)
+    def test_yes_override_does_not_execute_before_time_or_repeat_completed_occurrence(self):
+        self.store.schedule = schedule(timings='9:00pm', job_override='yes')
+        before = datetime(2026, 11, 16, 15, 29, tzinfo=timezone.utc)
+        self.assertEqual(self.service().run(scheduled=True, now=before)['status'], 'waiting')
+        self.assertEqual(self.provider.deleted, [])
+        self.redis.data.pop(self.state.prefix+'next_poll')
+        due = datetime(2026, 11, 16, 15, 30, tzinfo=timezone.utc)
+        self.service().run(scheduled=True, now=due)
+        self.store.rows.append(row('later', '201'))
+        for override in ('no', 'yes'):
+            self.store.schedule = schedule(timings='9:00pm', job_override=override)
+            self.redis.data.pop(self.state.prefix+'next_poll')
+            self.assertEqual(self.service().run(scheduled=True, now=due)['status'], 'waiting')
+        self.assertEqual(self.provider.deleted, ['200'])
     def test_poll_is_shared_across_replicas(self):
         self.service().run(scheduled=True, now=datetime(2026, 11, 15, 1, tzinfo=timezone.utc))
         self.service(RedisState(self.redis, 'book')).run(scheduled=True)
@@ -225,10 +252,39 @@ class ScheduleAndProviderTests(unittest.TestCase):
         self.assertTrue(worker.read_schedule(schedule(' Python :: Clickouts '))['enabled'])
         self.assertEqual(worker.parse_times('9:30 AM; 6:00 PM\n00:00'), [0, 570, 1080])
         self.assertEqual(worker.parse_times(.5), [720])
-        self.assertFalse(worker.read_schedule(schedule(timings='', enabled=''))['enabled'])
+        self.assertFalse(worker.read_schedule(schedule(timings=''))['enabled'])
         for bad in ['24:00', '12:99', '0:00PM', 'every hour', '', '10:00<script>']:
             with self.assertRaises(ClickoutError): worker.parse_times(bad)
         with self.assertRaises(ClickoutError): worker.read_schedule(schedule() + [schedule('Python::Clickouts')[1]])
+    def test_only_workflow_and_timings_headers_are_required(self):
+        self.assertEqual(worker.read_schedule([['Workflow','Timings'], ['Server::Clickouts','11:58pm']])['times'], [1438])
+        values = [['Timings','Run as Job Today','Workflow','Run as Job Today'], ['3:30pm','yes','Python::Clickouts','no']]
+        self.assertEqual(worker.read_schedule(values)['times'], [930])
+    def test_job_override_values_do_not_change_daily_schedule(self):
+        expected = worker.read_schedule(schedule(timings='11:45pm'))
+        for override in ('', 'yes', 'no', 'TRUE', 'FALSE', True, False, 0, 1, 'custom one-time args'):
+            with self.subTest(override=override):
+                self.assertEqual(worker.read_schedule(schedule(timings='11:45pm', job_override=override)), expected)
+        for blank in ('', '  ', None):
+            data = worker.read_schedule(schedule(timings=blank, job_override='yes'))
+            self.assertFalse(data['enabled']); self.assertEqual(data['reason'], 'workflow_timings_empty')
+        with self.assertRaises(ClickoutError): worker.read_schedule(schedule(timings='invalid', job_override='no'))
+    def test_screenshot_time_formats_and_noon_midnight(self):
+        expected = {'9:00pm':1260, '3:30pm':930, '11:00pm':1380, '11:45pm':1425,
+                    '6:00pm':1080, '3:00pm':900, '11:58pm':1438, '7:00pm':1140,
+                    '8:48pm':1248, '9:48pm':1308, '7:30pm':1170, '9:30pm':1290,
+                    '10:30pm':1350, '11:15pm':1395, '10:40pm':1360,
+                    '12:00am':0, '12:00pm':720, ' 11:58 PM ':1438}
+        for text, minute in expected.items():
+            with self.subTest(text=text):
+                self.assertEqual(worker.parse_times(text), [minute])
+                self.assertEqual(worker.read_schedule(schedule(timings=text))['times'], [minute])
+        self.assertEqual(worker.parse_times('9:00pm;11:58pm\n9:00pm'), [1260,1438])
+    def test_native_sheet_time_never_rounds_to_another_minute_or_day(self):
+        for minute in (0, 1, 720, 930, 1260, 1438, 1439):
+            self.assertEqual(worker.parse_times(minute/1440), [minute])
+        self.assertEqual(worker.parse_times((23*3600+59*60+59)/86400), [1439])
+        self.assertEqual(worker.read_schedule(schedule(timings=0))['times'], [0])
     def provider(self):
         with patch.dict(os.environ, {'META_SYSVAR': 'x'*32}, clear=True): return worker.MetaDelete()
     def test_owner_permalink_and_exact_id_verified(self):

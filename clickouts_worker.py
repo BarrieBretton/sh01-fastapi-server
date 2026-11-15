@@ -65,7 +65,8 @@ def post_key(row):
 
 def parse_times(value):
     if isinstance(value, (float, int)) and not isinstance(value, bool) and 0 <= value < 1:
-        minutes = round(value * 1440) % 1440
+        # Use the displayed minute; never round 11:59pm forward to midnight.
+        minutes = min(1439, int(value * 1440 + 1e-7))
         return [minutes]
     result = set()
     for item in re.split(r'[,;\n]+', str(value).strip()):
@@ -85,23 +86,24 @@ def read_schedule(values):
     if not values:
         raise ClickoutError('workflow_schedule_empty')
     headers = [str(x).strip().casefold() for x in values[0]]
-    for key in ('workflow', 'timings', 'run as job today'):
+    for key in ('workflow', 'timings'):
         if headers.count(key) != 1:
             raise ClickoutError('workflow_schedule_headers_invalid')
+    workflow_column, timings_column = headers.index('workflow'), headers.index('timings')
     rows = []
     for cells in values[1:]:
-        row = {h: cells[i] if i < len(cells) else '' for i, h in enumerate(headers)}
-        workflow = re.sub(r'\s+', '', str(row.get('workflow', ''))).casefold()
+        name = cells[workflow_column] if workflow_column < len(cells) else ''
+        workflow = re.sub(r'\s+', '', str(name)).casefold()
         if workflow in {'server::clickouts', 'python::clickouts'}:
-            rows.append(row)
+            rows.append(cells[timings_column] if timings_column < len(cells) else '')
     if not rows:
         return {'enabled': False, 'times': [], 'timezone': 'Asia/Kolkata', 'reason': 'workflow_not_listed'}
     if len(rows) != 1:
         raise ClickoutError('duplicate_clickouts_schedule_rows')
-    row = rows[0]
-    enabled = str(row['run as job today']).strip().casefold() in {'yes', 'true', '1'}
-    return {'enabled': enabled, 'times': parse_times(row['timings']) if enabled else [],
-            'timezone': 'Asia/Kolkata', 'reason': None if enabled else 'workflow_paused'}
+    timing = rows[0]
+    if timing is None or (isinstance(timing, str) and not timing.strip()):
+        return {'enabled': False, 'times': [], 'timezone': 'Asia/Kolkata', 'reason': 'workflow_timings_empty'}
+    return {'enabled': True, 'times': parse_times(timing), 'timezone': 'Asia/Kolkata', 'reason': None}
 
 
 class MetaDelete:

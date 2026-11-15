@@ -38,12 +38,13 @@ for deletion: enable this only for the workbook containing confirmed removals.
    dashboard's existing `INGEST_TOKEN`. `INGEST_TOKEN` on the server is also
    accepted. Retain `OPS_DASHBOARD_URL` if configured; the existing fixed dashboard
    default is otherwise used. A scanner-only credential cannot report deletions.
-7. Add **one** schedule row as shown below, initially with `Run as Job Today = no`.
+7. Add **one** schedule row as shown below using `Workflow` and `Timings`.
    Inspect `POST /social/clickouts/preview`; it reads the queue without modifying
    rows or calling Meta. It validates row identities, not provider permissions.
 8. To activate actual deletion, set **`SOCIAL_DELETE_ENABLED=1`** on the SH01
-   service, restart/redeploy it, and set that schedule row's flag to **`yes`**.
-   The first due run can consume existing queued rows immediately.
+   service and restart/redeploy it. A matching workflow row with valid `Timings`
+   supplies its daily cadence. The first due run can consume existing queued rows
+   immediately. Clear `Timings` to pause the daily cadence.
 
 No separate per-account registry is required by this consumer. Account ownership
 and the permalink are verified against Meta immediately before deletion. A blank
@@ -53,16 +54,24 @@ and the permalink are verified against Meta immediately before deletion. A blank
 
 | Workflow | Timings | Associated Accounts | Run as Job Today | Public Drive Link | Caption | Remarks |
 | --- | --- | --- | --- | --- | --- | --- |
-| Server::Clickouts | 10:00, 18:30 | | yes | | | |
+| Server::Clickouts | 9:00pm, 11:58pm | | | | | |
 
 `Python::Clickouts` is an alias for the same job. Use **one row**, not both aliases.
 Other `Server::`/`Python::` names do not execute arbitrary functions or Python code.
 
 - Times are **Asia/Kolkata (UTC+05:30)**, matching the existing server scheduler.
-- Accepted: `10:00`, `18:30`, `9:30 AM`; separate multiple times with commas,
-  semicolons or newlines. A native Google Sheets time cell is supported too.
-- `yes`, `true`, or `1` enables the row. Blank / `no` pauses it. The flag remains
-  as entered, so `yes` repeats daily; the consumer does not reset it at midnight.
+- Accepted: `9:00pm`, `3:30pm`, `11:45pm`, `11:58pm`, `9:30 AM`, `10:00`,
+  `18:30`. AM/PM is case-insensitive and can be attached directly to the time.
+  Separate multiple times with commas, semicolons or newlines. Native Google
+  Sheets time cells are supported; a minute is never rounded into the next day.
+- Only `Workflow` and `Timings` are required by the daily scheduler.
+  **`Run as Job Today` is ignored**, including blank, `no`, and `yes`. It belongs
+  to the operator's separate one-time override workflow. Clickouts neither reads
+  that column for scheduling decisions nor consumes, resets or writes it.
+  Setting it to `yes` does not create an immediate or additional Clickouts run.
+- A matching row with valid `Timings` schedules daily runs. Blank `Timings` or
+  no matching workflow row means no daily run; invalid nonblank times produce a
+  diagnostic error. `Run as Job Today = no` is **not** a pause control.
 - One shared poll per minute across replicas checks the schedule. A due occurrence
   processes up to **3 rows per tick**, then resumes on subsequent minute ticks
   while there is eligible backlog. Each batch also stops starting new items after
@@ -230,3 +239,5 @@ perform live deletion. Cases include same-post duplication, wrong-owner refusal,
 long numeric-ID rejection, loss of a DELETE response, loss of a Sheet update,
 Redis/lease failures, row/column movement, protected routes, daily aliases,
 restart catch-up, bounded backlog continuation and quota cooldown.
+Schedule regressions cover every job-override value, a missing override column,
+the supplied compact `h:mmpm` strings, noon/midnight, and native Sheet time values.
