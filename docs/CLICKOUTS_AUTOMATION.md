@@ -26,9 +26,10 @@ for deletion: enable this only for the workbook containing confirmed removals.
 3. Retain a working **shared `REDIS_URL`** on every SH01 replica consuming this
    workbook. Configure Redis persistence and avoid eviction of the Clickouts keys.
    Missing/unavailable Redis prevents deletion. Process memory is not a substitute.
-4. Configure `SOCIAL_INVENTORY_API_KEY` for the protected endpoints. This is the
-   existing single-post deletion credential; `MEDIA_CLIP_API_KEY` does **not** grant
-   access to these new deletion endpoints.
+4. Use the server's existing **`MEDIA_CLIP_API_KEY`** for the protected Clickouts
+   endpoints. No additional API-key variable is required. An already configured
+   `SOCIAL_INVENTORY_API_KEY` is also accepted for compatibility; it does not
+   override or disable the media key on instances where both exist.
 5. Verify the Meta token and app permissions described below. Use the existing
    `META_SYSVAR` (or `FB_PAGE_ACCESS_TOKEN` fallback) and `META_GRAPH_VERSION`.
 6. For Operations Desk status updates, set the server's `OPS_INGEST_TOKEN` to the
@@ -128,7 +129,11 @@ that other services sharing the same Google/Meta quota cannot exhaust it.
 
 ## Endpoints
 
-All routes require `X-API-KEY: <SOCIAL_INVENTORY_API_KEY>`.
+All Clickouts routes accept `X-API-KEY: <MEDIA_CLIP_API_KEY>` using the existing
+server credential. An already configured `SOCIAL_INVENTORY_API_KEY` also works.
+Missing/incorrect credentials are rejected before storage access. This credential
+reuse is limited to these Clickouts routes; the existing provider ownership,
+server deletion enable switch, and Sheet scheduling checks still apply.
 
 | Method and path | Behaviour |
 | --- | --- |
@@ -145,7 +150,7 @@ sanitised diagnostics. Clients must inspect the JSON result as well as HTTP stat
 
 ```powershell
 $base = 'https://sh01.vivojaymail.workers.dev'
-$secure = Read-Host 'SOCIAL_INVENTORY_API_KEY' -AsSecureString
+$secure = Read-Host 'Existing MEDIA_CLIP_API_KEY' -AsSecureString
 $key = [System.Net.NetworkCredential]::new('', $secure).Password
 try {
     Invoke-RestMethod -Method Post -Uri "$base/social/clickouts/preview" `

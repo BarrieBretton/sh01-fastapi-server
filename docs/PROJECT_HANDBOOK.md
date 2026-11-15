@@ -18,8 +18,11 @@ Redis records support safe status recovery and prevent blind repeat DELETE calls
 One `Server::Clickouts` (alias `Python::Clickouts`) row in `Workflow-Schedule`
 controls daily timings in Asia/Kolkata and uses `Run as Job Today` as its enable
 flag. `Associated Accounts` can be blank. The scheduler starts only when
-`SOCIAL_DELETE_ENABLED=1`; protected routes use `SOCIAL_INVENTORY_API_KEY`, not
-the scanner/media key. Existing Google credentials, `SPREADSHEET_ID`, shared
+`SOCIAL_DELETE_ENABLED=1`; protected Clickouts routes reuse `MEDIA_CLIP_API_KEY`.
+An existing `SOCIAL_INVENTORY_API_KEY` is also accepted, without overriding the
+media key. No additional API-key variable is required on Render instances.
+This correction is based on remote `main` at `5c04906b589e0a533fa0161b8f63c48b5a2e0866`.
+Existing Google credentials, `SPREADSHEET_ID`, shared
 `REDIS_URL`, and Meta credentials are reused. Operations Desk receipts require
 its existing ingest credential (`OPS_INGEST_TOKEN` on SH01).
 

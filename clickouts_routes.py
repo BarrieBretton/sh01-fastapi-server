@@ -18,10 +18,13 @@ _scheduler = None
 
 
 def authorize(x_api_key: str | None = Header(default=None, alias='X-API-KEY')):
-    expected = os.getenv('SOCIAL_INVENTORY_API_KEY', '')
+    # Reuse the already deployed media credential on every instance. Retain an
+    # existing social key as a compatible alternative, never a required setup step.
+    expected = [value for name in ('MEDIA_CLIP_API_KEY', 'SOCIAL_INVENTORY_API_KEY')
+                if (value := os.getenv(name, '').strip())]
     if not expected:
         raise HTTPException(status_code=503, detail='social_api_not_configured')
-    if not x_api_key or not hmac.compare_digest(expected, x_api_key):
+    if not x_api_key or not any(hmac.compare_digest(value.encode(), x_api_key.encode()) for value in expected):
         raise HTTPException(status_code=401, detail='invalid_api_key')
 
 

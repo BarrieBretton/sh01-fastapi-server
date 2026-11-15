@@ -291,11 +291,53 @@ class RouteTests(unittest.TestCase):
     def test_auth_before_any_storage_work_and_default_preview(self):
         with patch.object(routes, 'worker') as factory:
             for path in ['/preview', '/run', '/tick']:
-                self.assertEqual(self.client.post('/social/clickouts'+path, json={}, headers={'X-API-KEY':'scanner-key'}).status_code, 401)
+                self.assertEqual(self.client.post('/social/clickouts'+path, json={}, headers={'X-API-KEY':'wrong-key'}).status_code, 401)
             factory.assert_not_called()
             factory.return_value.preview.return_value = {'dry_run': True}
             reply = self.client.post('/social/clickouts/run', json={}, headers={'X-API-KEY':'delete-key'})
             self.assertTrue(reply.json()['dry_run']); factory.return_value.run.assert_not_called()
+    def test_existing_media_key_works_without_a_social_key_on_every_endpoint(self):
+        os.environ.pop('SOCIAL_INVENTORY_API_KEY')
+        headers = {'X-API-KEY': 'scanner-key'}
+        with patch.object(routes, 'worker') as factory:
+            factory.return_value.preview.return_value = {'dry_run': True}
+            factory.return_value.state.get.return_value = None
+            factory.return_value.run.return_value = {'status': 'disabled', 'done': 0}
+            self.assertEqual(self.client.get('/social/clickouts/status', headers=headers).status_code, 200)
+            self.assertEqual(self.client.post('/social/clickouts/preview', headers=headers).status_code, 200)
+            result = self.client.post('/social/clickouts/run', json={}, headers=headers)
+            self.assertTrue(result.json()['dry_run']); factory.return_value.run.assert_not_called()
+            self.assertEqual(self.client.post('/social/clickouts/run', json={'dry_run':False}, headers=headers).status_code, 200)
+            self.assertEqual(self.client.post('/social/clickouts/tick', headers=headers).status_code, 200)
+    def test_partially_configured_social_key_does_not_override_existing_media_key(self):
+        with patch.object(routes, 'worker') as factory:
+            factory.return_value.preview.return_value = {'dry_run': True}
+            for key in ('scanner-key', 'delete-key'):
+                self.assertEqual(self.client.post('/social/clickouts/preview', headers={'X-API-KEY':key}).status_code, 200)
+    def test_missing_wrong_and_unrelated_keys_fail_before_storage(self):
+        with patch.object(routes, 'worker') as factory:
+            for key in (None, '', 'wrong', 'control-key'):
+                headers = {'X-API-KEY':key} if key is not None else {}
+                self.assertEqual(self.client.get('/social/clickouts/status', headers=headers).status_code, 401)
+            with patch.dict(os.environ, {'CONTROL_PLANE_API_KEY':'control-key', 'MEDIA_CLIP_API_KEY':' ', 'SOCIAL_INVENTORY_API_KEY':''}, clear=True):
+                self.assertEqual(self.client.get('/social/clickouts/status', headers={'X-API-KEY':'control-key'}).status_code, 503)
+            factory.assert_not_called()
+    def test_media_key_rotation_takes_effect_without_cached_auth(self):
+        os.environ.pop('SOCIAL_INVENTORY_API_KEY')
+        with patch.object(routes, 'worker') as factory:
+            factory.return_value.preview.return_value = {'dry_run': True}
+            os.environ['MEDIA_CLIP_API_KEY'] = 'replacement-key'
+            self.assertEqual(self.client.post('/social/clickouts/preview', headers={'X-API-KEY':'scanner-key'}).status_code, 401)
+            self.assertEqual(self.client.post('/social/clickouts/preview', headers={'X-API-KEY':'replacement-key'}).status_code, 200)
+    def test_media_auth_cannot_bypass_disabled_deletion(self):
+        os.environ.pop('SOCIAL_INVENTORY_API_KEY')
+        store = Mock(); state = Mock()
+        service = worker.ClickoutsWorker(store, state)
+        with patch.object(routes, 'worker', return_value=service):
+            for path, body in [('/run', {'dry_run':False}), ('/tick', {})]:
+                response = self.client.post('/social/clickouts'+path, json=body, headers={'X-API-KEY':'scanner-key'})
+                self.assertEqual(response.json()['status'], 'disabled')
+        store.read.assert_not_called(); state.acquire.assert_not_called()
     def test_explicit_batch_limits_and_opaque_failures(self):
         with patch.object(routes, 'worker') as factory:
             headers = {'X-API-KEY':'delete-key'}
