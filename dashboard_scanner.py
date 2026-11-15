@@ -88,14 +88,22 @@ class CatalogueProvider:
     def __init__(self, cfg, client):
         self.cfg,self.client=cfg,client
         self.media={}
+        self.post_ids=None
 
     def page(self, after, limit):
         if limit!=20: raise core.SafeError('catalogue_page_size_invalid')
         params={'platform':self.cfg['platform'],'account_id':self.cfg['account_id']}
-        if after: params['after']=after
+        if self.post_ids is not None:
+            if after:raise core.SafeError('invalid_targeted_posts')
+            params['post_ids']=','.join(self.post_ids)
+        elif after: params['after']=after
         data=read_bridge(self.client,'posts',params)
         if data.get('source')!='dashboard_catalogue' or not isinstance(data.get('rows'),list):
             raise core.SafeError('dashboard_catalogue_invalid')
+        if self.post_ids is not None:
+            ids=[str(r.get('post_id','')) for r in data['rows']]
+            if set(ids)!=set(self.post_ids) or len(ids)!=len(self.post_ids) or data.get('next_after'):
+                raise core.SafeError('targeted_posts_missing_or_mismatched')
         return data['rows'],data.get('next_after')
 
     def resolve(self, post_id, refresh=False):
@@ -145,9 +153,13 @@ class CatalogueProvider:
 
 def scan_catalogue(request):
     if request.max_posts>20:raise core.SafeError('maximum_20_catalogue_posts')
+    selected=request.post_ids
+    if selected is not None and (request.cursor or not selected or len(selected)>20 or len(set(selected))!=len(selected) or request.max_posts!=len(selected) or any(not core.re.fullmatch(r'[A-Za-z0-9_-]{1,150}',p) for p in selected)):
+        raise core.SafeError('invalid_targeted_posts')
     cfg={'platform':request.platform,'account_id':request.account_id,'handle':request.account_id,'provider_id':request.account_id}
     client=bridge_client()
     provider=CatalogueProvider(cfg,client)
+    provider.post_ids=selected
     sink=FingerprintSink(client.http)
     result=core.scan(request,cfg=cfg,provider=provider,dashboard=sink,normalizer=provider.normalize,cursor_scope='catalogue-v1:')
     if not result['ok']:
@@ -164,4 +176,10 @@ def scan_catalogue(request):
     if coverage.get('stop_reason')=='provider_exhausted':coverage['stop_reason']='catalogue_exhausted'
     result['counts']['fingerprints_saved']=result['counts'].pop('posts_ingested')
     result['counts']['metric_observations_created']=0
+    if selected is not None:
+        coverage['targeted_posts']=True
+        coverage['requested_posts']=len(selected)
+        coverage['catalogue_exhausted']=False
+        if result['ok']:coverage['stop_reason']='targeted_batch_finished'
+        result['resume_cursor']=None
     return result

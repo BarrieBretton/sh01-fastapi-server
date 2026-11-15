@@ -877,6 +877,7 @@ class ScanRequest(BaseModel):
     account_id: str = Field(min_length=1, max_length=150, pattern=r"^[A-Za-z0-9_.-]+$")
     max_posts: int = Field(default=20, ge=1, le=100)
     cursor: str | None = Field(default=None, max_length=12000)
+    post_ids: list[str] | None = Field(default=None, max_length=20)
 
     class Config:
         extra = "forbid"
@@ -1015,6 +1016,8 @@ async def scan_route(request: ScanRequest, x_api_key: str | None = Header(defaul
         raise HTTPException(status_code=503, detail="social_inventory_not_configured")
     if not x_api_key or not hmac.compare_digest(expected, x_api_key):
         raise HTTPException(status_code=401, detail="invalid_api_key")
+    if request.post_ids is not None and request.platform not in ('facebook', 'instagram'):
+        raise HTTPException(status_code=400, detail='targeted_scan_platform_unsupported')
     if not _SCAN_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="scan_already_running")
     def run_and_release():
@@ -1028,7 +1031,7 @@ async def scan_route(request: ScanRequest, x_api_key: str | None = Header(defaul
         return await asyncio.shield(asyncio.to_thread(run_and_release))
     except SafeError as exc:
         code = str(exc)
-        status = 400 if code in ("account_not_configured", "invalid_or_expired_cursor") else 503
+        status = 400 if code in ("account_not_configured", "invalid_or_expired_cursor", "invalid_targeted_posts") else 503
         diagnostic = getattr(exc, "diagnostic", {})
         raise HTTPException(status_code=status, detail={"code": code, **diagnostic} if diagnostic else code,
                             headers={"Retry-After": str(int(diagnostic["retry_after_seconds"]))} if diagnostic.get("retry_after_seconds") else None) from None

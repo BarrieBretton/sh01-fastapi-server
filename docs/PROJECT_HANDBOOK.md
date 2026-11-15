@@ -247,3 +247,33 @@ Code: scanner reads and deterministic writes share process-local request pacing 
 Worker read snapshots coalesce metadata reads for ten seconds, are credential/workbook scoped, and invalidate after fingerprint writes. Writes always revalidate through storage transactions. Other writers may be reflected up to ten seconds later. These are process/isolate-local controls, not a distributed quota coordinator; collector and UI traffic still share Google quota. Operator observed Erika recover after a 75-second pause; global quota headroom and full-catalogue duplicate accuracy remain unverified.
 
 Local regression evidence: 74 backend tests and 99 dashboard tests passed. PowerShell execution is pending the operator Windows run; installer checks support LF and CRLF. No live scan or deployment was performed here.
+
+## Cloudflare-scheduled targeted similarity scans — 15 November 2026
+
+The Operations Dashboard Worker now owns automatic scan scheduling and durable
+batch progress in its existing Sheets job/state tables. This supersedes the
+manual-only scheduling description above. It uses the existing MEDIA_CLIP_API_KEY
+and SH01 router; no new Render environment variable, Python process or scheduler
+is introduced. FastAPI still performs bounded media fingerprinting and group
+persistence behind the existing authenticated /social/inventory/scan endpoint.
+
+An optional post_ids request selects 1–20 explicit published catalogue posts for
+one platform/account. The automatic Worker sends at most two. max_posts must equal
+the unique ID count; cursors cannot be combined with this mode. Catalogue reads
+pass the same selection to Cloudflare, then verify every returned ID. Missing or
+unexpected rows fail instead of advancing progress. Existing paginated manual
+requests are unchanged. Targeted success reports targeted_posts=true and never
+claims catalogue or provider-history exhaustion. Fingerprints are reused, metrics
+are not replayed, and the existing resource limits/retry protections still apply.
+
+Deploy this FastAPI update before the dashboard scheduler update. The dashboard
+retains incomplete batches before dispatch, leases automatic work across invocations,
+backs off on quota/transport failures and exposes status in Collection & sync.
+Backend success does not imply every historical post was collected or compared:
+cache/pair truncation remains explicit. No deletion or clickouts action is scheduled.
+Local validation includes actual cached-fingerprint targeted execution, malformed
+requests rejected before network calls, unexpected/missing IDs, and the existing
+scanner, video, auth, retry and quota suites. Live deployment and background
+execution remain operator checks after both repository updates.
+
+Final local validation: 204 dashboard JavaScript tests, 73 backend scanner/auth/retry/video tests and four dashboard Python completion tests passed. Built HTML validation passed with 176 unique IDs. A real browser/rendering session and live scheduled execution were not available in this development environment.
