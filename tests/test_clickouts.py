@@ -1,0 +1,327 @@
+"""Offline deletion, scheduling, auth and Google adapter regression tests."""
+import ast
+import copy
+import json
+import os
+import sys
+import time
+import types
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import clickouts_routes as routes
+import clickouts_worker as worker
+from clickouts_state import ClickoutError, GoogleClickouts, RedisState
+
+
+def row(request='r1', post='200', **extra):
+    return {'urls': 'https://www.instagram.com/p/ABC/', 'platform': 'instagram',
+            'account_id': '100', 'post_id': post, 'request_id': request, 'status': '', **extra}
+
+
+def schedule(workflow='Server::Clickouts', timings='10:00, 18:30', enabled='yes'):
+    return [['Workflow', 'Timings', 'Associated Accounts', 'Run as Job Today'],
+            [workflow, timings, '', enabled]]
+
+
+class Redis:
+    def __init__(self): self.data = {}; self.fail = False
+    def get(self, key): return self.data.get(key)
+    def set(self, key, value, nx=False, ex=None):
+        if self.fail: raise OSError('private redis URL must not escape')
+        if nx and key in self.data: return False
+        self.data[key] = value
+        return True
+    def eval(self, script, count, key, owner):
+        if self.fail: raise OSError('private redis URL must not escape')
+        if self.data.get(key) != owner: return 0
+        if "'del'" in script: self.data.pop(key)
+        return 1
+
+
+class Store:
+    def __init__(self, rows):
+        self.rows = copy.deepcopy(rows); self.schedule = schedule(); self.writes = []
+        self.fail_done = False; self.fail_processing = False; self.prepared = False
+        self.schedule_reads = 0
+    def schedule_rows(self): self.schedule_reads += 1; return self.schedule
+    def read(self): return copy.deepcopy(self.rows)
+    def prepare(self): self.prepared = True
+    def current(self, row): return next(r for r in self.rows if r['request_id'] == row['request_id'])
+    def bind(self, row): self.verify(row)
+    def verify(self, row):
+        current = self.current(row)
+        if any(current.get(k, '') != row.get(k, '') for k in (*GoogleClickouts.REQUIRED, 'status')):
+            raise ClickoutError('queued_row_identity_changed')
+    def update(self, row, **changes):
+        self.verify(row)
+        if changes.get('status') == 'done' and self.fail_done: raise ClickoutError('sheets_request_failed')
+        if changes.get('status') == 'processing' and self.fail_processing: raise ClickoutError('sheets_request_failed')
+        self.current(row).update(changes); row.update(changes); self.writes.append(changes)
+
+
+class Provider:
+    def __init__(self): self.deleted = []; self.verified = []; self.error = None; self.verify_error = None
+    def verify(self, row):
+        self.verified.append(row['post_id'])
+        if self.verify_error: raise self.verify_error
+    def delete(self, row):
+        self.deleted.append(row['post_id'])
+        if self.error: raise self.error
+        return {'status': 'done', 'post_id': row['post_id'], 'deleted_at': '2026-11-15T10:00:00Z'}
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {}, clear=True); self.env.start()
+        self.redis = Redis(); self.state = RedisState(self.redis, 'book')
+        self.store = Store([row()]); self.provider = Provider()
+    def tearDown(self): self.env.stop()
+    def service(self, state=None, ack=None):
+        return worker.ClickoutsWorker(self.store, state or self.state,
+            provider_factory=lambda: self.provider, ack=ack or (lambda r: 'not_configured'), enabled=lambda: True)
+    def test_preview_is_read_only_and_never_calls_provider(self):
+        result = self.service().preview()
+        self.assertEqual(result['eligible'], 1); self.assertFalse(self.store.prepared)
+        self.assertEqual(self.redis.data, {}); self.assertEqual(self.provider.verified, [])
+        self.assertEqual(self.store.writes, [])
+    def test_done_only_after_confirmation_preserves_row_and_id(self):
+        self.store.rows[0]['post_id'] = '17954543838036274'
+        self.service().run()
+        self.assertEqual(len(self.store.rows), 1)
+        self.assertEqual(self.store.rows[0]['status'], 'done')
+        self.assertEqual(self.store.rows[0]['post_id'], '17954543838036274')
+        self.assertEqual(self.provider.deleted, ['17954543838036274'])
+        self.service(RedisState(self.redis, 'book')).run()
+        self.assertEqual(len(self.provider.deleted), 1)
+    def test_permission_or_owner_failure_before_delete_is_blocked(self):
+        self.provider.verify_error = ClickoutError('provider_owner_or_post_mismatch')
+        self.service().run()
+        self.assertEqual(self.store.rows[0]['status'], 'blocked'); self.assertEqual(self.provider.deleted, [])
+    def test_ambiguous_delete_never_retried_even_if_status_cleared(self):
+        self.provider.error = TimeoutError('secret')
+        self.service().run()
+        self.assertEqual(self.store.rows[0]['status'], 'manual_required')
+        self.store.rows[0]['status'] = ''
+        self.service(RedisState(self.redis, 'book')).run()
+        self.assertEqual(len(self.provider.deleted), 1)
+        self.assertNotIn('secret', str(self.store.rows))
+    def test_deleted_then_sheet_failure_recovers_without_another_delete(self):
+        self.store.fail_done = True
+        with self.assertRaises(ClickoutError): self.service().run()
+        self.assertEqual(self.store.rows[0]['status'], 'processing')
+        self.store.fail_done = False
+        self.service(RedisState(self.redis, 'book')).run()
+        self.assertEqual(self.store.rows[0]['status'], 'done'); self.assertEqual(len(self.provider.deleted), 1)
+    def test_processing_marker_failure_prevents_delete(self):
+        self.store.fail_processing = True
+        with self.assertRaises(ClickoutError): self.service().run()
+        self.assertEqual(self.provider.deleted, [])
+        self.store.fail_processing = False
+        self.service().run()
+        self.assertEqual(self.store.rows[0]['status'], 'done')
+        self.assertEqual(len(self.provider.deleted), 1)
+    def test_sheet_processing_survives_redis_data_loss(self):
+        self.store.rows[0]['status'] = 'processing'
+        self.service(RedisState(Redis(), 'book')).run()
+        self.assertEqual(self.provider.deleted, []); self.assertEqual(self.store.rows[0]['status'], 'manual_required')
+    def test_receipt_record_failure_after_delete_remains_manual(self):
+        original = self.provider.delete
+        def delete(row):
+            receipt = original(row); self.redis.fail = True; return receipt
+        self.provider.delete = delete
+        with self.assertRaises(OSError): self.service().run()
+        self.redis.fail = False
+        # Simulate lease expiry after Redis recovers.
+        self.redis.data.pop(self.state.prefix + 'lease', None)
+        self.service(RedisState(self.redis, 'book')).run()
+        self.assertEqual(len(self.provider.deleted), 1); self.assertEqual(self.store.rows[0]['status'], 'manual_required')
+    def test_two_requests_for_same_post_delete_once(self):
+        self.store.rows.append(row('r2'))
+        self.service().run()
+        self.assertEqual([r['status'] for r in self.store.rows], ['done', 'done'])
+        self.assertEqual(self.provider.deleted, ['200'])
+    def test_invalid_request_duplicates_do_not_starve_valid_rows(self):
+        self.store.rows = [row(), row(), row('good', '201')]
+        result = self.service().run(1)
+        self.assertEqual(result['invalid_rows'], 2); self.assertEqual(self.provider.deleted, ['201'])
+    def test_old_numeric_ids_and_unsupported_platforms_never_deleted(self):
+        self.store.rows = [row('numeric', post=17954543838036274), row('other', platform='tumblr')]
+        self.service().run()
+        self.assertEqual(self.provider.deleted, []); self.assertTrue(all(r['status'] == 'blocked' for r in self.store.rows))
+    def test_busy_lease_and_lost_lease_prevent_delete(self):
+        self.state.acquire()
+        other = RedisState(self.redis, 'book')
+        self.assertEqual(self.service(other).run()['status'], 'busy')
+        self.state.release()
+        def verify(row): self.redis.data[self.state.prefix + 'lease'] = 'replacement'
+        self.provider.verify = verify
+        with self.assertRaisesRegex(ClickoutError, 'lease_lost'): self.service().run()
+        self.assertEqual(self.provider.deleted, [])
+        self.assertEqual(self.redis.data[self.state.prefix + 'lease'], 'replacement')
+    def test_global_disabled_does_not_touch_sheet(self):
+        service = self.service(); service.enabled = lambda: False
+        self.assertEqual(service.run()['status'], 'disabled'); self.assertFalse(self.store.prepared)
+    def test_verification_rate_limit_defers_and_survives_restart(self):
+        self.provider.verify_error = ClickoutError('meta_rate_limited', 300)
+        self.service().run()
+        result = self.service(RedisState(self.redis, 'book')).run()
+        self.assertEqual(result['status'], 'cooldown'); self.assertEqual(len(self.provider.verified), 1)
+        self.assertEqual(self.store.rows[0]['status'], '')
+    def test_delete_rejection_not_marked_done_or_retried(self):
+        self.provider.error = ClickoutError('meta_rate_limited', 300)
+        self.service().run()
+        self.assertEqual(self.store.rows[0]['status'], 'manual_required')
+        self.assertEqual(self.service().run()['status'], 'cooldown')
+    def test_changed_row_after_owner_check_is_not_deleted(self):
+        self.provider.verify = lambda r: self.store.rows[0].update(post_id='999')
+        with self.assertRaises(ClickoutError): self.service().run()
+        self.assertEqual(self.provider.deleted, [])
+    def test_callback_retry_never_repeats_delete(self):
+        os.environ['OPS_INGEST_TOKEN'] = 'fake'
+        self.service(ack=lambda r: 'pending').run()
+        self.service(ack=lambda r: 'synced').run()
+        self.assertEqual(self.store.rows[0]['dashboard_ack'], 'synced')
+        self.assertEqual(self.provider.deleted, ['200'])
+    def test_handwritten_done_without_receipt_cannot_report_provider_deletion(self):
+        os.environ['OPS_INGEST_TOKEN'] = 'fake'
+        self.store.rows[0]['status'] = 'done'
+        ack = Mock()
+        self.service(ack=ack).run()
+        ack.assert_not_called()
+        self.assertEqual(self.store.rows[0]['status'], 'done')
+        self.assertEqual(self.store.rows[0]['dashboard_ack'], 'unverified_receipt')
+    def test_schedule_resumes_batches_and_runs_once_per_daily_time(self):
+        self.store.rows = [row(str(i), str(200+i)) for i in range(4)]
+        at = datetime(2026, 11, 15, 5, 0, tzinfo=timezone.utc)  # 10:30 IST, catches 10:00.
+        self.service().run(2, True, at)
+        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.service(RedisState(self.redis, 'book')).run(2, True, at)
+        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.store.rows.append(row('new', '999'))
+        self.assertEqual(self.service().run(2, True, at)['status'], 'waiting')
+        self.assertEqual(len(self.provider.deleted), 4)
+        self.redis.data.pop(self.state.prefix + 'next_poll')
+        evening = datetime(2026, 11, 15, 13, 0, tzinfo=timezone.utc)
+        self.service().run(2, True, evening)
+        self.assertEqual(self.provider.deleted[-1], '999')
+    def test_paused_or_unregistered_schedule_cannot_execute(self):
+        self.store.schedule = schedule(enabled='no')
+        self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
+        self.redis.data.pop(self.state.prefix + 'next_poll')
+        self.store.schedule = schedule('Python::arbitrary_code')
+        self.assertEqual(self.service().run(scheduled=True)['status'], 'paused')
+        self.assertEqual(self.provider.deleted, [])
+    def test_poll_is_shared_across_replicas(self):
+        self.service().run(scheduled=True, now=datetime(2026, 11, 15, 1, tzinfo=timezone.utc))
+        self.service(RedisState(self.redis, 'book')).run(scheduled=True)
+        self.assertEqual(self.store.schedule_reads, 1)
+
+
+class ScheduleAndProviderTests(unittest.TestCase):
+    def test_aliases_times_and_disabled_empty_time(self):
+        self.assertTrue(worker.read_schedule(schedule(' Python :: Clickouts '))['enabled'])
+        self.assertEqual(worker.parse_times('9:30 AM; 6:00 PM\n00:00'), [0, 570, 1080])
+        self.assertEqual(worker.parse_times(.5), [720])
+        self.assertFalse(worker.read_schedule(schedule(timings='', enabled=''))['enabled'])
+        for bad in ['24:00', '12:99', '0:00PM', 'every hour', '', '10:00<script>']:
+            with self.assertRaises(ClickoutError): worker.parse_times(bad)
+        with self.assertRaises(ClickoutError): worker.read_schedule(schedule() + [schedule('Python::Clickouts')[1]])
+    def provider(self):
+        with patch.dict(os.environ, {'META_SYSVAR': 'x'*32}, clear=True): return worker.MetaDelete()
+    def test_owner_permalink_and_exact_id_verified(self):
+        provider = self.provider(); provider.request = Mock(return_value={
+            'id': '200', 'owner': {'id': '100'}, 'permalink': row()['urls']})
+        provider.verify(row())
+        for changed in [{'id': '999'}, {'owner': {'id': '999'}}, {'permalink': 'https://www.instagram.com/p/OTHER/'}]:
+            provider.request.return_value = {'id':'200', 'owner':{'id':'100'}, 'permalink':row()['urls'], **changed}
+            with self.assertRaises(ClickoutError): provider.verify(row())
+    def test_correct_token_for_instagram_and_facebook(self):
+        provider = self.provider(); provider.request = Mock(return_value={'id': '100', 'access_token': 'page-token'})
+        self.assertEqual(provider.token(row()), 'x'*32)
+        fb = row(platform='facebook', post_id='100_200', urls='https://www.facebook.com/100/posts/200')
+        self.assertEqual(provider.token(fb), 'page-token'); provider.token(fb)
+        provider.request.assert_called_once()
+        worker.validate(fb)
+        with self.assertRaises(ClickoutError): worker.validate({**fb, 'post_id': '999_200'})
+    def test_explicit_confirmation_required_from_provider(self):
+        provider = self.provider()
+        for data in [{'success': False}, {'success': 1}, {'success': True, 'deleted_id':'999'}, {}]:
+            provider.request = Mock(return_value=data)
+            with self.assertRaises(ClickoutError): provider.delete(row())
+        provider.request = Mock(return_value={'success':True, 'deleted_id':'200'})
+        self.assertEqual(provider.delete(row())['status'], 'done')
+    def test_http_transport_no_redirects_or_retries_and_safe_errors(self):
+        provider = self.provider()
+        response = Mock(status_code=429, headers={'Retry-After':'900'})
+        response.__enter__ = Mock(return_value=response); response.__exit__ = Mock(return_value=False)
+        response.iter_content.return_value = [b'{"error":{"code":4,"message":"secret"}}']
+        session = Mock(); session.__enter__ = Mock(return_value=session); session.__exit__ = Mock(return_value=False)
+        session.request.return_value = response
+        module = types.SimpleNamespace(Session=Mock(return_value=session))
+        with patch.dict(sys.modules, {'requests':module}):
+            with self.assertRaises(ClickoutError) as error: provider.request('200', 'private', 'DELETE')
+        self.assertEqual(error.exception.retry_after, 900); self.assertNotIn('secret', str(error.exception))
+        session.request.assert_called_once()
+        self.assertFalse(session.request.call_args.kwargs['allow_redirects']); self.assertFalse(session.trust_env)
+    def test_dashboard_ack_uses_ingest_credential_not_scanner_key(self):
+        import social_inventory as inventory
+        http = Mock(); http.json.side_effect = [{'post':row()}, {'ok':True}]
+        with patch.dict(os.environ, {'OPS_INGEST_TOKEN':'test-ingest'}, clear=True), patch.object(inventory, 'SafeHTTP', return_value=http):
+            self.assertEqual(worker.acknowledge(row()), 'synced')
+        self.assertEqual(http.json.call_args.kwargs['headers'], {'X-INGEST-KEY':'test-ingest'})
+    def test_dashboard_ack_rejects_unrelated_request_identity(self):
+        import social_inventory as inventory
+        http = Mock(); http.json.return_value = {'post':row(request='other')}
+        with patch.dict(os.environ, {'OPS_INGEST_TOKEN':'test-ingest'}, clear=True), patch.object(inventory, 'SafeHTTP', return_value=http):
+            self.assertEqual(worker.acknowledge(row()), 'identity_mismatch')
+        http.json.assert_called_once()
+
+
+class RouteTests(unittest.TestCase):
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI(); app.include_router(routes.router); self.client = TestClient(app)
+        self.env = patch.dict(os.environ, {'SOCIAL_INVENTORY_API_KEY':'delete-key', 'MEDIA_CLIP_API_KEY':'scanner-key'}, clear=True)
+        self.env.start()
+    def tearDown(self): self.env.stop()
+    def test_auth_before_any_storage_work_and_default_preview(self):
+        with patch.object(routes, 'worker') as factory:
+            for path in ['/preview', '/run', '/tick']:
+                self.assertEqual(self.client.post('/social/clickouts'+path, json={}, headers={'X-API-KEY':'scanner-key'}).status_code, 401)
+            factory.assert_not_called()
+            factory.return_value.preview.return_value = {'dry_run': True}
+            reply = self.client.post('/social/clickouts/run', json={}, headers={'X-API-KEY':'delete-key'})
+            self.assertTrue(reply.json()['dry_run']); factory.return_value.run.assert_not_called()
+    def test_explicit_batch_limits_and_opaque_failures(self):
+        with patch.object(routes, 'worker') as factory:
+            headers = {'X-API-KEY':'delete-key'}
+            self.assertEqual(self.client.post('/social/clickouts/run', json={'max_items':100}, headers=headers).status_code, 422)
+            factory.side_effect = RuntimeError('private connection string')
+            result = self.client.post('/social/clickouts/run', json={'dry_run':False}, headers=headers)
+            self.assertEqual(result.status_code, 503); self.assertNotIn('private', result.text)
+    def test_app_wires_router_without_changing_existing_routes(self):
+        source = (Path(__file__).resolve().parents[1]/'app.py').read_text()
+        ast.parse(source)
+        for name in ('clickouts_router', 'social_inventory_router', 'social_delete_router'):
+            self.assertIn('app.include_router('+name+')', source)
+    def test_scheduler_is_opt_in_single_instance_and_stops_on_shutdown(self):
+        scheduler = Mock()
+        fake = types.SimpleNamespace(BackgroundScheduler=Mock(return_value=scheduler))
+        with patch.dict(sys.modules, {'apscheduler.schedulers.background': fake}), patch.object(routes, '_scheduler', None):
+            routes.start_clickouts_scheduler()
+            fake.BackgroundScheduler.assert_not_called()
+            os.environ['SOCIAL_DELETE_ENABLED'] = '1'
+            routes.start_clickouts_scheduler(); routes.start_clickouts_scheduler()
+            fake.BackgroundScheduler.assert_called_once()
+            self.assertEqual(scheduler.add_job.call_args.kwargs['seconds'], 60)
+            self.assertEqual(scheduler.add_job.call_args.kwargs['max_instances'], 1)
+            routes.stop_clickouts_scheduler()
+            scheduler.shutdown.assert_called_once_with(wait=False)
+
+
+if __name__ == '__main__':
+    unittest.main()

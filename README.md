@@ -1,5 +1,9 @@
 # SH01 FastAPI server
 
+**Clickouts queue deletion:** [setup, Sheet schedule and endpoints](docs/CLICKOUTS_AUTOMATION.md).
+The consumer retains rows and marks confirmed deletions `done`. Runtime activation
+and provider deletion permissions are required; patch installation is not activation.
+
 SH01 is a FastAPI service for media production, Telegram-backed media storage, Google Sheets utilities, and publishing integrations. The same repository also contains an infrastructure control plane that coordinates paired n8n and SH01 Render services, Postgres slots, Backblaze B2 slots, and Cloudflare routers.
 
 This README describes the code on `main` and the Cloudflare dashboard setup used with it. It does not contain credentials. Treat the live router and control-plane status APIs as the source of truth for the **currently active** Render, Postgres, and B2 slots.

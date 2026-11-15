@@ -6,6 +6,28 @@
 
 ## How to read and update this handbook
 
+### Clickouts consumer — source update 15 November 2026
+
+**Code:** Starting from remote `main` at `c82f0a47ad4c9d75c5ff27e4ed2334703bbfa3f1`,
+the SH01 server now mounts `/social/clickouts/{status,preview,run,tick}` via
+`clickouts_routes.py`. `clickouts_worker.py` consumes confirmed-queue identities
+from the existing workbook's `clickouts` tab; only provider-confirmed deletions
+are marked `status=done`, without removing rows. Google row metadata and shared
+Redis records support safe status recovery and prevent blind repeat DELETE calls.
+
+One `Server::Clickouts` (alias `Python::Clickouts`) row in `Workflow-Schedule`
+controls daily timings in Asia/Kolkata and uses `Run as Job Today` as its enable
+flag. `Associated Accounts` can be blank. The scheduler starts only when
+`SOCIAL_DELETE_ENABLED=1`; protected routes use `SOCIAL_INVENTORY_API_KEY`, not
+the scanner/media key. Existing Google credentials, `SPREADSHEET_ID`, shared
+`REDIS_URL`, and Meta credentials are reused. Operations Desk receipts require
+its existing ingest credential (`OPS_INGEST_TOKEN` on SH01).
+
+**Unverified:** live deployment, Redis persistence, the workbook schedule row,
+Meta deletion permissions/app eligibility, and actual deletions. Offline tests
+are not production execution evidence. Full setup, failure states, API limits,
+and read-only verification: [Clickouts automation](CLICKOUTS_AUTOMATION.md).
+
 Evidence labels in the tables:
 
 - **Code:** directly present in the named repository file at the baseline commit.
