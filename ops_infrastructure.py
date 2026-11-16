@@ -70,7 +70,7 @@ def budget(component, field="storage_bytes"):
 def card(id, name, configured=True, probe=True, note=''):
     return {'id': id, 'name': name, 'status': 'unchecked' if configured else 'not_configured',
             'can_probe': bool(configured and probe), 'note': note, 'metrics': [],
-            'quota_note': 'Provider usage / plan quota is not available from this adapter.', 'checked_at': None}
+            'quota_note': ('Storage is measured during checks. Account billing and daily caps are separate from bucket bytes.' if id.startswith('b2:') else 'Capacity is shown when the provider exposes it.'), 'checked_at': None}
 
 
 def runtime_cards():
@@ -226,9 +226,15 @@ async def probe(component, runtime=False):
                     item['metrics'] = await db_metrics(dict(host=os.environ['DB_POSTGRESDB_HOST'], port=int(os.getenv('DB_POSTGRESDB_PORT','6543')),user=os.environ['DB_POSTGRESDB_USER'],password=os.environ['DB_POSTGRESDB_PASSWORD'],database=os.getenv('DB_POSTGRESDB_DATABASE','postgres')),component)
                 elif component.startswith('b2:'):
                     b = await B2.connect(client, component.split(':',1)[1])
-                    await b.call('b2_list_file_versions', {'bucketId':b.bucket,'maxFileCount':1,'prefix':b.prefix})
-                    item['note'] = 'Authorized bucket metadata listing. Open Manage files to measure stored version bytes; no media downloaded.'
+                    usage = await b.storage_usage()
+                    item['storage_usage'] = usage
+                    item['metrics'] = [metric('Stored file versions' if usage['complete'] else 'Stored file versions · at least', usage['bytes'], budget(component) if usage['complete'] else None,
+                                              'B2 version metadata / operator budget' if usage['complete'] and budget(component) else 'B2 version metadata; '+('complete listing' if usage['complete'] else 'partial listing'))]
+                    item['note'] = str(usage['versions'])+' uploaded versions counted in '+('prefix '+b.prefix if b.prefix else 'bucket '+b.name)+'. '+('Listing complete at read time.' if usage['complete'] else 'Partial scan; browse files to continue measuring.')
+                    item['quota_note'] = 'Bucket bytes exclude unfinished upload parts. Account storage, download and transaction caps are not returned by the file API. A configured budget is an operator reference, not a fetched provider cap.'
                     item['bucket'] = b.name
+                    item['bucket_id'] = b.bucket
+                    item['prefix'] = b.prefix
                 elif component.startswith('router:'):
                     role = component.split(':')[1].upper()
                     base = os.getenv(role+'_ROUTER_CONTROL_BASE_URL') or (os.getenv('ROUTER_CONTROL_BASE_URL') if role=='N8N' else '')
@@ -375,6 +381,39 @@ class B2:
     async def call(self,method,payload):
         # No automatic retries, especially for destructive requests.
         return await request_json(self.client,'POST',self.base+'/b2api/v3/'+method,headers={'Authorization':self.token},json=payload)
+
+    async def storage_usage(self):
+        # Bound reads and memory; never claim a partial prefix scan is account usage.
+        args={'bucketId':self.bucket,'maxFileCount':1000,'prefix':self.prefix}
+        total=versions=pages=0
+        complete=False
+        deadline=time.monotonic()+10
+        seen=set()
+        for _ in range(10):
+            remaining=deadline-time.monotonic()
+            if remaining<=0: break
+            try:
+                async with asyncio.timeout(remaining):
+                    data=await self.call('b2_list_file_versions',args)
+            except (TimeoutError, httpx.TimeoutException, HTTPException):
+                if pages==0: raise
+                break
+            pages+=1
+            for f in data.get('files',[]):
+                identity=f.get('fileId')
+                if identity in seen: continue
+                seen.add(identity)
+                if f.get('action')=='upload':
+                    total+=max(0,int(f.get('contentLength',0)))
+                    versions+=1
+            if not data.get('nextFileName'):
+                complete=True
+                break
+            cursor=(data['nextFileName'],data.get('nextFileId'))
+            if cursor==(args.get('startFileName'),args.get('startFileId')): break
+            args.update(startFileName=cursor[0],startFileId=cursor[1])
+        return {'bytes':total,'versions':versions,'pages':pages,'complete':complete,
+                'scope':'prefix' if self.prefix else 'bucket','prefix':self.prefix,'observed_at':now()}
 
     def ticket(self,kind,**payload):
         return seal(dict(kind=kind,slot=self.slot,scope=self.scope,bucket=self.bucket,expires=int(time.time())+600,**payload))

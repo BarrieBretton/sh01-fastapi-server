@@ -107,3 +107,47 @@ class OpsTests(unittest.TestCase):
             with self.assertRaises(m.HTTPException):m.origin(value)
 
 if __name__=='__main__':unittest.main()
+
+class StorageUsageTests(unittest.IsolatedAsyncioTestCase):
+    def bucket(self):
+        return m.B2(None,'https://api001.backblazeb2.com','private','bucket','name','folder/',['listFiles'],'@default','scope')
+
+    async def test_pagination_counts_uploaded_versions_once_and_preserves_prefix(self):
+        b=self.bucket();calls=[]
+        async def call(method,args):
+            calls.append(dict(args))
+            if len(calls)==1:return {'files':[FILE,{**FILE,'fileId':'hide','action':'hide','contentLength':99}], 'nextFileName':'folder/next','nextFileId':'v2'}
+            return {'files':[FILE,{**FILE,'fileId':'v2','contentLength':200}], 'nextFileName':None}
+        b.call=call
+        d=await b.storage_usage()
+        self.assertEqual(d['bytes'],1434);self.assertEqual(d['versions'],2);self.assertTrue(d['complete'])
+        self.assertEqual(d['scope'],'prefix');self.assertEqual(calls[1]['prefix'],'folder/')
+        self.assertEqual(calls[1]['startFileId'],'v2')
+
+    async def test_scan_is_bounded_and_partial(self):
+        b=self.bucket();calls=[]
+        async def call(method,args):
+            calls.append(dict(args));n=len(calls)
+            return {'files':[{**FILE,'fileId':str(n)}],'nextFileName':str(n),'nextFileId':str(n)}
+        b.call=call;d=await b.storage_usage()
+        self.assertEqual(len(calls),10);self.assertFalse(d['complete']);self.assertEqual(d['versions'],10)
+
+    async def test_later_timeout_keeps_partial_usage(self):
+        b=self.bucket();calls=[]
+        async def call(method,args):
+            calls.append(1)
+            if len(calls)>1:raise httpx.ReadTimeout('private')
+            return {'files':[FILE],'nextFileName':'next','nextFileId':'next'}
+        b.call=call;d=await b.storage_usage()
+        self.assertFalse(d['complete']);self.assertEqual(d['bytes'],1234)
+
+    async def test_media_card_returns_storage_without_control_key(self):
+        from unittest.mock import AsyncMock
+        with patch.dict(os.environ,ENV,clear=True):
+            os.environ.pop('CONTROL_PLANE_API_KEY')
+            b=self.bucket()
+            b.storage_usage=AsyncMock(return_value={'bytes':1234,'versions':1,'pages':1,'complete':True,'scope':'prefix','prefix':'folder/','observed_at':'now'})
+            with patch.object(m.B2,'connect',new=AsyncMock(return_value=b)):
+                item=await m.probe('b2:@default',True)
+            self.assertEqual(item['status'],'healthy');self.assertEqual(item['metrics'][0]['used'],1234)
+            self.assertIsNone(item['metrics'][0]['limit']);self.assertEqual(item['bucket_id'],'bucket')
