@@ -409,3 +409,20 @@ Live execution speed, complete provider history and the operator's actual 19
 video uploads remain unverified until the updated deployment processes them.
 
 Catch-up validation: 211 dashboard JavaScript tests, 61 backend scanner/auth/retry/video tests and four dashboard Python completion tests passed locally. Live all-19 matching is still an operator check.
+
+## Infrastructure desk and manual B2 version management — 16 November 2026
+
+**Code-confirmed:** The companion ops_infrastructure.py adds separately authenticated
+/infra/desk (control key) and /ops/infra (media key) inventory/check routes.
+The desk Infrastructure tab discovers all registered slots and inventories runtime
+integrations. Capacity figures have explicit scopes and unknown quotas remain unknown.
+B2 manual listing/preview/delete is control-key-only, bounded, signed, confirmed and
+scoped to exact immutable versions; there is no automatic deletion retry or schedule.
+The dashboard Worker needs the existing CONTROL_PLANE_API_KEY and MEDIA_CLIP_API_KEY
+as server secrets, with optional OPS_INFRA_CONTROL_URL / OPS_INFRA_MEDIA_URL origins.
+Existing registry/provider secrets remain on the backend. Optional operator capacity
+budgets use OPS_INFRA_LIMITS_JSON; ImageKit usage can use OPS_IMAGEKIT_USAGE_KEY.
+**Unverified:** live deployment, credentials, actual provider grants, external account
+quotas, current traffic/standby mappings and production deletion outcomes. Offline
+tests do not establish these. Real browser rendering was unavailable in the test host.
+The paired Operations Dashboard repository contains INFRA-DESK-SETUP.md with full setup, coverage and acceptance instructions.

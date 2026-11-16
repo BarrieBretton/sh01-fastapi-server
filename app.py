@@ -319,6 +319,9 @@ class VideoToFBResponse(BaseModel):
 
 app = FastAPI(title="Python Server - SideHustle-01", version="2.2")
 app.include_router(image_templating_router, prefix="/img")
+from ops_infrastructure import router as ops_infra_router, runtime_router as ops_runtime_router
+app.include_router(ops_infra_router)
+app.include_router(ops_runtime_router)
 app.include_router(infra_router)
 app.include_router(media_job_store_router)
 app.include_router(media_router)
