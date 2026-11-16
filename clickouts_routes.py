@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from clickouts_state import ClickoutError, google_store
 from clickouts_sheet_state import SheetsState
-from clickouts_worker import ClickoutsWorker, read_schedule
+from clickouts_worker import ClickoutsWorker, blocked_code, read_schedule
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix='/social/clickouts', tags=['Clickouts deletion'])
@@ -77,6 +77,23 @@ def last_run_summary(value):
             result['checked_at'] = datetime.fromisoformat(value['checked_at'].replace('Z', '+00:00')).isoformat()
         except ValueError:
             pass
+    if isinstance(value.get('blocked_reasons'), dict):
+        reasons = {}
+        for code, count in value['blocked_reasons'].items():
+            if type(count) is int and count >= 0:
+                safe = blocked_code(code)
+                reasons[safe] = reasons.get(safe, 0) + count
+        result['blocked_reasons'] = reasons
+    return result
+
+
+def runtime_details():
+    result = {}
+    for field, name, pattern in (('commit', 'RENDER_GIT_COMMIT', r'[a-fA-F0-9]{40}'),
+                                 ('service_id', 'RENDER_SERVICE_ID', r'srv-[a-zA-Z0-9_-]{1,100}'),
+                                 ('instance_id', 'RENDER_INSTANCE_ID', r'[a-zA-Z0-9_-]{1,128}')):
+        value = os.getenv(name, '')
+        result[field] = value if re.fullmatch(pattern, value) else None
     return result
 
 
@@ -101,7 +118,7 @@ def failure_summary(value):
 
 def inspect_status():
     """Independent read-only checks. An unavailable dependency cannot erase other evidence."""
-    result = {'diagnostics_version': 4, 'dry_run': True, 'enabled': None,
+    result = {'diagnostics_version': 5, 'dry_run': True, 'enabled': None,
               'scheduler_enabled': None, 'state_backend': 'google_sheets',
               'scheduler_running': bool(_scheduler is not None and _scheduler.running),
               'dashboard_receipts_configured': bool(os.getenv('OPS_INGEST_TOKEN') or os.getenv('INGEST_TOKEN')),
@@ -109,12 +126,7 @@ def inspect_status():
               'status_counts': None, 'blocked_counts': None, 'schedule': None, 'last_run': None,
               'last_failure': None, 'checks': {}}
     # Render supplies these automatically; validate and expose only public identifiers.
-    result['runtime'] = {}
-    for field, name, pattern in (('commit', 'RENDER_GIT_COMMIT', r'[a-fA-F0-9]{40}'),
-                                 ('service_id', 'RENDER_SERVICE_ID', r'srv-[a-zA-Z0-9_-]{1,100}'),
-                                 ('instance_id', 'RENDER_INSTANCE_ID', r'[a-zA-Z0-9_-]{1,128}')):
-        value = os.getenv(name, '')
-        result['runtime'][field] = value if re.fullmatch(pattern, value) else None
+    result['runtime'] = runtime_details()
     checks = result['checks']
     service = None
     try:
@@ -155,14 +167,23 @@ def inspect_status():
         except Exception as exc:
             checks['state'] = check_failure(exc, 'clickouts_state_read_failed')
     dependencies_ok = all(check['status'] == 'ok' for check in checks.values())
-    result['ok'] = dependencies_ok and result['last_failure'] is None
-    result['status'] = 'degraded' if not dependencies_ok else 'execution_failed' if result['last_failure'] else 'ok'
+    counts = result['status_counts'] or {}
+    attention = bool(counts.get('blocked') or counts.get('manual_required'))
+    result['ok'] = dependencies_ok and result['last_failure'] is None and not attention
+    result['status'] = ('degraded' if not dependencies_ok else 'execution_failed' if result['last_failure']
+                        else 'attention_required' if attention else 'ok')
     return result
 
 
 class RunRequest(BaseModel):
     dry_run: bool = True
     max_items: int = Field(default=3, ge=1, le=5)
+
+
+class PreviewRequest(BaseModel):
+    check_provider: bool = False
+    request_id: str | None = Field(default=None, min_length=1, max_length=160, pattern=r'^[A-Za-z0-9:_-]+$')
+    expected_token_sha256: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
 
 
 async def invoke(callback):
@@ -181,7 +202,15 @@ async def get_status():
 
 
 @router.post('/preview', dependencies=[Depends(authorize)])
-async def preview():
+async def preview(request: PreviewRequest | None = None):
+    if request is not None and request.check_provider:
+        if request.request_id is None:
+            raise HTTPException(status_code=400, detail='request_id_required_for_access_check')
+        result = await invoke(lambda: worker(read_only=True).check_access(
+            request.request_id, request.expected_token_sha256))
+        return {**result, 'diagnostics_version': 5, 'runtime': runtime_details()}
+    if request is not None and (request.request_id is not None or request.expected_token_sha256 is not None):
+        raise HTTPException(status_code=400, detail='check_provider_required_for_access_check')
     return await invoke(lambda: worker(read_only=True).preview())
 
 
@@ -200,7 +229,10 @@ async def tick():
 def scheduled_tick():
     try:
         result = worker().run(scheduled=True)
-        log.info('clickouts_tick status=%s done=%s reason=%s', result['status'], result.get('done', 0), result.get('reason', 'none'))
+        log.info('clickouts_tick status=%s done=%s blocked=%s manual_required=%s deferred=%s remaining=%s reason=%s',
+                 result['status'], result.get('done', 0), result.get('blocked', 0),
+                 result.get('manual_required', 0), result.get('deferred', 0),
+                 result.get('remaining'), result.get('reason', 'none'))
     except ClickoutError as exc:
         log.warning('clickouts_tick code=%s', str(exc))
     except Exception:

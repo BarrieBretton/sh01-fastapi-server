@@ -158,7 +158,7 @@ change is required.
 | Method and path | Behaviour |
 | --- | --- |
 | GET `/social/clickouts/status` | Independent Google client, queue, schedule and workbook-state checks; preserve available evidence when another check fails. No deletion. |
-| POST `/social/clickouts/preview` | Read-only queue eligibility and blocked-reason counts. |
+| POST `/social/clickouts/preview` | Read-only queue eligibility and blocked-reason counts; explicit access-check body verifies one stored request with Meta GET only. |
 | POST `/social/clickouts/run` | Defaults to `{"dry_run":true}`. `{"dry_run":false,"max_items":3}` executes one explicit batch, independent of the daily schedule. `max_items` is 1–5. |
 | POST `/social/clickouts/tick` | Check/run the configured daily occurrence; suitable for an external scheduler. |
 
@@ -170,7 +170,7 @@ sanitised diagnostics. Clients must inspect the JSON result as well as HTTP stat
 
 ### Diagnosing a deployed status failure
 
-The endpoint returns `diagnostics_version: 4`, `state_backend: google_sheets`,
+The endpoint returns `diagnostics_version: 5`, `state_backend: google_sheets`,
 `ok`, `status`, `checks.google_client`, `checks.queue`, `checks.schedule` and
 `checks.state`. There is no Redis check. `enabled` and `scheduler_enabled` reflect
 whether a valid daily schedule was read, not provider permission or live task
@@ -194,7 +194,50 @@ zero-deletion result for a partially failed batch.
 HTTP 200 with `status: degraded` / `ok: false` preserves partial diagnostics.
 Unavailable counts are `null`; successful counts remain numeric. Google quota
 responses suppress subsequent Sheet calls in the same process until cooldown.
-No status or preview call changes rows, calls Meta, or executes deletion.
+No status or preview call changes rows or executes deletion. Only an explicit
+provider-access preview calls Meta, using GET requests. Ordinary previews remain
+queue-only reads. `blocked_counts` includes static reasons for already-blocked
+rows as well as validation failures among pending rows. Unknown stored errors
+become `unclassified_block`. Blocked or manual-required rows produce
+`status: attention_required` and `ok: false` while dependency checks remain
+independently reported. `last_run.blocked_reasons` preserves per-batch block counts.
+
+### Compare a working token with the deployed server
+
+After deployment, run this local helper using an existing Clickouts `request_id`:
+
+```powershell
+python .\check_clickouts_access.py --request-id "REQUEST_ID_FROM_CLICKOUTS"
+```
+
+It prompts for existing `MEDIA_CLIP_API_KEY`, followed by the Meta token that
+worked in a direct test. The Meta token is hashed locally; only SHA-256 is sent
+to the existing authenticated preview route. Keys are not written to disk or
+included in command-line arguments. The optional `--base-url` accepts the known
+Cloudflare proxy or `https://sh01.onrender.com` for origin-specific comparison.
+Each invocation sends one read-only request, without redirects or automatic retries.
+
+The equivalent request body is:
+
+```json
+{"check_provider":true,"request_id":"REQUEST_ID_FROM_CLICKOUTS","expected_token_sha256":"64_lowercase_hex_characters"}
+```
+
+The reference digest is optional for API callers. `request_id` must select exactly
+one valid stored row; caller-supplied URLs or arbitrary Graph paths are not accepted.
+The check can read a blocked row without changing its status or creating metadata,
+leases, attempt state or receipts. It returns `runtime`, token source/JSON selector,
+Graph version and `credential.matches_reference_token` when a digest was supplied.
+
+| Result | Meaning / next action |
+| --- | --- |
+| `credential_mismatch` | This Render process resolved a different token. Use returned runtime/backend headers to correct that instance's existing configuration. No Meta call was made. |
+| `access_failed` | Verification failed. Inspect static `code`, HTTP status, Graph code/subcode and any allowlisted permission names. No deletion was attempted. |
+| `access_verified` | The exact queued identity, owner and permalink passed the provider read. DELETE permission remains unverified. |
+| Client note about an older backend | This backend did not execute the new access check; inspect its deployment before treating the reply as provider evidence. |
+
+Do not requeue blocked rows solely because dependency status reads succeed.
+Correct the access failure first; retain all uncertain deletion-attempt records.
 
 | Diagnostic code | Interpretation |
 | --- | --- |

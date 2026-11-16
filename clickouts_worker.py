@@ -6,6 +6,7 @@ row deletion, missing-as-zero inference, or automatic retry of ambiguous deletes
 from __future__ import annotations
 
 import json
+import hmac
 import os
 import re
 import time
@@ -18,6 +19,46 @@ from clickouts_state import ClickoutError, digest
 
 IST = timezone(timedelta(hours=5, minutes=30), 'Asia/Kolkata')
 PENDING = {'', 'pending', 'queued', 'queued_clickouts', 'awaiting_sheet'}
+
+BLOCK_CODES = frozenset({
+    'meta_permissions_or_token', 'meta_request_rejected', 'meta_rate_limited',
+    'provider_verification_failed', 'provider_owner_or_post_mismatch',
+    'provider_permalink_mismatch', 'provider_outcome_unconfirmed',
+    'provider_response_unconfirmed', 'facebook_page_token_unavailable',
+    'invalid_graph_version', 'unsupported_platform', 'invalid_account_id',
+    'invalid_post_id', 'facebook_page_post_id_required', 'account_post_mismatch',
+    'invalid_request_id', 'invalid_permalink', 'duplicate_request_id',
+    'missing_or_numeric_account_id', 'missing_or_numeric_post_id',
+    'missing_or_numeric_request_id', 'meta_credential_missing_or_invalid',
+    'meta_credential_invalid', 'previous_attempt_unconfirmed',
+})
+
+
+def blocked_code(value):
+    return value if isinstance(value, str) and value in BLOCK_CODES else 'unclassified_block'
+
+
+def graph_diagnostic(http_status, error):
+    """Retain numeric evidence, never raw Meta messages, URLs or tokens."""
+    result = {'http_status': http_status}
+    if not isinstance(error, dict):
+        return result
+    for source, target in (('code', 'graph_code'), ('error_subcode', 'graph_subcode')):
+        value = error.get(source)
+        if type(value) is int and -2147483648 <= value <= 2147483647:
+            result[target] = value
+    if error.get('type') in {'OAuthException', 'GraphMethodException'}:
+        result['graph_type'] = error['type']
+    if type(error.get('is_transient')) is bool:
+        result['is_transient'] = error['is_transient']
+    message = error.get('message')
+    if isinstance(message, str):
+        scopes = ('instagram_basic', 'pages_read_engagement', 'instagram_manage_contents',
+                  'pages_manage_posts', 'ads_read', 'ads_management')
+        mentioned = [scope for scope in scopes if re.search(r'(?<![a-z_])' + scope + r'(?![a-z_])', message)]
+        if mentioned:
+            result['permissions_mentioned'] = mentioned
+    return result
 
 
 def stamp(now=None):
@@ -134,18 +175,32 @@ class MetaDelete:
                     data = json.loads(raw)
                     error = data.get('error', {}) if isinstance(data, dict) else {}
                     code = error.get('code') if isinstance(error, dict) else None
+                    diagnostic = graph_diagnostic(response.status_code, error)
                     if response.status_code == 429 or code in {4, 17, 32, 613, 80001, 80002, 80004}:
                         # A rejected GET is retryable; any failed DELETE remains manual.
-                        raise ClickoutError('meta_rate_limited', retry_seconds(response.headers.get('Retry-After')))
+                        raise ClickoutError('meta_rate_limited', retry_seconds(response.headers.get('Retry-After')), diagnostic)
                     if response.status_code in (401, 403) or code in {10, 190, 200, 294}:
-                        raise ClickoutError('meta_permissions_or_token')
+                        raise ClickoutError('meta_permissions_or_token', diagnostics=diagnostic)
                     if response.status_code != 200 or error or not isinstance(data, dict):
-                        raise ClickoutError('meta_request_rejected')
+                        raise ClickoutError('meta_request_rejected', diagnostics=diagnostic)
                     return data
         except ClickoutError:
             raise
         except Exception:
             raise ClickoutError('provider_outcome_unconfirmed') from None
+
+    def credential_info(self, expected_token_sha256=None):
+        source = 'META_SYSVAR' if os.getenv('META_SYSVAR', '').strip() else 'FB_PAGE_ACCESS_TOKEN'
+        raw = os.getenv(source, '').strip()
+        info = {'source': source, 'format': 'json' if raw.startswith('{') else 'raw',
+                'graph_version': self.version}
+        if raw.startswith('{'):
+            obj = json.loads(raw)
+            info['json_key'] = next((key for key in ('access_token', 'token', 'page_access_token',
+                'user_access_token') if obj.get(key)), None)
+        if expected_token_sha256 is not None:
+            info['matches_reference_token'] = hmac.compare_digest(digest(self.root_token), expected_token_sha256)
+        return info
 
     def token(self, row):
         if row['platform'] == 'instagram':
@@ -210,6 +265,9 @@ class ClickoutsWorker:
         reasons, eligible = Counter(), 0
         ids = Counter(row.get('request_id') for row in rows if isinstance(row.get('request_id'), str))
         for row in rows:
+            if status(row) == 'blocked':
+                reasons[blocked_code(row.get('error'))] += 1
+                continue
             if status(row) not in PENDING:
                 continue
             try:
@@ -225,6 +283,37 @@ class ClickoutsWorker:
         if include_schedule:
             result['schedule'] = read_schedule(self.store.schedule_rows())
         return result
+
+    def check_access(self, request_id, expected_token_sha256=None):
+        """One queued identity, read-only: no leases, markers, state or DELETE."""
+        rows = [r for r in self.store.read() if r.get('request_id') == request_id]
+        if len(rows) != 1:
+            raise ClickoutError('queued_request_missing_or_ambiguous')
+        row = rows[0]
+        validate(row)
+        result = {'dry_run': True, 'check': 'provider_access', 'request_id': request_id,
+                  'platform': row['platform'], 'account_id': row['account_id'],
+                  'post_id': row['post_id'], 'queue_status': status(row),
+                  'checked_at': stamp(), 'provider_permissions': 'not_checked',
+                  'credential': {'source': 'META_SYSVAR' if os.getenv('META_SYSVAR', '').strip()
+                                 else 'FB_PAGE_ACCESS_TOKEN'}}
+        try:
+            provider = self.provider_factory()
+            result['credential'] = provider.credential_info(expected_token_sha256)
+            if result['credential'].get('matches_reference_token') is False:
+                return {**result, 'ok': False, 'status': 'credential_mismatch',
+                        'code': 'server_token_differs_from_reference'}
+            provider.verify(row)
+        except ClickoutError as exc:
+            return {**result, 'ok': False, 'status': 'access_failed',
+                    'code': blocked_code(str(exc)), 'diagnostics': exc.diagnostics,
+                    **({'retry_after': exc.retry_after} if exc.retry_after else {})}
+        except Exception as exc:
+            from social_inventory import SafeError
+            code = blocked_code(str(exc)) if isinstance(exc, SafeError) else 'provider_verification_failed'
+            return {**result, 'ok': False, 'status': 'access_failed', 'code': code}
+        return {**result, 'ok': True, 'status': 'access_verified',
+                'provider_permissions': 'read_verified_delete_permission_unverified'}
 
     def run(self, max_items=3, scheduled=False, now=None):
         if not self.enabled():
@@ -295,6 +384,7 @@ class ClickoutsWorker:
         self.stage = 'prepare_columns'
         self.store.prepare()
         counts = Counter(invalid_rows=invalid)
+        blocked_reasons = Counter()
         processed = 0
         provider = None
         started = time.monotonic()
@@ -330,6 +420,7 @@ class ClickoutsWorker:
                 validate(row)
             except ClickoutError as exc:
                 self.store.update(row, status='blocked', error=str(exc))
+                blocked_reasons[blocked_code(str(exc))] += 1
                 counts['blocked'] += 1
                 processed += 1
                 continue
@@ -358,6 +449,7 @@ class ClickoutsWorker:
                 code = str(exc) if isinstance(exc, ClickoutError) else 'provider_verification_failed'
                 self.state.guard()
                 self.store.update(row, status='blocked', error=code)
+                blocked_reasons[blocked_code(code)] += 1
                 counts['blocked'] += 1
                 processed += 1
                 continue
@@ -405,6 +497,8 @@ class ClickoutsWorker:
             self.state.put('occurrence_done', occurrence)
         result = {'status': 'completed' if not remaining else 'more_pending', 'done': 0,
                   **counts, 'remaining': remaining, 'checked_at': stamp(now)}
+        if blocked_reasons:
+            result['blocked_reasons'] = dict(blocked_reasons)
         self.state.put('last_result', result)
         if self.state.get('last_failure') is not None:
             self.state.put('last_failure', None)

@@ -30,8 +30,9 @@ Startup enables polling when existing workbook/key configuration is present;
 **deployment with a valid schedule activates daily execution**, including today's
 latest due occurrence. Authenticated manual non-dry-run requests execute one batch.
 
-`diagnostics_version: 4` reports Google setup, queue, schedule and workbook state.
-Status/preview requests never create state or call Meta. A missing state tab is
+`diagnostics_version: 5` reports Google setup, queue, schedule and workbook state.
+Status and ordinary preview requests never create state or call Meta. The explicit
+provider-access preview below performs only Meta reads. A missing state tab is
 normal before first execution; damaged state stops execution. Optional dashboard
 receipts reuse existing `OPS_INGEST_TOKEN` / `INGEST_TOKEN` when configured. Without
 one, Sheet status still updates but the dashboard is not notified.
@@ -69,11 +70,46 @@ no longer produce an overall `ok` while a recorded execution failure is unresolv
 Successful batch completion clears that failure; status and preview remain read-only.
 Waiting results distinguish poll cooldown, a future schedule and a completed occurrence.
 
-**Unverified:** deployment of the header correction, the exact original live
-header-response shape, Meta permissions and successful deletions. Tests reproduce
+**Unverified:** the exact original live header-response shape and successful
+deletions. The operator subsequently confirmed deployment of the header correction
+at `68247c1becfda1c354e529742727bd080e1f7326`. Tests reproduce
 false rejection of equivalent range representations and confirm genuine changed
 headers remain blocked. They do not establish the original live payload's exact
 trigger. See [Clickouts automation](CLICKOUTS_AUTOMATION.md) for details.
+
+### Clickouts provider access diagnostics — 16 November 2026
+
+**Operator-observed:** The scheduler then processed batches with zero deletions
+and `meta_permissions_or_token` on blocked Instagram rows. A direct v24.0 GET
+using a valid System User token returned the exact queued post ID, owner ID and
+permalink. The token debugger displayed the read and `instagram_manage_contents`
+scopes. After the operator reported adding `META_SYSVAR`, a manual one-item run at
+07:13:55 UTC (12:43:55 IST) still returned `blocked: 1`, `done: 0`; its row retained
+the same access error. These observations do not establish which token or Graph
+version the responding server used, or whether the DELETE operation is permitted.
+
+**Code:** The existing authenticated POST `/social/clickouts/preview` now accepts
+an explicit `check_provider: true` and one exact stored `request_id`. It reads
+that row, validates identity, and compares the resolved token with an optional
+SHA-256 reference from the client. A mismatch stops before calling Meta. A match
+performs only the same identity/owner/permalink GET used before deletion. The
+response reports source variable, JSON selector if applicable, configured Graph
+version, validated Render runtime identifiers, and numeric Meta error evidence.
+Tokens, their digests and raw provider messages are never returned. The local
+`check_clickouts_access.py` helper prompts for the two existing keys, hashes the
+working Meta token locally and sends only its digest for comparison. It never
+calls run/tick or writes the workbook, and never follows redirects or retries.
+
+Version 5 status includes reasons for already-blocked rows and reports
+`attention_required` when blocked/manual rows remain. Batch results retain
+`blocked_reasons`; logs include blocked/manual/deferred/remaining counts. No
+blocked rows are automatically reset, and no permission or account checks are
+bypassed. The scheduler, authentication keys, destructive-call receipts and
+no-repeat protection remain in effect. No new environment variable is required.
+
+**Unverified:** live results of this new access check and successful deletion.
+Offline tests verify no writes/DELETE from diagnostics, exact request scoping,
+token mismatch refusal, safe Meta evidence, and compatibility with ordinary preview.
 
 Evidence labels in the tables:
 

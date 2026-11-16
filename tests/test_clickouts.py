@@ -462,7 +462,7 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertEqual(data['rows'], 1); self.assertEqual(data['eligible'], 1)
         self.assertTrue(data['schedule']['enabled']); self.assertFalse(data['ok'])
         self.assertEqual(data['checks']['state']['code'], 'clickouts_state_corrupt')
-        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 4)
+        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 5)
     def test_google_initialization_failure_skips_state_and_preserves_diagnostics(self):
         with patch.object(routes, 'worker', side_effect=ClickoutError('google_credentials_refresh_rejected')), patch.object(routes, 'sheet_state') as state:
             data = self.client.get('/social/clickouts/status', headers=self.headers).json()
@@ -513,6 +513,17 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertTrue(data['ok']); self.assertTrue(data['enabled'])
         self.assertEqual(data['state_backend'],'google_sheets')
         self.assertEqual(data['provider_permissions'], 'not_checked')
+    def test_blocked_rows_have_reasons_and_attention_status_without_provider_calls(self):
+        self.store.rows = [row(status='blocked', error='meta_permissions_or_token'),
+                           row('r2','201',status='blocked',error='secret-literal'),
+                           row('r3','202',status='manual_required')]
+        data = self.status(last={'status':'completed','done':0,'blocked':2,
+                                'blocked_reasons':{'meta_permissions_or_token':1,'secret-literal':1}})
+        self.assertEqual(data['status'],'attention_required'); self.assertFalse(data['ok'])
+        self.assertEqual(data['eligible'],0)
+        self.assertEqual(data['blocked_counts'], {'meta_permissions_or_token':1,'unclassified_block':1})
+        self.assertEqual(data['last_run']['blocked_reasons'],data['blocked_counts'])
+        self.assertNotIn('secret-literal',json.dumps(data))
     def test_execution_failure_is_visible_even_when_dependency_reads_are_healthy(self):
         with patch.object(routes,'_scheduler',types.SimpleNamespace(running=True)):
             data=self.status(failure={'code':'clickouts_headers_changed','stage':'verify_row',
@@ -567,6 +578,133 @@ class DependencyDiagnosticsTests(unittest.TestCase):
             get_credentials.side_effect = None; build.side_effect = RuntimeError('private URL')
             with self.assertRaisesRegex(ClickoutError, 'google_client_initialization_failed'):
                 state_module.google_store('book')
+
+
+class AccessCheckTests(unittest.TestCase):
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI(); app.include_router(routes.router); self.client = TestClient(app)
+        self.token = 'a_working_meta_token_' + 'x'*32
+        self.env = patch.dict(os.environ, {'META_SYSVAR':self.token,'FB_PAGE_ACCESS_TOKEN':'old-page-'+'y'*32,
+            'MEDIA_CLIP_API_KEY':'existing-key','RENDER_SERVICE_ID':'srv-current','RENDER_GIT_COMMIT':'a'*40}, clear=True)
+        self.env.start()
+        self.store = Store([row(status='blocked',error='meta_permissions_or_token'),row('r2','201')])
+        self.provider = worker.MetaDelete()
+        self.provider.request = Mock(return_value={'id':'200','owner':{'id':'100'},'permalink':'https://www.instagram.com/p/ABC/'})
+        self.service = worker.ClickoutsWorker(self.store, None, provider_factory=lambda:self.provider)
+        self.headers = {'X-API-KEY':'existing-key'}
+        self.body = {'check_provider':True,'request_id':'r1','expected_token_sha256':worker.digest(self.token)}
+    def tearDown(self): self.env.stop()
+    def check(self, body=None):
+        with patch.object(routes,'worker',return_value=self.service) as factory, patch.object(routes,'sheet_state') as state:
+            response = self.client.post('/social/clickouts/preview',json=self.body if body is None else body,headers=self.headers)
+            factory.assert_called_once_with(read_only=True); state.assert_not_called()
+        self.assertFalse(self.store.prepared); self.assertEqual(self.store.writes,[])
+        self.assertEqual(self.store.rows[0]['status'],'blocked')
+        return response
+    def test_exact_request_and_matching_token_verify_without_deleting_or_writing(self):
+        data=self.check().json()
+        self.assertEqual(data['status'],'access_verified'); self.assertTrue(data['dry_run'])
+        self.assertEqual(data['post_id'],'200'); self.assertEqual(data['runtime']['service_id'],'srv-current')
+        self.assertTrue(data['credential']['matches_reference_token'])
+        self.assertEqual(data['credential']['source'],'META_SYSVAR')
+        self.assertEqual(data['credential']['graph_version'],'v24.0')
+        self.assertEqual(data['provider_permissions'],'read_verified_delete_permission_unverified')
+        self.provider.request.assert_called_once_with('200',self.token,fields='id,owner,permalink')
+        self.assertNotIn(self.token,json.dumps(data)); self.assertNotIn(worker.digest(self.token),json.dumps(data))
+    def test_mismatched_token_stops_before_meta_and_identifies_source(self):
+        self.body['expected_token_sha256']=worker.digest('different-valid-token')
+        data=self.check().json()
+        self.assertEqual(data['status'],'credential_mismatch'); self.assertFalse(data['ok'])
+        self.assertFalse(data['credential']['matches_reference_token']); self.provider.request.assert_not_called()
+    def test_legacy_fallback_and_json_selector_are_reported_without_values(self):
+        os.environ.pop('META_SYSVAR')
+        provider=worker.MetaDelete(); info=provider.credential_info(worker.digest(self.token))
+        self.assertEqual(info['source'],'FB_PAGE_ACCESS_TOKEN'); self.assertFalse(info['matches_reference_token'])
+        os.environ['META_SYSVAR']=json.dumps({'page_access_token':'page-'+'z'*32,'user_access_token':self.token})
+        info=worker.MetaDelete().credential_info(worker.digest(self.token))
+        self.assertEqual(info['format'],'json'); self.assertEqual(info['json_key'],'page_access_token')
+        self.assertFalse(info['matches_reference_token']); self.assertNotIn(self.token,json.dumps(info))
+    def test_missing_duplicate_and_invalid_queued_identity_never_reach_meta(self):
+        for rows in ([],[row(),row()],[row(account_id=100)]):
+            with self.subTest(rows=len(rows)):
+                self.store.rows=rows
+                with patch.object(routes,'worker',return_value=self.service):
+                    response=self.client.post('/social/clickouts/preview',json=self.body,headers=self.headers)
+                self.assertEqual(response.status_code,409)
+        self.provider.request.assert_not_called(); self.assertEqual(self.store.writes,[])
+    def test_wrong_owner_or_permalink_remains_a_failed_read_only_check(self):
+        for reply,code in [({'id':'200','owner':{'id':'other'},'permalink':'https://www.instagram.com/p/ABC/'},'provider_owner_or_post_mismatch'),
+                           ({'id':'200','owner':{'id':'100'},'permalink':'https://www.instagram.com/p/DIFFERENT/'},'provider_permalink_mismatch')]:
+            self.provider.request.return_value=reply
+            data=self.check().json(); self.assertEqual(data['code'],code); self.assertFalse(data['ok'])
+    def test_transport_keeps_meta_numeric_errors_and_discards_raw_messages(self):
+        provider=worker.MetaDelete()
+        response=Mock(status_code=400,headers={})
+        response.__enter__=Mock(return_value=response); response.__exit__=Mock(return_value=False)
+        response.iter_content.return_value=[json.dumps({'error':{'code':190,'error_subcode':463,
+            'type':'OAuthException','message':self.token+' requires instagram_basic','is_transient':False,
+            'access_token':self.token}}).encode()]
+        session=Mock(); session.__enter__=Mock(return_value=session); session.__exit__=Mock(return_value=False)
+        session.request.return_value=response
+        self.service.provider_factory=lambda:provider
+        with patch.dict(sys.modules,{'requests':types.SimpleNamespace(Session=Mock(return_value=session))}):
+            data=self.check().json()
+        self.assertEqual(data['code'],'meta_permissions_or_token')
+        self.assertEqual(data['diagnostics']['graph_code'],190); self.assertEqual(data['diagnostics']['graph_subcode'],463)
+        self.assertEqual(data['diagnostics']['permissions_mentioned'],['instagram_basic'])
+        self.assertNotIn(self.token,json.dumps(data)); self.assertNotIn('message',data['diagnostics'])
+        session.request.assert_called_once(); self.assertEqual(session.request.call_args.args[0],'GET')
+        self.assertFalse(session.request.call_args.kwargs['allow_redirects'])
+    def test_auth_and_bad_access_check_inputs_stop_before_storage(self):
+        with patch.object(routes,'worker') as factory:
+            self.assertEqual(self.client.post('/social/clickouts/preview',json=self.body).status_code,401)
+            for body,expected in [({'check_provider':True},400),({'request_id':'r1'},400),
+                                  ({**self.body,'expected_token_sha256':'a-secret-token'},422),
+                                  ({**self.body,'request_id':'https://arbitrary.example'},422)]:
+                response=self.client.post('/social/clickouts/preview',json=body,headers=self.headers)
+                self.assertEqual(response.status_code,expected)
+            factory.assert_not_called()
+    def test_bad_configuration_is_safe_and_never_deletes(self):
+        from social_inventory import SafeError
+        self.service.provider_factory=Mock(side_effect=SafeError('meta_credential_missing_or_invalid'))
+        data=self.check().json(); self.assertEqual(data['code'],'meta_credential_missing_or_invalid')
+        self.provider.request.assert_not_called()
+    def test_batch_result_contains_static_block_reasons(self):
+        store=Store([row()]); provider=Provider(); provider.verify_error=ClickoutError('meta_permissions_or_token')
+        service=worker.ClickoutsWorker(store,RedisState(Redis(),'book'),provider_factory=lambda:provider)
+        result=service.run(max_items=1)
+        self.assertEqual(result['blocked_reasons'],{'meta_permissions_or_token':1})
+        self.assertEqual(result['done'],0); self.assertEqual(provider.deleted,[])
+
+
+class AccessCheckClientTests(unittest.TestCase):
+    def test_client_sends_only_hash_to_preview_and_redacts_reflected_secrets(self):
+        import check_clickouts_access as client
+        response=Mock(code=200,headers={'x-backend-used':'https://sh01.onrender.com'})
+        response.__enter__=Mock(return_value=response); response.__exit__=Mock(return_value=False)
+        response.read.return_value=json.dumps({'check':'provider_access','dry_run':True,
+                                              'unexpected':'api-private meta-private'}).encode()
+        opener=Mock(); opener.open.return_value=response
+        with patch.object(client.urllib.request,'build_opener',return_value=opener):
+            result=client.check('https://sh01.vivojaymail.workers.dev','r1','api-private','meta-private')
+        opener.open.assert_called_once()
+        request=opener.open.call_args.args[0]; body=json.loads(request.data)
+        self.assertEqual(request.full_url,'https://sh01.vivojaymail.workers.dev/social/clickouts/preview')
+        self.assertEqual(request.get_method(),'POST'); self.assertTrue(body['check_provider'])
+        self.assertEqual(body['expected_token_sha256'],worker.digest('meta-private'))
+        self.assertNotIn('meta-private',request.data.decode()); self.assertNotIn('api-private',json.dumps(result))
+        self.assertNotIn('meta-private',json.dumps(result))
+        self.assertIsNone(client.NoRedirects().redirect_request(None,None,302,'',{},'https://foreign.example'))
+    def test_older_backend_is_explicit_and_has_no_automatic_retry(self):
+        import check_clickouts_access as client
+        response=Mock(code=200,headers={}); response.read.return_value=b'{"dry_run":true,"eligible":1}'
+        response.__enter__=Mock(return_value=response); response.__exit__=Mock(return_value=False)
+        opener=Mock(); opener.open.return_value=response
+        with patch.object(client.urllib.request,'build_opener',return_value=opener):
+            result=client.check('https://sh01.onrender.com','r1','api-private','meta-private')
+        self.assertIn('client_note',result); opener.open.assert_called_once()
 
 
 if __name__ == '__main__':
