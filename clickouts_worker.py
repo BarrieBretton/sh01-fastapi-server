@@ -229,10 +229,11 @@ class ClickoutsWorker:
     def run(self, max_items=3, scheduled=False, now=None):
         if not self.enabled():
             return {'status': 'disabled', 'done': 0}
+        self.stage = 'coordination'
         schedule_snapshot = None
         if scheduled:
             if (self.state.get('next_poll') or 0) > time.time():
-                return {'status': 'waiting', 'done': 0}
+                return {'status': 'waiting', 'reason': 'poll_cooldown', 'done': 0}
             schedule = read_schedule(self.store.schedule_rows())
             if not schedule['enabled']:
                 return {'status': 'paused', 'done': 0}
@@ -242,8 +243,13 @@ class ClickoutsWorker:
         try:
             return self._run(max_items, scheduled, now or datetime.now(timezone.utc), schedule_snapshot)
         except ClickoutError as exc:
-            if exc.retry_after:
-                self.state.put('cooldown', time.time() + exc.retry_after)
+            try:
+                self.state.put('last_failure', {'code': str(exc), 'stage': self.stage,
+                    'checked_at': stamp(), 'diagnostics': exc.diagnostics})
+                if exc.retry_after:
+                    self.state.put('cooldown', time.time() + exc.retry_after)
+            except Exception:
+                pass  # Reporting failure must not replace the execution error.
             raise
         finally:
             self.state.release()
@@ -256,7 +262,7 @@ class ClickoutsWorker:
         if scheduled:
             # One schedule poll per minute across replicas, including idle periods.
             if (self.state.get('next_poll') or 0) > time.time():
-                return {'status': 'waiting', 'done': 0}
+                return {'status': 'waiting', 'reason': 'poll_cooldown', 'done': 0}
             self.state.put('next_poll', time.time() + 60)
             schedule = schedule_snapshot if schedule_snapshot is not None else read_schedule(self.store.schedule_rows())
             if not schedule['enabled']:
@@ -264,11 +270,12 @@ class ClickoutsWorker:
             local = now.astimezone(IST)
             due = [minute for minute in schedule['times'] if minute <= local.hour * 60 + local.minute]
             if not due:
-                return {'status': 'waiting', 'done': 0}
+                return {'status': 'waiting', 'reason': 'before_scheduled_time', 'done': 0}
             # After a restart, catch up the most recent time today (never yesterday).
             occurrence = local.date().isoformat() + ':' + str(max(due))
             if self.state.get('occurrence_done') == occurrence:
-                return {'status': 'waiting', 'done': 0}
+                return {'status': 'waiting', 'reason': 'occurrence_complete', 'done': 0}
+        self.stage = 'read_queue'
         rows = self.store.read()
         identifiers = Counter(row.get('request_id') for row in rows if isinstance(row.get('request_id'), str))
         invalid = sum(1 for row in rows if status(row) in PENDING and
@@ -285,6 +292,7 @@ class ClickoutsWorker:
                 self.state.put('occurrence_done', occurrence)
             return {'status': 'idle', 'done': 0, 'remaining': 0, 'invalid_rows': invalid}
         self.state.guard()
+        self.stage = 'prepare_columns'
         self.store.prepare()
         counts = Counter(invalid_rows=invalid)
         processed = 0
@@ -299,6 +307,7 @@ class ClickoutsWorker:
                 counts['invalid'] += 1
                 processed += 1
                 continue
+            self.stage = 'verify_row'
             self.store.bind(row)
             if status(row) == 'done':
                 try:
@@ -338,6 +347,7 @@ class ClickoutsWorker:
                 processed += 1
                 continue
             try:
+                self.stage = 'verify_provider'
                 provider = provider or self.provider_factory()
                 provider.verify(row)
             except Exception as exc:
@@ -352,6 +362,7 @@ class ClickoutsWorker:
                 processed += 1
                 continue
             self.state.guard()
+            self.stage = 'verify_row'
             self.store.verify(row)
             if not self.enabled():
                 break
@@ -359,6 +370,7 @@ class ClickoutsWorker:
             attempt = {'status': 'processing', 'phase': 'prepared', 'request_id': row['request_id'], 'at': stamp(now)}
             if not prepared and not self.state.claim(key, attempt):
                 raise ClickoutError('post_already_claimed')
+            self.stage = 'mark_processing'
             self.store.update(row, status='processing', last_attempt_at=stamp(now), error='')
             self.store.verify(row)  # Require an acknowledged, readable processing marker.
             self.state.guard()
@@ -368,6 +380,7 @@ class ClickoutsWorker:
             # after a Sheets quota error; armed attempts require manual reconciliation.
             self.state.put(key, {**attempt, 'phase': 'delete_sent'})
             try:
+                self.stage = 'delete_request'
                 receipt = provider.delete(row)
                 if receipt.get('status') != 'done' or receipt.get('post_id') != row['post_id']:
                     raise ClickoutError('provider_did_not_confirm_deletion')
@@ -382,6 +395,7 @@ class ClickoutsWorker:
                     self.state.put('cooldown', time.time() + exc.retry_after)
                     break
                 continue
+            self.stage = 'save_receipt'
             self.state.put(key, receipt)  # Recover status-only after restart / Sheets failure.
             self.finish(row, receipt)
             counts['done'] += 1
@@ -392,9 +406,12 @@ class ClickoutsWorker:
         result = {'status': 'completed' if not remaining else 'more_pending', 'done': 0,
                   **counts, 'remaining': remaining, 'checked_at': stamp(now)}
         self.state.put('last_result', result)
+        if self.state.get('last_failure') is not None:
+            self.state.put('last_failure', None)
         return result
 
     def finish(self, row, receipt):
+        self.stage = 'update_done'
         self.state.guard()
         # Record success before optional dashboard notification; callback failures cannot undo it.
         self.store.update(row, status='done', deleted_at=receipt['deleted_at'], error='', dashboard_ack='pending')

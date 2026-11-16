@@ -18,6 +18,7 @@ class Sheets:
         self.headers = ['URLS', 'platform', 'account_id', 'post_id', 'request_id', 'custom']
         self.rows = [['https://www.instagram.com/p/ABC/', 'instagram', '100', '200', 'r1', '=1+2']]
         self.markers = {}; self.updates = []; self.calls = []; self.width = 26
+        self.filter_style = 'echo'; self.trailing_blanks = False; self.header_mode = 'normal'
     def spreadsheets(self): return self
     def values(self): return self
     def developerMetadata(self): return self
@@ -29,7 +30,7 @@ class Sheets:
                 for i, title in [(1, 'clickouts'), (2, 'Workflow-Schedule')]]})
         if 'Workflow-Schedule' in args['range']:
             return Request(lambda: {'values': [['Workflow', 'Timings', 'Run as Job Today']]})
-        return Request(lambda: {'values': copy.deepcopy([self.headers, *self.rows])})
+        return Request(lambda: {'values': copy.deepcopy([self.headers + (['', ''] if self.trailing_blanks else []), *self.rows])})
     def update(self, **args):
         def action():
             self.headers.extend(args['body']['values'][0])
@@ -53,12 +54,25 @@ class Sheets:
         def action():
             ranges = []
             for data_filter in args['body']['dataFilters']:
-                if 'gridRange' in data_filter:
-                    value = self.headers
+                if 'gridRange' in data_filter or 'a1Range' in data_filter:
+                    value = self.headers + (['', ''] if self.trailing_blanks else [])
+                    if self.header_mode == 'missing': continue
+                    response_filter = copy.deepcopy(data_filter)
+                    response_range = data_filter.get('a1Range')
+                    if self.filter_style == 'canonical':
+                        response_filter = {'gridRange': {'sheetId':1,'endRowIndex':1,'endColumnIndex':len(self.headers)}}
+                        response_range = response_range.replace("'", '')
+                    if self.filter_style == 'range_only': response_filter = None
+                    if self.header_mode == 'foreign': response_range = 'other!A1:K1'
                 else:
                     marker = self.markers[data_filter['developerMetadataLookup']['metadataId']]
                     value = marker['row']
-                ranges.append({'dataFilters': [data_filter], 'valueRange': {'values': [copy.deepcopy(value)]}})
+                    response_filter = data_filter; response_range = None
+                item = {'dataFilters': [response_filter] if response_filter else [], 'valueRange': {'values': [copy.deepcopy(value)]}}
+                if response_range: item['valueRange']['range'] = response_range
+                ranges.append(item)
+                if ('gridRange' in data_filter or 'a1Range' in data_filter) and self.header_mode == 'duplicate':
+                    ranges.append(copy.deepcopy(item))
             return {'valueRanges': list(reversed(ranges))}  # Order cannot be assumed.
         return Request(action)
     def batchUpdateByDataFilter(self, **args):
@@ -126,6 +140,39 @@ class SheetsTests(unittest.TestCase):
         with self.assertRaises(ClickoutError) as result: self.store.call(Request(fail))
         self.assertEqual(result.exception.retry_after, 900)
         self.assertEqual(str(result.exception), 'sheets_rate_limited')
+    def test_header_verification_handles_normalized_filters_and_exact_returned_range(self):
+        for style in ('echo', 'canonical', 'range_only'):
+            with self.subTest(style=style):
+                self.setUp(); self.api.filter_style=style
+                rows=self.store.read(); self.store.prepare(); self.store.bind(rows[0])
+                self.store.update(rows[0],status='processing')
+                self.assertEqual(self.api.rows[0][self.api.headers.index('status')],'processing')
+    def test_trailing_empty_header_values_do_not_shift_columns_or_block_verification(self):
+        self.api.trailing_blanks=True
+        self.api.headers.insert(2,''); self.api.rows[0].insert(2,'custom data')
+        rows=self.store.read(); self.store.prepare(); self.store.bind(rows[0])
+        self.store.update(rows[0],status='processing')
+        self.assertEqual(self.api.rows[0][2],'custom data')
+        self.assertEqual(self.api.rows[0][self.api.headers.index('status')],'processing')
+    def test_missing_ambiguous_and_foreign_header_results_stop_before_write(self):
+        for mode,code in [('missing','header_range_missing'),('duplicate','header_range_ambiguous'),('foreign','header_range_missing')]:
+            with self.subTest(mode=mode):
+                self.setUp(); rows=self.store.read(); self.store.prepare(); self.api.header_mode=mode
+                with self.assertRaisesRegex(ClickoutError,code): self.store.bind(rows[0])
+                self.assertEqual(self.api.updates,[])
+    def test_actual_header_edit_reports_numeric_position_without_exposing_header_contents(self):
+        rows=self.store.read(); self.store.prepare(); self.store.bind(rows[0])
+        self.api.headers[3]='private custom value'
+        with self.assertRaisesRegex(ClickoutError,'headers_changed') as result:
+            self.store.update(rows[0],status='done')
+        self.assertEqual(result.exception.diagnostics['first_mismatch_column'],4)
+        self.assertNotIn('private',str(result.exception.diagnostics))
+        self.assertEqual(self.api.updates,[])
+    def test_equivalent_header_ranges_preserve_exact_sheet_and_width(self):
+        self.store.title="Owner's clickouts"; self.store.headers=['urls','platform','account_id','post_id','request_id']
+        self.assertTrue(self.store.is_header_range("'Owner''s clickouts'!$A$1:$E$1"))
+        for value in ("'Owner''s clickouts'!A2:E2", "other!A1:E1", "'Owner''s clickouts'!A1:F1"):
+            self.assertFalse(self.store.is_header_range(value))
 
 
 if __name__ == '__main__': unittest.main()

@@ -10,9 +10,10 @@ import uuid
 
 class ClickoutError(Exception):
     """Static, credential-free diagnostic only."""
-    def __init__(self, code, retry_after=0):
+    def __init__(self, code, retry_after=0, diagnostics=None):
         super().__init__(code)
         self.retry_after = retry_after
+        self.diagnostics = diagnostics or {}
 
 
 def exception_types(error):
@@ -176,7 +177,7 @@ class GoogleClickouts:
         values = self.call(self.service.spreadsheets().values().get(
             spreadsheetId=self.workbook, range=f'{quoted}!A1:{column(width)}{height}',
             valueRenderOption='UNFORMATTED_VALUE')).get('values', [])
-        self.headers = [str(x).strip().casefold() for x in (values[0] if values else [])]
+        self.headers = self.normalize_headers(values[0] if values else [])
         nonempty = [x for x in self.headers if x]
         if len(nonempty) != len(set(nonempty)) or any(x not in self.headers for x in self.REQUIRED):
             raise ClickoutError('clickouts_headers_missing_or_duplicated')
@@ -188,6 +189,27 @@ class GoogleClickouts:
             row['_row'] = number
             result.append(row)
         return result
+
+    @staticmethod
+    def normalize_headers(values):
+        headers = [str(x).strip().casefold() for x in values]
+        # Sheets omits trailing empty values. Preserve interior empty columns:
+        # their positions still matter to every identity and status write.
+        while headers and not headers[-1]:
+            headers.pop()
+        return headers
+
+    def header_range(self):
+        title = self.title.replace("'", "''")
+        return f"'{title}'!A1:{column(len(self.headers))}1"
+
+    def is_header_range(self, value):
+        if not isinstance(value, str) or '!' not in value:
+            return False
+        title, cells = value.rsplit('!', 1)
+        if title.startswith("'") and title.endswith("'"):
+            title = title[1:-1].replace("''", "'")
+        return title == self.title and cells.replace('$', '').upper() == f'A1:{column(len(self.headers))}1'
 
     def prepare(self):
         """Execution only: append helper headers; never rewrite existing headers/rows."""
@@ -235,23 +257,44 @@ class GoogleClickouts:
         self.verify(row)
 
     def verify(self, row):
-        header_filter = {'gridRange': {'sheetId': self.sheet_id, 'startRowIndex': 0,
-            'endRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': len(self.headers)}}
+        # Explicit A1 selection avoids relying on an exact echoed GridRange.
+        # Headers and the metadata-bound row still share one Google read.
+        header_filter = {'a1Range': self.header_range()}
         result = self.call(self.service.spreadsheets().values().batchGetByDataFilter(
             spreadsheetId=self.workbook, body={'dataFilters': [self.filter(row), header_filter],
-                'valueRenderOption': 'UNFORMATTED_VALUE'}))
+                'majorDimension': 'ROWS', 'valueRenderOption': 'UNFORMATTED_VALUE'}))
         ranges = result.get('valueRanges', [])
         matching = [r for r in ranges if any(f.get('developerMetadataLookup', {}).get('metadataId') == row['_metadata']
                                              for f in r.get('dataFilters', []))]
         def is_header(data_filter):
+            if self.is_header_range(data_filter.get('a1Range')):
+                return True
             grid = data_filter.get('gridRange', {})
-            return (grid.get('sheetId') == self.sheet_id and grid.get('startRowIndex', 0) == 0
+            return (grid.get('sheetId', 0) == self.sheet_id and grid.get('startRowIndex', 0) == 0
                     and grid.get('endRowIndex') == 1 and grid.get('startColumnIndex', 0) == 0
                     and grid.get('endColumnIndex') == len(self.headers))
-        header_ranges = [r for r in ranges if any(is_header(f) for f in r.get('dataFilters', []))]
-        header_values = header_ranges[0].get('valueRange', {}).get('values', []) if len(header_ranges) == 1 else []
-        if len(header_values) != 1 or [str(x).strip().casefold() for x in header_values[0]] != self.headers:
-            raise ClickoutError('clickouts_headers_changed')
+        header_ranges = []
+        for item in ranges:
+            returned_range = item.get('valueRange', {}).get('range')
+            # A concrete response range must identify precisely the requested
+            # header on this tab, even if a filter claims it matched.
+            if returned_range is not None:
+                if self.is_header_range(returned_range):
+                    header_ranges.append(item)
+            elif any(is_header(f) for f in item.get('dataFilters', [])):
+                header_ranges.append(item)
+        if len(header_ranges) != 1:
+            raise ClickoutError('clickouts_header_range_missing' if not header_ranges else 'clickouts_header_range_ambiguous',
+                                diagnostics={'matching_ranges': len(header_ranges), 'expected_columns': len(self.headers)})
+        header_values = header_ranges[0].get('valueRange', {}).get('values', [])
+        if len(header_values) != 1 or not isinstance(header_values[0], list):
+            raise ClickoutError('clickouts_header_values_invalid')
+        current_headers = self.normalize_headers(header_values[0])
+        if current_headers != self.headers:
+            mismatch = next((i+1 for i, pair in enumerate(zip(current_headers, self.headers)) if pair[0] != pair[1]),
+                            min(len(current_headers), len(self.headers))+1)
+            raise ClickoutError('clickouts_headers_changed', diagnostics={'expected_columns': len(self.headers),
+                'returned_columns': len(current_headers), 'first_mismatch_column': mismatch})
         values = matching[0].get('valueRange', {}).get('values', []) if len(matching) == 1 else []
         if len(values) != 1:
             raise ClickoutError('queued_row_moved_or_removed')

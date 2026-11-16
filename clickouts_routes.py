@@ -80,13 +80,34 @@ def last_run_summary(value):
     return result
 
 
+def failure_summary(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ClickoutError('clickouts_failure_state_invalid')
+    code = value.get('code')
+    result = {'code': code if isinstance(code, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,95}', code)
+              else 'execution_error'}
+    if value.get('stage') in {'coordination', 'read_queue', 'prepare_columns', 'verify_row',
+                            'verify_provider', 'mark_processing', 'delete_request', 'save_receipt', 'update_done'}:
+        result['stage'] = value['stage']
+    result.update(last_run_summary({'checked_at': value.get('checked_at')}))
+    details = value.get('diagnostics')
+    if isinstance(details, dict):
+        result['diagnostics'] = {name: details[name] for name in ('matching_ranges', 'expected_columns',
+            'returned_columns', 'first_mismatch_column') if type(details.get(name)) is int and 0 <= details[name] <= 10000}
+    return result
+
+
 def inspect_status():
     """Independent read-only checks. An unavailable dependency cannot erase other evidence."""
-    result = {'diagnostics_version': 3, 'dry_run': True, 'enabled': None,
+    result = {'diagnostics_version': 4, 'dry_run': True, 'enabled': None,
               'scheduler_enabled': None, 'state_backend': 'google_sheets',
+              'scheduler_running': bool(_scheduler is not None and _scheduler.running),
               'dashboard_receipts_configured': bool(os.getenv('OPS_INGEST_TOKEN') or os.getenv('INGEST_TOKEN')),
               'provider_permissions': 'not_checked', 'rows': None, 'eligible': None,
-              'status_counts': None, 'blocked_counts': None, 'schedule': None, 'last_run': None, 'checks': {}}
+              'status_counts': None, 'blocked_counts': None, 'schedule': None, 'last_run': None,
+              'last_failure': None, 'checks': {}}
     # Render supplies these automatically; validate and expose only public identifiers.
     result['runtime'] = {}
     for field, name, pattern in (('commit', 'RENDER_GIT_COMMIT', r'[a-fA-F0-9]{40}'),
@@ -129,11 +150,13 @@ def inspect_status():
             state = sheet_state(service.store)
             initialized = state.load()
             result['last_run'] = last_run_summary(state.get('last_result')) if initialized else None
+            result['last_failure'] = failure_summary(state.get('last_failure')) if initialized else None
             checks['state'] = {'status': 'ok', 'initialized': initialized}
         except Exception as exc:
             checks['state'] = check_failure(exc, 'clickouts_state_read_failed')
-    result['ok'] = all(check['status'] == 'ok' for check in checks.values())
-    result['status'] = 'ok' if result['ok'] else 'degraded'
+    dependencies_ok = all(check['status'] == 'ok' for check in checks.values())
+    result['ok'] = dependencies_ok and result['last_failure'] is None
+    result['status'] = 'degraded' if not dependencies_ok else 'execution_failed' if result['last_failure'] else 'ok'
     return result
 
 
@@ -177,7 +200,7 @@ async def tick():
 def scheduled_tick():
     try:
         result = worker().run(scheduled=True)
-        log.info('clickouts_tick status=%s done=%s', result['status'], result.get('done', 0))
+        log.info('clickouts_tick status=%s done=%s reason=%s', result['status'], result.get('done', 0), result.get('reason', 'none'))
     except ClickoutError as exc:
         log.warning('clickouts_tick code=%s', str(exc))
     except Exception:

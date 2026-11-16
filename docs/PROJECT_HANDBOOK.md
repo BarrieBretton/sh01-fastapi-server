@@ -30,7 +30,7 @@ Startup enables polling when existing workbook/key configuration is present;
 **deployment with a valid schedule activates daily execution**, including today's
 latest due occurrence. Authenticated manual non-dry-run requests execute one batch.
 
-`diagnostics_version: 3` reports Google setup, queue, schedule and workbook state.
+`diagnostics_version: 4` reports Google setup, queue, schedule and workbook state.
 Status/preview requests never create state or call Meta. A missing state tab is
 normal before first execution; damaged state stops execution. Optional dashboard
 receipts reuse existing `OPS_INGEST_TOKEN` / `INGEST_TOKEN` when configured. Without
@@ -42,10 +42,38 @@ Redis connection failure, no dashboard receipts configured and no checked Meta
 permissions. This correction addresses those runtime configuration dependencies;
 it does not classify `added` as pending or claim those posts were deleted.
 
-**Unverified:** deployment of this correction, the live Sheets concurrency guard,
-Meta permissions/app eligibility, and actual deletions. Offline protocol tests
-are not live provider evidence. See [Clickouts automation](CLICKOUTS_AUTOMATION.md)
-for schedule semantics, state recovery and diagnostic codes.
+### Clickouts header verification correction — 16 November 2026
+
+**Operator-observed:** Commit `6860904ac1c322b27ff60664ce1823d349807545`
+served HTTP 200 from `sh01.onrender.com` at 05:24:23 UTC (10:54:23 IST),
+with 37 rows (34 pending, 3 `added`), schedule minute 635 (10:35 IST), initialized
+workbook state and no recorded completed batch. Render logs show background ticks
+and the first `clickouts_headers_changed` at 05:05:43 UTC (10:35:43 IST), followed
+by repeated header failures. Thus the daily schedule did start work when due.
+Restarts are logged at 04:26 and 05:21 UTC; their cause is unverified. The Redis
+cron-master error belongs to the separate legacy n8n activation cron in `app.py`.
+
+**Code:** The old header error combined failure to locate the echoed GridRange,
+invalid header-response shape, and genuinely changed header values. It did not
+prove an operator edited columns. Verification now requests an explicit quoted
+A1 header range together with the metadata-bound post row, identifies the exact
+returned header range independently of result order/filter normalization, and
+normalizes only trailing blank header cells. Interior empty-column positions and
+strict normalized header equality remain required. Missing, ambiguous or wrong-tab
+header results stop execution with distinct static diagnostics. No extra Google
+read is introduced for each verification.
+
+`diagnostics_version: 4` adds `scheduler_running` for the responding process and
+persisted `last_failure` with a stage and numeric header evidence. Healthy reads
+no longer produce an overall `ok` while a recorded execution failure is unresolved.
+Successful batch completion clears that failure; status and preview remain read-only.
+Waiting results distinguish poll cooldown, a future schedule and a completed occurrence.
+
+**Unverified:** deployment of the header correction, the exact original live
+header-response shape, Meta permissions and successful deletions. Tests reproduce
+false rejection of equivalent range representations and confirm genuine changed
+headers remain blocked. They do not establish the original live payload's exact
+trigger. See [Clickouts automation](CLICKOUTS_AUTOMATION.md) for details.
 
 Evidence labels in the tables:
 

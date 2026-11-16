@@ -163,20 +163,33 @@ change is required.
 | POST `/social/clickouts/tick` | Check/run the configured daily occurrence; suitable for an external scheduler. |
 
 Overlapping execution returns `busy`; an empty daily schedule returns `paused`.
+`waiting.reason` is `poll_cooldown`, `before_scheduled_time` or
+`occurrence_complete`, making timing-related waits distinguishable.
 Upstream cooldown returns `cooldown` with `retry_after`. Transport failures return
 sanitised diagnostics. Clients must inspect the JSON result as well as HTTP status.
 
 ### Diagnosing a deployed status failure
 
-The endpoint returns `diagnostics_version: 3`, `state_backend: google_sheets`,
+The endpoint returns `diagnostics_version: 4`, `state_backend: google_sheets`,
 `ok`, `status`, `checks.google_client`, `checks.queue`, `checks.schedule` and
 `checks.state`. There is no Redis check. `enabled` and `scheduler_enabled` reflect
 whether a valid daily schedule was read, not provider permission or live task
 liveness. They are `null` if that schedule could not be read.
+`scheduler_running` reports whether the scheduler is running in the responding
+process. It does not assert that another replica or Meta is healthy.
 
 `checks.state.initialized: false` is normal before the first execution. A status
 request reads state without creating its tab or acquiring a lease. `runtime`
 contains validated Render identifiers when supplied by the platform.
+
+`last_failure` records an execution error after the worker acquired its lease,
+including a static code, timestamp, stage and optional numeric column evidence.
+If writing telemetry fails (for example during a Sheets quota cooldown), the
+original error remains in logs; absence of a failure record is not proof of a run.
+A recorded failure gives `status: execution_failed` / `ok: false` even if all
+read-only dependency checks succeed. A successful batch clears the failure.
+`last_run` continues to describe the last saved batch result, not a fabricated
+zero-deletion result for a partially failed batch.
 
 HTTP 200 with `status: degraded` / `ok: false` preserves partial diagnostics.
 Unavailable counts are `null`; successful counts remain numeric. Google quota
@@ -185,6 +198,9 @@ No status or preview call changes rows, calls Meta, or executes deletion.
 
 | Diagnostic code | Interpretation |
 | --- | --- |
+| `clickouts_header_range_missing` / `clickouts_header_range_ambiguous` | The exact header range was absent or returned more than once; no column layout is guessed. |
+| `clickouts_header_values_invalid` | Header result did not contain exactly one row. |
+| `clickouts_headers_changed` | Normalized header values/positions actually differed; numeric diagnostics locate the first differing column without returning cell contents. |
 | `clickouts_state_revision_conflict` | Another instance changed the shared revision; this batch stops before using stale state. |
 | `clickouts_state_guard_not_enforced` | The stale-guard validation probe did not fail as required. No deletion proceeds. |
 | `clickouts_state_corrupt` / `clickouts_state_grid_changed` | Internal workbook state was altered or cannot be validated; it is not automatically reset. |
@@ -273,3 +289,19 @@ the supplied compact `h:mmpm` strings, noon/midnight, and native Sheet time valu
 Workbook-state tests cover atomic conflict rejection, concurrent claims, expired
 owners, loss of a commit response, stale-guard refusal, quota suppression, durable
 receipt recovery, and no repeat DELETE after an uncertain result.
+
+### Header response regression
+
+The 16 November operator log showed `clickouts_headers_changed` at the configured
+10:35 IST time and on subsequent attempts. The former error covered missing
+filter matches as well as actual header edits. The exact live response was not
+captured. Verification now uses an explicit quoted A1 range, accepts equivalent
+returned A1 notation or canonical echoed filters, and trims trailing blank header
+cells consistently. It rejects foreign tabs, different widths, missing/duplicate
+header results, actual reordered columns, and edited post identity/status. The
+header and metadata-bound row are still fetched in one request. Tests also cover
+persisted failure visibility and clearing the failure after recovery.
+
+Google's response contract documents matched filters and omission of trailing
+empty values: [batchGetByDataFilter](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values/batchGetByDataFilter)
+and [ValueRange](https://developers.google.com/workspace/sheets/api/reference/rest/v4/spreadsheets.values).

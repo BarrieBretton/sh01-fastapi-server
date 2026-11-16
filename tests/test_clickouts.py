@@ -123,6 +123,18 @@ class WorkerTests(unittest.TestCase):
         self.service().run()
         self.assertEqual(self.store.rows[0]['status'], 'done')
         self.assertEqual(len(self.provider.deleted), 1)
+    def test_header_failure_is_recorded_before_delete_and_cleared_after_recovery(self):
+        with patch.object(self.store,'bind',side_effect=ClickoutError('clickouts_headers_changed',
+                diagnostics={'expected_columns':11,'returned_columns':11,'first_mismatch_column':4})):
+            with self.assertRaisesRegex(ClickoutError,'headers_changed'): self.service().run()
+        failure=self.state.get('last_failure')
+        self.assertEqual(failure['stage'],'verify_row')
+        self.assertEqual(failure['diagnostics']['first_mismatch_column'],4)
+        self.assertEqual(self.provider.deleted,[])
+        self.assertIsNone(self.state.get('last_result'))
+        self.service(RedisState(self.redis,'book')).run()
+        self.assertEqual(self.provider.deleted,['200'])
+        self.assertIsNone(RedisState(self.redis,'book').get('last_failure'))
     def test_sheet_processing_survives_redis_data_loss(self):
         self.store.rows[0]['status'] = 'processing'
         self.service(RedisState(Redis(), 'book')).run()
@@ -434,9 +446,9 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.service = worker.ClickoutsWorker(self.store, None)
         self.headers = {'X-API-KEY': 'existing-key'}
     def tearDown(self): self.env.stop()
-    def status(self, state_error=None, last=None):
+    def status(self, state_error=None, last=None, failure=None):
         state = Mock()
-        state.get.return_value = last
+        state.get.side_effect = lambda key: {'last_result':last,'last_failure':failure}.get(key)
         state.load.return_value = True
         if state_error: state.load.side_effect = state_error
         with patch.object(routes, 'worker', return_value=self.service), patch.object(routes, 'sheet_state', return_value=state):
@@ -450,7 +462,7 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertEqual(data['rows'], 1); self.assertEqual(data['eligible'], 1)
         self.assertTrue(data['schedule']['enabled']); self.assertFalse(data['ok'])
         self.assertEqual(data['checks']['state']['code'], 'clickouts_state_corrupt')
-        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 3)
+        self.assertIsNone(data['last_run']); self.assertEqual(data['diagnostics_version'], 4)
     def test_google_initialization_failure_skips_state_and_preserves_diagnostics(self):
         with patch.object(routes, 'worker', side_effect=ClickoutError('google_credentials_refresh_rejected')), patch.object(routes, 'sheet_state') as state:
             data = self.client.get('/social/clickouts/status', headers=self.headers).json()
@@ -501,6 +513,17 @@ class StatusDiagnosticsTests(unittest.TestCase):
         self.assertTrue(data['ok']); self.assertTrue(data['enabled'])
         self.assertEqual(data['state_backend'],'google_sheets')
         self.assertEqual(data['provider_permissions'], 'not_checked')
+    def test_execution_failure_is_visible_even_when_dependency_reads_are_healthy(self):
+        with patch.object(routes,'_scheduler',types.SimpleNamespace(running=True)):
+            data=self.status(failure={'code':'clickouts_headers_changed','stage':'verify_row',
+                'checked_at':'2026-11-16T05:05:43Z','diagnostics':{'expected_columns':11,
+                'returned_columns':11,'first_mismatch_column':4,'raw_header':'private-secret'}})
+        self.assertFalse(data['ok']); self.assertEqual(data['status'],'execution_failed')
+        self.assertTrue(data['scheduler_running'])
+        self.assertTrue(all(c['status']=='ok' for c in data['checks'].values()))
+        self.assertEqual(data['last_failure']['stage'],'verify_row')
+        self.assertNotIn('private-secret',json.dumps(data))
+        self.assertIsNone(data['last_run'])
     def test_corrupt_last_run_state_is_explicit(self):
         data = self.status(last='private-secret')
         self.assertEqual(data['checks']['state']['code'], 'clickouts_state_invalid_shape')
