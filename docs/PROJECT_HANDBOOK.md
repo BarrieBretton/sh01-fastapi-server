@@ -426,3 +426,24 @@ budgets use OPS_INFRA_LIMITS_JSON; ImageKit usage can use OPS_IMAGEKIT_USAGE_KEY
 quotas, current traffic/standby mappings and production deletion outcomes. Offline
 tests do not establish these. Real browser rendering was unavailable in the test host.
 The paired Operations Dashboard repository contains INFRA-DESK-SETUP.md with full setup, coverage and acceptance instructions.
+
+
+## Snapchat server workflow — 18 November 2026
+
+Code-confirmed: `snapchat_feature/` implements one-profile OAuth, encrypted workbook
+job state, prepared-video upload and Spotlight/Public Story publication.
+`Server::Snapchat-Spotlight` and `Server::Snapchat-Stories` in Workflow-Schedule
+use IST and durable occurrence claims. No n8n dependency. Publishing defaults off;
+`SNAPCHAT_ENABLED=1` requires configured credentials and a reviewed queue.
+
+The Operations Desk Producers pane provides preview, setup, connection checks,
+progress/history and cached analytics. All operator routes reuse MEDIA_CLIP_API_KEY.
+The shared media admission helper now accepts an optional minimum-memory argument;
+existing consumers keep 176 MiB, Snapchat's streaming transfer requests 96 MiB.
+
+Unverified: Snap API approval, live account OAuth, publishing permission, actual
+Render memory and scheduling, viewing URLs and monetization. Stories remain accepted
+until verified externally when Snap omits an identifier. Unknown publication outcomes
+are never automatically replayed. No posts or B2 files were deleted during this work.
+See [Snapchat setup](SNAPCHAT-SETUP.md) for configuration, workbook schema, deployment
+and the first-publication acceptance checks.

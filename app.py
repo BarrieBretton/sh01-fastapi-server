@@ -332,6 +332,8 @@ app.include_router(auto_editor_router)
 app.include_router(social_inventory_router)
 app.include_router(social_delete_router)
 app.include_router(clickouts_router)
+from snapchat_feature.router import router as snapchat_router
+app.include_router(snapchat_router)
 install_ops_handler(logging.getLogger())
 app.include_router(threads_router)
 app.include_router(tumblr_router)
