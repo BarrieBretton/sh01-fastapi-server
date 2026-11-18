@@ -115,24 +115,37 @@ async def desk_call(client,path,payload=None):
     if r.status_code!=200:raise RuntimeError('workbook_scan_http_'+str(r.status_code))
     return r.json()
 
+def scan_batches(sheets):
+    batches=[];batch=[];cells=0
+    for sheet in sorted(sheets,key=lambda s:(not s.get('designated',False),s['id'])):
+        if sheet['mode']=='excluded':continue
+        if sheet['type']!='GRID' or not sheet['rows'] or not 0<sheet['columns']<=20000:raise RuntimeError('sheet_unscannable')
+        start=0
+        while start<sheet['rows']:
+            end=min(sheet['rows'],start+max(1,50000//sheet['columns']))
+            cost=(end-start)*sheet['columns']+(sheet['columns'] if not start<sheet['header_row']<=end else 0)
+            if len(batch)>=4 or cells+cost>160000 or any(c['sheet_id']==sheet['id'] for c in batch):
+                batches.append(batch);batch=[];cells=0
+            batch.append({'sheet_id':sheet['id'],'start_row':start,'end_row':end,'rows':sheet['rows']});cells+=cost;start=end
+    if batch:batches.append(batch)
+    if len(batches)>100:raise RuntimeError('scan_request_limit')
+    return batches
+
 async def scan(client,b,objects,state):
     started=time.monotonic();meta=await desk_call(client,'workbook');refs=[];issues=list(meta.get('issues',[]))
     if meta.get('workbook_id')!=configured_workbook():raise RuntimeError('workbook_configuration_mismatch')
-    for sheet in meta['sheets']:
-        if sheet['mode']=='excluded':continue
-        if sheet['type']!='GRID' or not sheet['rows']:raise RuntimeError('sheet_unscannable')
-        start=0
-        while True:
-            state.guard()
-            if time.monotonic()-started>480:raise RuntimeError('scan_expired')
-            d=await desk_call(client,'scan',{'fingerprint':meta['fingerprint'],'bucket':b.name,'objects':[{'file_id':r['file_id'],'name':r['name']} for r in objects],'sheet_id':sheet['id'],'start_row':start})
-            if d.get('fingerprint')!=meta['fingerprint'] or d.get('start_row')!=start:raise RuntimeError('scan_identity_changed')
-            refs.extend(d['references']);issues.extend(d['issues'])
-            nxt=d.get('next_row')
-            await asyncio.sleep(3) # Pace shared Google quota; failures stop this occurrence.
-            if nxt is None:break
-            if not isinstance(nxt,int) or nxt<=start:raise RuntimeError('scan_cursor_invalid')
-            start=nxt
+    for chunks in scan_batches(meta['sheets']):
+        state.guard()
+        if time.monotonic()-started>480:raise RuntimeError('scan_expired')
+        d=await desk_call(client,'scan',{'fingerprint':meta['fingerprint'],'bucket':b.name,'objects':[{'file_id':r['file_id'],'name':r['name']} for r in objects],'chunks':[{'sheet_id':c['sheet_id'],'start_row':c['start_row']} for c in chunks]})
+        results=d.get('results')
+        if d.get('fingerprint')!=meta['fingerprint'] or not isinstance(results,list) or len(results)!=len(chunks) or len({r.get('sheet_id') for r in results})!=len(chunks):raise RuntimeError('scan_batch_incomplete')
+        for chunk in chunks:
+            r=next((r for r in results if r.get('sheet_id')==chunk['sheet_id']),None)
+            nxt=chunk['end_row'] if chunk['end_row']<chunk['rows'] else None
+            if not r or r.get('fingerprint')!=meta['fingerprint'] or r.get('start_row')!=chunk['start_row'] or r.get('end_row')!=chunk['end_row'] or r.get('next_row')!=nxt or not isinstance(r.get('references'),list) or not isinstance(r.get('issues'),list):raise RuntimeError('scan_batch_incomplete')
+        for r in results:refs.extend(r['references']);issues.extend(r['issues'])
+        await asyncio.sleep(3) # Preserve the existing quota headroom for n8n.
     end=await desk_call(client,'workbook')
     if end.get('workbook_id')!=configured_workbook() or end['fingerprint']!=meta['fingerprint']:raise RuntimeError('workbook_changed')
     return refs,issues

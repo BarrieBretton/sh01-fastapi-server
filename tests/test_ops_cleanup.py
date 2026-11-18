@@ -99,3 +99,29 @@ class EndpointTests(unittest.TestCase):
             self.assertTrue(ops_cleanup.social_evidence()['rows'][0]['receipt_verified'])
             store.read=lambda:[row,row]
             self.assertFalse(ops_cleanup.social_evidence()['rows'][0]['receipt_verified'])
+
+class BatchScanTests(unittest.TestCase):
+    def test_bounds_and_coverage(self):
+        import ops_cleanup
+        sheets=[{'id':i,'title':str(i),'mode':'included','type':'GRID','rows':1000,'columns':26,'header_row':1} for i in range(28)]
+        batches=ops_cleanup.scan_batches(sheets)
+        self.assertEqual(len(batches),7)
+        self.assertEqual(len([c for b in batches for c in b]),28)
+        sheets[0]['rows']=6000
+        batches=ops_cleanup.scan_batches(sheets)
+        chunks=[c for b in batches for c in b if c['sheet_id']==0]
+        self.assertEqual(sum(c['end_row']-c['start_row'] for c in chunks),6000)
+        self.assertTrue(all(len({c['sheet_id'] for c in b})==len(b) for b in batches))
+    def test_incomplete_batch_fails_closed_and_keeps_three_second_pacing(self):
+        import ops_cleanup
+        from unittest.mock import AsyncMock,patch
+        sheets=[{'id':1,'title':'streamables','mode':'included','type':'GRID','rows':2,'columns':2,'header_row':1}]
+        meta={'workbook_id':'book','sheets':sheets,'fingerprint':'f'}
+        result={'fingerprint':'f','results':[{'sheet_id':1,'fingerprint':'f','start_row':0,'end_row':2,'next_row':None,'references':[],'issues':[]}]}
+        with patch.object(ops_cleanup,'configured_workbook',return_value='book'),patch.object(ops_cleanup,'desk_call',AsyncMock(side_effect=[meta,result,meta])),patch.object(ops_cleanup.asyncio,'sleep',AsyncMock()) as sleep:
+            asyncio.run(ops_cleanup.scan(None,types.SimpleNamespace(name='bucket'),[],types.SimpleNamespace(guard=lambda:None)))
+            sleep.assert_awaited_once_with(3)
+        result['results']=[]
+        with patch.object(ops_cleanup,'configured_workbook',return_value='book'),patch.object(ops_cleanup,'desk_call',AsyncMock(side_effect=[meta,result])):
+            with self.assertRaisesRegex(RuntimeError,'scan_batch_incomplete'):
+                asyncio.run(ops_cleanup.scan(None,types.SimpleNamespace(name='bucket'),[],types.SimpleNamespace(guard=lambda:None)))
