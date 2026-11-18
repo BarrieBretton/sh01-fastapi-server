@@ -33,7 +33,7 @@ async def _heartbeat(job_id: str, token: str, lost: asyncio.Event):
 
 
 @asynccontextmanager
-async def heavy_request(kind: str):
+async def heavy_request(kind: str, *, minimum_mb: int = 176):
     job_id = "legacy-" + uuid.uuid4().hex
     try:
         token = await asyncio.to_thread(store.queue_acquire_external, job_id, kind, OWNER)
@@ -49,7 +49,7 @@ async def heavy_request(kind: str):
     heartbeat = asyncio.create_task(_heartbeat(job_id, token, lost))
     result = {"job_id": job_id, "status": "complete"}
     try:
-        await asyncio.to_thread(require_memory_headroom, kind)
+        await asyncio.to_thread(require_memory_headroom, kind, minimum_mb=minimum_mb)
         yield
         if lost.is_set():
             raise HTTPException(status_code=503, detail="Lost shared media admission during request")
