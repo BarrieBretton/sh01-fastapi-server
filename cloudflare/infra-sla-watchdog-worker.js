@@ -29,6 +29,8 @@ async function triggerTick(env, dryRun = false) {
   catch { throw new Error("SLA tick returned invalid JSON"); }
   // The control plane returns HTTP 200 for both an unsuccessful tick and a
   // maintenance skip. Surface these in Worker logs and manual /tick responses.
+  // Live ticks are queued jobs; acceptance is separate from recovery success.
+  if (result?.accepted === true && result?.job?.id) return result;
   if (result?.ok !== true || (result.skipped && result.reason !== "another_sla_tick_is_running")) {
     throw new Error(`SLA tick ${String(result?.action || result?.reason || "failed")}`);
   }

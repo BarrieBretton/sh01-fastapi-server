@@ -93,6 +93,11 @@ class SlaRecoveryTests(unittest.TestCase):
         self.sla._routers_in_maintenance = Mock(return_value={"maintenance": True})
         self.sla._load_monitor_state = Mock(return_value=({"hard_stop": True}, 23))
         self.sla._save_monitor_state = Mock()
+        self.sla._candidate_runtime_matches = Mock(return_value={"match": True})
+
+        async def locked(active, revision):
+            return self.sla._recover_hard_stop(active, {"hard_stop": True}, revision, False)
+        self.sla._locked_hard_stop_tick = locked
         self.sla.render_resume_blocker.return_value = None
 
     def test_hard_stop_never_suspends_a_running_service(self):
@@ -133,6 +138,21 @@ class SlaRecoveryTests(unittest.TestCase):
         self.assertEqual(result["active_render"], "render-a")
         self.sla._promote_live_candidate.assert_called_once_with("render-b", "render-a")
         self.assertFalse(self.sla._save_monitor_state.call_args.args[0]["hard_stop"])
+
+    def test_mismatched_healthy_pair_repaired_with_current_storage(self):
+        self.sla.registry.render_slots.return_value = ["render-a", "render-b", "render-c"]
+        self.sla._active_pair_state = Mock(side_effect=lambda slot: {"healthy": slot == "render-c"})
+        self.sla.state.all.return_value = {"render": "render-b", "postgres": "supabase-b", "b2": "b2-a"}
+        self.sla._candidate_runtime_matches = Mock(return_value={"match": False})
+        preview = self.sla.run_sla_tick(dry_run=True)
+        self.assertEqual(preview["mode"], "reconfigure_render")
+        self.sla.run_failover.assert_not_called()
+        result = self.sla.run_sla_tick()
+        self.sla.run_failover.assert_called_once_with(
+            target_render="render-c", target_postgres="supabase-b",
+            target_b2="b2-a", hard_stop_source="render-b",
+        )
+        self.assertEqual(result["action"], "recovered_hard_stop")
 
     def test_failed_router_reopen_restores_both_to_maintenance(self):
         self.sla._active_pair_state = Mock(return_value={"healthy": True})

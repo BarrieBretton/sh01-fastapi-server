@@ -7,6 +7,6 @@
     "crons": ["*/2 * * * *"]
   },
   "vars": {
-    "CONTROL_PLANE_BASE_URL": "https://sh01-fastapi-server-mtwu.onrender.com"
+    "CONTROL_PLANE_BASE_URL": "https://infra-control.vivojaymail.workers.dev"
   }
 }
