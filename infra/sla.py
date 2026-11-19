@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import threading
@@ -401,7 +402,8 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
                        dry_run: bool) -> dict[str, Any]:
     """Recheck a hard stop on every tick; reopen only a healthy, aligned pair."""
     pair = _active_pair_state(active)
-    candidate = active if pair["healthy"] else None
+    candidate = active if pair["healthy"] and _candidate_runtime_matches(active)["match"] else None
+    repair = None
     inspected: dict[str, Any] = {}
 
     if candidate is None:
@@ -415,8 +417,15 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
                     if runtime["match"]:
                         candidate = slot
                         break
+                    if repair is None:
+                        repair = slot
             except Exception as exc:
                 inspected[slot] = {"error": str(exc)}
+
+    mode = "reopen_active" if candidate == active else "fast_promote_live_candidate"
+    if candidate is None and repair is not None:
+        candidate = repair
+        mode = "reconfigure_render"
 
     if dry_run:
         return {
@@ -424,6 +433,7 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
             "action": "would_recover_hard_stop" if candidate else "recovery_pending",
             "active_render": active,
             "recovery_target": candidate,
+            "mode": mode if candidate else None,
             "pair": pair,
             "candidates": inspected,
             "dry_run": True,
@@ -440,7 +450,16 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
         }
 
     try:
-        if candidate != active:
+        if mode == "reconfigure_render":
+            current = state.all()
+            if current.get("render") != active or not current.get("postgres") or not current.get("b2"):
+                raise RuntimeError("Active ring selections unavailable or changed during recovery")
+            run_failover(
+                target_render=candidate, target_postgres=current["postgres"],
+                target_b2=current["b2"], hard_stop_source=active,
+            )
+            promotion = {"reconfigured": candidate}
+        elif candidate != active:
             promotion = _promote_live_candidate(active, candidate)
         else:
             promotion = {"router_actions": _align_routers(active)}
@@ -464,14 +483,14 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
             "hard_stop": False,
             **({"last_failover_at": _now(), "last_failover_from": active,
                 "last_failover_to": candidate,
-                "last_failover_mode": "fast_promote_live_candidate"}
+                "last_failover_mode": mode}
                if candidate != active else {}),
         }, revision + 1)
         return {
             "ok": True,
             "action": "recovered_hard_stop",
             "active_render": candidate,
-            "mode": "fast_promote_live_candidate" if candidate != active else "reopen_active",
+            "mode": mode,
             "result": promotion,
         }
     except Exception as exc:
@@ -482,6 +501,33 @@ def _recover_hard_stop(active: str, monitor: dict[str, Any], revision: int,
             "active_render": active,
             "error": str(exc),
         }
+
+async def _locked_hard_stop_tick(active, revision):
+    """Serialize live recovery across masters using the selected Postgres."""
+    import asyncpg
+    from .postgres import get_postgres_config
+
+    postgres = state.get_active("postgres")
+    config = get_postgres_config(postgres)
+    conn = await asyncpg.connect(**vars(config), timeout=15, statement_cache_size=0)
+    try:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL idle_in_transaction_session_timeout = 0")
+            acquired = await conn.fetchval(
+                "SELECT pg_try_advisory_xact_lock(736801, 1)"
+            )
+            if not acquired:
+                return {"ok": True, "skipped": True, "reason": "another_master_is_recovering"}
+            monitor, latest = await asyncio.to_thread(_load_monitor_state)
+            if latest != revision or not monitor.get("hard_stop"):
+                return {"ok": True, "skipped": True, "reason": "monitor_changed"}
+            await asyncio.to_thread(state.refresh)
+            if state.get_active("render") != active or state.get_active("postgres") != postgres:
+                return {"ok": True, "skipped": True, "reason": "ring_selection_changed"}
+            return await asyncio.to_thread(_recover_hard_stop, active, monitor, latest, False)
+    finally:
+        await conn.close()
+
 
 def sla_status() -> dict[str, Any]:
     monitor, revision = _load_monitor_state()
@@ -504,6 +550,7 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
         }
 
     try:
+        state.refresh()
         active = state.get_active("render")
         if not active or not registry.exists("render", active):
             raise RuntimeError(f"Active Render slot is missing or unknown: {active}")
@@ -511,7 +558,9 @@ def run_sla_tick(dry_run: bool = False) -> dict[str, Any]:
         routers = _routers_in_maintenance()
         monitor, revision = _load_monitor_state()
         if monitor.get("hard_stop"):
-            return _recover_hard_stop(active, monitor, revision, dry_run)
+            if dry_run:
+                return _recover_hard_stop(active, monitor, revision, True)
+            return asyncio.run(_locked_hard_stop_tick(active, revision))
         if routers["maintenance"]:
             return {
                 "ok": True,

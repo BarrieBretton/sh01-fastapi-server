@@ -201,6 +201,7 @@ def run_failover(
     prune_b2_extra: bool = False,
     switch_router: bool = True,
     quiesce_source: bool = True,
+    *, hard_stop_source: str | None = None,
 ) -> dict[str, Any]:
     if not _FAILOVER_LOCK.acquire(blocking=False):
         raise RuntimeError("Another infrastructure failover is already running")
@@ -246,6 +247,11 @@ def run_failover(
     mutations_started = False
 
     try:
+        if hard_stop_source and (
+            previous_render != hard_stop_source or source_postgres != target["postgres"]
+            or source_b2 != target_b2 or target_render == previous_render
+        ):
+            raise RuntimeError("Ring selections changed before Render recovery")
         source_pg_health = postgres_health(source_postgres)
         target_pg_health = postgres_health(target["postgres"])
         if not source_pg_health.get("healthy"):
@@ -295,7 +301,12 @@ def run_failover(
             for role in ("n8n", "sh01"):
                 router_state = preflight[f"{role}_router"]
 
-                if router_state.get("maintenance"):
+                if hard_stop_source:
+                    if router_state.get("maintenance") is not True:
+                        raise RuntimeError(f"{role} must be in maintenance for hard-stop repair")
+                    if render_base_url(target_render, role) not in router_state.get("configured", []):
+                        raise RuntimeError(f"{role} router is missing the recovery target")
+                elif router_state.get("maintenance"):
                     raise RuntimeError(
                         f"{role} router is already in maintenance mode; "
                         "refusing to begin paired failover"
@@ -519,8 +530,8 @@ def run_failover(
         except Exception as exc:
             result["rollback"]["restore_state_error"] = str(exc)
 
-        # Reopen both public entry points only after rollback is complete.
-        if plan["switch_router"]:
+        # A failed hard-stop repair must leave ingress frozen for the next tick.
+        if plan["switch_router"] and not hard_stop_source:
             for role in ("n8n", "sh01"):
                 try:
                     result["rollback"][

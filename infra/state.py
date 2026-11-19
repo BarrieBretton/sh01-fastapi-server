@@ -71,6 +71,20 @@ class InfraState:
         except Exception as exc:
             logger.warning("Could not load durable state; using env defaults: %s", exc)
 
+    def refresh(self) -> None:
+        """Observe durable promotions made by the other controller before a tick."""
+        with self._lock:
+            payload = store.load_state("active_infrastructure")
+            if payload is None:
+                if self._revision:
+                    raise RuntimeError("Cannot verify the persisted infrastructure selection")
+                return
+            revision = int(payload["revision"])
+            if revision < self._revision:
+                raise RuntimeError("Durable infrastructure selection is behind the controller")
+            self._active.update(self._normalize(payload["value"]))
+            self._revision = revision
+
     def get_active(self, infra_type: str) -> str | None:
         with self._lock:
             return self._active.get(infra_type)

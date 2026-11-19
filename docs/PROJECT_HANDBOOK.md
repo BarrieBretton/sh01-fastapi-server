@@ -4,6 +4,19 @@
 
 **Baseline checked:** GitHub `BarrieBretton/sh01-fastapi-server` `main` at `24f8924bd974418e309afdc48d83832f5e244c4e` on 20 October 2026. The operator also reported a successful Kaggle end-to-end branded video render on 20 October 2026. Configuration can change without a Git commit; check live dashboards before changing production.
 
+### Periodic Render hard-stop recovery
+
+The existing infra-sla-watchdog cron example runs every two minutes through the control-plane proxy.
+Check the deployed Worker trigger and CONTROL_PLANE_BASE_URL separately. A Pulsetic GET does
+not submit an SLA job. A live tick returns a job ID; inspect /infra/jobs/{id} for completion.
+During hard stop the monitor prefers an aligned healthy pair. If only a healthy mismatched
+standby exists, the dry run reports reconfigure_render. A live job uses the existing
+quiesce, configure, deploy, health-check and route sequence with the selected Postgres
+and B2 slots pinned. Both routers must already be in maintenance for this repair.
+Failed repair retains maintenance. Live hard-stop ticks share a transaction advisory lock
+on the selected Postgres. This lock coordinates recovery among upgraded masters using the
+same database; it does not provide application-level workflow deduplication.
+
 ## How to read and update this handbook
 
 ### Clickouts consumer — configuration correction, November 2026

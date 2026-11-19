@@ -17,6 +17,9 @@ def require_control_plane_key(
         alias="X-API-KEY",
     ),
 ) -> None:
+    if os.getenv("SH01_ROLE", "").strip().lower() != "controller":
+        raise HTTPException(status_code=403, detail="Controller role required")
+
     if not CONTROL_PLANE_API_KEY:
         raise HTTPException(
             status_code=500,
