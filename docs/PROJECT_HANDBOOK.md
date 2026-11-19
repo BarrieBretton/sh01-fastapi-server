@@ -447,3 +447,11 @@ until verified externally when Snap omits an identifier. Unknown publication out
 are never automatically replayed. No posts or B2 files were deleted during this work.
 See [Snapchat setup](SNAPCHAT-SETUP.md) for configuration, workbook schema, deployment
 and the first-publication acceptance checks.
+
+
+
+## n8n workflow coordination patch — 19 November 2026
+
+Code: `workflow_guards.py` and `scripts/sh01_workflow_transform.py` add explicit shared-workbook dispatch reservations and fenced Telegram render-state commits. See [WORKFLOW-GUARDS.md](WORKFLOW-GUARDS.md) for rollout, credentials, at-most-once limitations, state capacity, and manual recovery. Backend deployment does not rewrite n8n graphs or initialize the hidden state. Separate guarded workflow installation is required.
+
+Observed: operator supplied a C inventory of 69 workflows, 23 active, and live exports of the master scheduler and Telegram render worker. Both lacked graph-level cross-instance admission. The render handlers rejected queued status. Offline reproduction confirmed the first-target dispatch bug and queued-response retry corruption. Historical duplicate publishing, effective API credential targets, and full ring admission remain unverified. No Render/Supabase selection is changed by this patch.

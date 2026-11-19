@@ -2789,6 +2789,10 @@ def start_cron_scheduler():
 # Worker startup hook (runs in every uvicorn worker)
 # =====================================================
 
+# Shared scheduling/queue coordination; no startup mutations.
+from workflow_guards import router as workflow_guards_router
+app.include_router(workflow_guards_router)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
@@ -2798,3 +2802,4 @@ else:
         start_cron_scheduler()
     except Exception as e:
         logger.error("Failed to initialize cron master: %s", e)
+
