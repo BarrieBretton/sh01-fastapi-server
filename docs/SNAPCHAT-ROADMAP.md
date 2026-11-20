@@ -1,11 +1,11 @@
 # Snapchat integration: development roadmap
 
-Last updated: 18 November 2026 (IST).
+Updated 20 November 2026 (IST).
 
 This is the canonical tracker for the SH01 Snapchat development lane. The first
-pilot is implemented and tested offline. Deployment, account authorization, real
-publication and revenue have **not been verified in this conversation**. Do not
-mark a live milestone complete merely because its code exists.
+pilot merged into both deployment branches on 18 November. The next milestone
+is an authenticated status check through the SH01 router, with publishing paused.
+Snap account authorization, publication and revenue still require live evidence.
 
 ## Repositories and reference documents
 
@@ -44,7 +44,7 @@ not a claim about the repositories' current remote heads or deployed revisions.
 |---|---|---|---|
 | SC-01 | Server publishing foundation | Implemented; offline verified | OAuth, prepared-video upload, separate Story/Spotlight destinations, durable job/occurrence records and duplicate protection |
 | SC-02 | Operations Desk integration | Implemented; DOM tests pass; browser layout unverified | Readiness, cell links, progress/history, analytics, visible loading and session locking |
-| SC-03 | Repository deployment | Pending confirmation | Record merged PRs, deployed backend/Worker revisions, and authenticated health response with publishing paused |
+| SC-03 | Repository deployment | Pilot merges verified on both branches. Authenticated Snapchat health is pending. | Record deployed backend/Worker revisions and a paused health response through the router |
 | SC-04 | Snapchat access and account authorization | Pending confirmation; external prerequisite | Obtain the appropriate API access, configure profile/app, complete OAuth and verify profile read |
 | SC-05 | First manual publication | Pending SC-03/04 | Publish owned test content; distinguish API acceptance from actual visibility; measure resource use |
 | SC-06 | Scheduled production pilot | Pending SC-05 | Demonstrate correct IST execution and restart/duplicate behavior before expanding cadence |
@@ -70,8 +70,10 @@ not a claim about the repositories' current remote heads or deployed revisions.
 
 ### SC-03 / SC-04: immediate next work
 
-1. Apply the single installer patch to the intended repositories; record the PRs
-   and confirm deployments of backend `main` and dashboard `master`.
+1. In **Producers → Snapchat publishing**, use **Refresh status**. For a direct
+   read-only check, use the stable SH01 router command in the setup guide.
+   Record the reported revision, publishing flag and next step. A response from
+   a suspended direct Render hostname left this check open.
 2. Keep publishing paused and Snapchat schedule timings blank during connection tests.
 3. Create/configure the intended creator Public Profile and business OAuth app;
    obtain API access. Follow the official access instructions linked below.
@@ -159,7 +161,8 @@ precisely. Link relevant PRs, test results, redacted job evidence and workbook c
 |---|---|---|---|
 | 18 Nov 2026 | SC-01/02 pilot packaged | `apply_sh01_snapchat.py`; 504 offline tests and real MP4 metadata check | Confirm deployment and API access |
 | 18 Nov 2026 | Dedicated roadmap added | This document; dashboard pointer; application code unchanged | Maintain this tracker through activation and subsequent PRs |
-| Pending | Deployment / first live post / scheduled run | No verified evidence recorded yet | Add deployed revisions, timestamps and redacted outcomes as they are observed |
+| 20 Nov 2026 | SC-03 pilot merges verified | [Backend PR 2](https://github.com/BarrieBretton/sh01-fastapi-server/pull/2) at `02adbdf` and [Operations Desk PR 1](https://github.com/BarrieBretton/SH01-Operations-Dashboard-Cloudflare/pull/1) at `4c05b3d` | Record authenticated health through the stable router |
+| 20 Nov 2026 | SC-03/04 setup diagnostics | Offline tests cover an uninitialized workbook, missing Google configuration, app/profile changes and a new OAuth grant whose profile read has yet to succeed | Follow the returned `next_step` and record the first successful authorized profile read |
 
 Before handing this lane to another engineer or AI, record the latest completed
 milestone, active blocker, next concrete action, deployment revisions and unresolved

@@ -33,7 +33,7 @@ def values(item='one', destination='spotlight'):
 class State:
     def __init__(self):
         self.values, self.writes, self.owner = {}, [], None
-        self.control = {'lease': None}; self.fail = None
+        self.control = {'lease': None, 'verified': True}; self.fail = None
     def get(self, key): return copy.deepcopy(self.values.get(key))
     def put(self, key, value): self.guard(); self.commit({key: value})
     def commit(self, values, **control):
@@ -131,6 +131,93 @@ class ServiceTests(unittest.TestCase):
     def test_preview_is_read_only_and_secret_free(self):
         self.service.preview(); self.assertFalse(self.state.writes); self.assertEqual(self.provider.posts,0)
         self.assertNotIn('PRIVATE',json.dumps(self.service.preview()))
+
+    def test_health_before_setup_reads_the_state_once(self):
+        with patch.object(self.state, 'load', return_value=False) as load, patch.object(self.state, 'get', side_effect=AssertionError):
+            result = self.service.health()
+        load.assert_called_once_with()
+        self.assertEqual(result['workbook_state'], 'setup_required')
+        self.assertEqual(result['next_step'], 'initialize_workbook')
+        self.assertEqual(len(result['schedules']), 2)
+        self.assertFalse(self.state.writes)
+
+    def test_partial_setup_requires_explicit_initialization(self):
+        self.state.control['verified'] = False
+        self.assertEqual(self.service.health()['next_step'], 'initialize_workbook')
+        self.assertFalse(self.state.writes)
+
+    def test_health_distinguishes_unavailable_state_and_schedule(self):
+        with patch.object(self.state, 'load', side_effect=SnapError('sheets_unavailable')):
+            result = self.service.health()
+        self.assertEqual(result['state_error'], 'sheets_unavailable')
+        self.assertEqual(result['workbook_state'], 'unknown')
+        self.assertEqual(result['authorization'], 'unknown')
+        self.assertEqual(result['next_step'], 'check_workbook_access')
+        self.assertEqual(len(result['schedules']), 2)
+
+    def test_health_survives_missing_google_configuration_on_normal_route(self):
+        app = FastAPI()
+        app.include_router(router)
+        with patch.dict('os.environ', {'MEDIA_CLIP_API_KEY': 'test-key'}, clear=True):
+            response = TestClient(app).get('/snapchat/health', headers={'X-API-KEY': 'test-key'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        result = response.json()
+        self.assertFalse(result['enabled'])
+        self.assertIn('SNAPCHAT_CLIENT_ID', result['missing_configuration'])
+        self.assertEqual(result['state_error'], 'spreadsheet_not_configured')
+        self.assertEqual(result['schedule_error'], result['state_error'])
+        self.assertEqual(result['next_step'], 'check_workbook_access')
+
+    def test_health_explains_missing_and_malformed_snap_settings(self):
+        self.service.config = replace(self.cfg, profile_id='')
+        self.assertEqual(self.service.health()['missing_configuration'], ['SNAPCHAT_PROFILE_ID'])
+        self.assertEqual(self.service.health()['next_step'], 'configure_snapchat')
+        self.service.config = replace(self.cfg, profile_id='incorrect')
+        result = self.service.health()
+        self.assertEqual(result['configuration_error'], 'snapchat_profile_id_invalid')
+        self.assertEqual(result['next_step'], 'configure_snapchat')
+        self.assertFalse(self.state.writes)
+
+    def test_health_displays_historical_read_for_matching_app_and_profile_only(self):
+        self.state.values['connection'] = {'id': PROFILE, 'display_name': 'Creator'}
+        self.assertEqual(self.service.health()['next_step'], 'check_profile_access')  # legacy evidence
+        self.state.values['connection']['client_id'] = 'other-app'
+        self.assertEqual(self.service.health()['api_access'], 'not_verified')
+        self.service.check_connection()
+        self.state.writes.clear()
+        self.service.client_factory = lambda *args: self.fail('Health contacted Snapchat')
+        result = self.service.health()
+        self.assertEqual(result['api_access'], 'profile_read_verified_previously')
+        self.assertEqual(result['next_step'], 'review_queue')
+        self.assertNotIn('client_id', result['connection'])
+        self.assertFalse(self.state.writes)
+
+    def test_failed_or_absent_tokens_never_reuse_a_previous_profile_read(self):
+        self.service.check_connection()
+        self.state.values['oauth_tokens']['refresh_pending'] = True
+        result = self.service.health()
+        self.assertEqual(result['next_step'], 'reconnect_snapchat')
+        self.assertNotIn('connection', result)
+        self.state.values['oauth_tokens'] = {'encrypted': 'PRIVATE-CIPHERTEXT'}
+        result = self.service.health()
+        self.assertEqual(result['next_step'], 'check_encryption_key')
+        self.assertEqual(result['authorization_error'], 'snapchat_encrypted_state_unreadable')
+        self.assertNotIn('PRIVATE-CIPHERTEXT', json.dumps(result))
+        del self.state.values['oauth_tokens']
+        self.assertEqual(self.service.health()['next_step'], 'connect_snapchat')
+
+    def test_new_grant_atomically_clears_earlier_profile_read_until_verified(self):
+        self.service.check_connection()
+        self.state.acquire()
+        client = SnapClient(self.cfg, self.state)
+        client.save_tokens({'access_token': 'sample-access', 'refresh_token': 'sample-refresh',
+                            'expires_in': 3600, 'scope': 'snapchat-profile-api'})
+        self.assertEqual(set(self.state.writes[-1]), {'oauth_tokens', 'connection'})
+        self.state.release()
+        result = self.service.health()
+        self.assertEqual(result['next_step'], 'check_profile_access')
+        self.assertNotIn('sample-refresh', json.dumps(result))
     def test_disabled_manual_and_schedule(self):
         self.service.config=replace(self.cfg,enabled=False)
         with self.assertRaisesRegex(SnapError,'disabled'):self.enqueue()

@@ -461,6 +461,13 @@ are never automatically replayed. No posts or B2 files were deleted during this 
 See [Snapchat setup](SNAPCHAT-SETUP.md) for configuration, workbook schema, deployment
 and the first-publication acceptance checks.
 
+The 20 November activation check uses the stable SH01 router. Authenticated
+`GET /snapchat/health` reports configuration, workbook initialization, cached
+app/profile evidence and one next step. A new OAuth grant clears the previous
+profile check in the same workbook update. Refreshing status only reads state.
+The pilot is merged in both repositories. An authenticated live check and Snap
+Public Profile API approval are still outstanding in the evidence log.
+
 
 
 ## n8n workflow coordination patch — 19 November 2026
