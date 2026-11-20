@@ -18,45 +18,100 @@ def safe_code(exc):
     return str(exc) if isinstance(exc, (SnapError, ClickoutError)) and re.fullmatch(r'[a-z][a-z0-9_]{0,100}', str(exc)) else 'snapchat_operation_failed'
 
 
+def activation_step(health):
+    if health.get('state_error'):
+        return 'check_workbook_access'
+    if health['workbook_state'] == 'setup_required':
+        return 'initialize_workbook'
+    if health['missing_configuration'] or health.get('configuration_error'):
+        return 'configure_snapchat'
+    if health.get('authorization_error'):
+        return 'check_encryption_key'
+    if health['authorization'] == 'reconnect_required':
+        return 'reconnect_snapchat'
+    if health['authorization'] != 'credentials_stored':
+        return 'connect_snapchat'
+    if health['api_access'] != 'profile_read_verified_previously':
+        return 'check_profile_access'
+    return 'review_queue'
+
+
 class Service:
     def __init__(self, config=None, workbook=None, client_factory=SnapClient, clock=time.time):
         self.config = config or Config.env()
-        self.book = workbook or Workbook(self.config)
-        self.state = self.book.state
+        self._book = workbook
         self.client_factory, self.clock = client_factory, clock
+
+    @property
+    def book(self):
+        if self._book is None:
+            self._book = Workbook(self.config)
+        return self._book
+
+    @property
+    def state(self):
+        return self.book.state
 
     def client(self):
         return self.client_factory(self.config, self.state)
 
     def health(self):
-        result = {'revision': 'snapchat-v1', 'enabled': self.config.enabled, 'missing_configuration': self.config.missing(),
-                  'profile_id': self.config.profile_id, 'authorization': 'not_connected', 'api_access': 'not_verified',
+        result = {'revision': 'snapchat-v2', 'enabled': self.config.enabled, 'missing_configuration': self.config.missing(),
+                  'profile_id': self.config.profile_id, 'workbook_state': 'unknown', 'authorization': 'unknown', 'api_access': 'not_verified',
                   'monetization_eligibility': 'not_determined', 'checked_at': utcnow(), 'schedules': [], 'jobs': []}
+        if not result['missing_configuration']:
+            try:
+                self.config.validate()
+            except SnapError as exc:
+                result['configuration_error'] = safe_code(exc)
         try:
-            self.state.load()
-            token = self.state.get('oauth_tokens')
-            if token:
-                result['authorization'] = 'reconnect_required' if token.get('refresh_pending') else 'credentials_stored'
-                if not self.config.missing():
-                    data = self.config.unseal(token['encrypted'])
-                    if data.get('client_id') != self.config.client_id or data.get('profile_id') != self.config.profile_id:
-                        result['authorization'] = 'reconnect_required'
-            connection = self.state.get('connection')
-            if connection and connection.get('id') == self.config.profile_id:
-                result['connection'] = connection
-                result['api_access'] = 'profile_read_verified_previously'
-            lease = (self.state.control or {}).get('lease') or {}
-            jobs = [public_job(v) for k, v in self.state.values.items() if k.startswith('job:') and v.get('profile_id') == self.config.profile_id]
-            for j in jobs:
-                if j['status'] in {'running', 'publishing'} and lease.get('until', 0) <= self.clock():
-                    j['status'] = 'outcome_unknown' if j['status'] == 'publishing' else 'interrupted_before_publication'
-            result['jobs'] = sorted(jobs, key=lambda j: j['created_at'], reverse=True)[:100]
-            result['last_tick'] = self.state.get('last_tick')
-            result['metrics'] = self.state.get('metrics:' + self.config.profile_id)
-        except Exception as exc: result['state_error'] = safe_code(exc)
-        try: result['schedules'] = schedules(self.book.google.schedule_rows())
-        except Exception as exc: result['schedule_error'] = safe_code(exc)
+            book = self.book
+        except Exception as exc:
+            result['state_error'] = result['schedule_error'] = safe_code(exc)
+        else:
+            try:
+                state = book.state
+                if state.load() and state.control['verified']:
+                    result['workbook_state'] = 'initialized'
+                    self._read_health_snapshot(result, state)
+                else:
+                    result['workbook_state'] = 'setup_required'
+            except Exception as exc:
+                result['state_error'] = safe_code(exc)
+            try:
+                result['schedules'] = schedules(book.google.schedule_rows())
+            except Exception as exc:
+                result['schedule_error'] = safe_code(exc)
+        result['next_step'] = activation_step(result)
         return result
+
+    def _read_health_snapshot(self, result, state):
+        token = state.get('oauth_tokens')
+        if not token:
+            result['authorization'] = 'not_connected'
+        elif token.get('refresh_pending'):
+            result['authorization'] = 'reconnect_required'
+        elif not result['missing_configuration'] and 'configuration_error' not in result:
+            try:
+                data = self.config.unseal(token['encrypted'])
+            except SnapError as exc:
+                result['authorization_error'] = safe_code(exc)
+            else:
+                same_account = data.get('client_id') == self.config.client_id and data.get('profile_id') == self.config.profile_id
+                result['authorization'] = 'credentials_stored' if same_account else 'reconnect_required'
+        connection = state.get('connection') or {}
+        if (result['authorization'] == 'credentials_stored' and connection.get('id') == self.config.profile_id
+                and connection.get('client_id') == self.config.client_id):
+            result['connection'] = {key: connection[key] for key in ('id', 'display_name', 'checked_at') if key in connection}
+            result['api_access'] = 'profile_read_verified_previously'
+        lease = state.control.get('lease') or {}
+        jobs = [public_job(v) for k, v in state.values.items() if k.startswith('job:') and v.get('profile_id') == self.config.profile_id]
+        for j in jobs:
+            if j['status'] in {'running', 'publishing'} and lease.get('until', 0) <= self.clock():
+                j['status'] = 'outcome_unknown' if j['status'] == 'publishing' else 'interrupted_before_publication'
+        result['jobs'] = sorted(jobs, key=lambda j: j['created_at'], reverse=True)[:100]
+        result['last_tick'] = state.get('last_tick')
+        result['metrics'] = state.get('metrics:' + self.config.profile_id)
 
     def preview(self):
         self.state.load()
@@ -92,15 +147,19 @@ class Service:
             result = client.transport(TOKEN, method='POST', form={'grant_type': 'authorization_code', 'code': code,
                 'client_id': self.config.client_id, 'client_secret': self.config.client_secret, 'redirect_uri': self.config.redirect_uri})
             client.save_tokens(result)
-            profile = client.profile()
-            self.state.put('connection', profile)
+            profile = self._verify_profile(client)
         return {'status': 'connected', 'profile': profile, 'publishing_enabled': self.config.enabled}
 
     def check_connection(self):
         self.config.validate()
         with locked(self.state):
-            profile = self.client().profile(); self.state.put('connection', profile)
+            profile = self._verify_profile(self.client())
         return {'status': 'profile_read_verified', 'profile': profile, 'publishing_permission': 'requires_first_publish_test'}
+
+    def _verify_profile(self, client):
+        profile = client.profile()
+        self.state.put('connection', {**profile, 'client_id': self.config.client_id})
+        return profile
 
     def require_enabled(self):
         self.config.validate()

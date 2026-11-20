@@ -38,7 +38,7 @@ encryption key**. Keep secrets in the hosting environment, never Git or sheet ce
 | `SNAPCHAT_CLIENT_ID` | The allowlisted business OAuth application's client ID |
 | `SNAPCHAT_CLIENT_SECRET` | Its client secret |
 | `SNAPCHAT_PROFILE_ID` | The Public Profile UUID, not the username |
-| `SNAPCHAT_REDIRECT_URI` | For example `https://sh01.onrender.com/snapchat/oauth/callback`; register this exact URL with Snap |
+| `SNAPCHAT_REDIRECT_URI` | Register `https://sh01.vivojaymail.workers.dev/snapchat/oauth/callback` with the Snap business OAuth app and use the identical value on the SH01 media workers |
 | `SNAPCHAT_TOKEN_ENCRYPTION_KEY` | A new Fernet-compatible key; preserve it across deployments |
 | `SNAPCHAT_SOURCE_HOSTS` | Exact comma-separated source hosts, e.g. `f005.backblazeb2.com`; no protocols, paths or wildcard |
 | `SNAPCHAT_ENABLED` | Start with `0`; use `1` only after authorization and content review |
@@ -60,7 +60,11 @@ the existing cgroup reserve and operator override still apply. Actual peak memor
 on your Render instance must be measured during the pilot.
 
 The dashboard uses the existing `MEDIA_CLIP_API_KEY` and `OPS_INFRA_MEDIA_URL`.
-If no media URL is configured, this bridge uses `https://sh01.onrender.com`.
+The updated Snapchat bridge defaults to the SH01 router at
+`https://sh01.vivojaymail.workers.dev`. An explicit `OPS_INFRA_MEDIA_URL` takes precedence.
+If it points directly to a Render service, the desk will keep calling that service
+across a failover. Older desk versions can also use the stable router via this setting.
+For an existing OAuth app, add the router callback in Snap before changing the backend value.
 
 ## Connect and prepare content
 
@@ -191,20 +195,45 @@ one-time-state-protected OAuth callback. The desk uses its existing dashboard to
 | GET /snapchat/metrics | Read cached metrics |
 | POST /snapchat/metrics/refresh | Collect metrics within cooldown limits |
 
-Read-only post-deployment check from PowerShell:
+### Read-only activation check
+
+Open **Producers → Snapchat publishing → Refresh status**, or run this from any
+PowerShell directory. Both routes use the same health check. A check reads the
+workbook and cached profile evidence. It does not initialize tabs, refresh OAuth,
+fetch media, consume a schedule occurrence or publish content.
 
 ```powershell
 & {
     $ErrorActionPreference = 'Stop'
-    $secure = Read-Host 'Existing MEDIA_CLIP_API_KEY' -AsSecureString
-    $key = [System.Net.NetworkCredential]::new('', $secure).Password
+    $key = $env:MEDIA_CLIP_API_KEY
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        $secure = Read-Host 'Existing MEDIA_CLIP_API_KEY' -AsSecureString
+        $key = [System.Net.NetworkCredential]::new('', $secure).Password
+    }
     try {
-        Invoke-RestMethod -Uri 'https://sh01.onrender.com/snapchat/health' `
-            -Headers @{ 'X-API-KEY' = $key } -TimeoutSec 60 | ConvertTo-Json -Depth 12
+        Invoke-RestMethod -Uri 'https://sh01.vivojaymail.workers.dev/snapchat/health' `
+            -Headers @{ 'X-API-KEY' = $key } -TimeoutSec 90 |
+            Select-Object revision, enabled, workbook_state, authorization, api_access, next_step,
+                missing_configuration, configuration_error, state_error, authorization_error, schedule_error |
+            ConvertTo-Json -Depth 4
     }
     finally { Remove-Variable key, secure -ErrorAction SilentlyContinue }
 }
 ```
+
+| Returned `next_step` | Operator action |
+|---|---|
+| `check_workbook_access` | Inspect `state_error`. Verify Google workbook access or the existing Snapchat state if its integrity check failed. |
+| `initialize_workbook` | Choose **Initialize Snapchat queue** to create or finish initializing the workbook storage. |
+| `configure_snapchat` | Supply the listed missing settings or correct the reported configuration error on the SH01 media workers. |
+| `check_encryption_key` | Verify the original shared encryption key used for stored OAuth and job data. |
+| `connect_snapchat` / `reconnect_snapchat` | With the business app allowlisted, choose **Connect Snapchat** and authorize the intended profile. |
+| `check_profile_access` | Choose **Check API connection** once. Older stored checks also need this step to identify which app verified the profile. |
+| `review_queue` | A previous read succeeded for the configured app and profile. Choose **Load content queue** and review the source row before the manual pilot. |
+
+The `snapchat-v1` health response still reports missing settings and connection state.
+The additional workbook and next-step fields appear with `snapchat-v2`.
+Schedule read errors are reported separately so a paused setup can still be inspected.
 
 ## Validation scope
 

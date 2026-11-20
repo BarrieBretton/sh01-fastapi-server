@@ -168,7 +168,14 @@ class SnapClient:
         if 'snapchat-profile-api' not in str(scopes).split(): raise SnapError('snapchat_profile_scope_missing')
         payload = {'access_token': access, 'refresh_token': refresh, 'scope': scopes, 'expires_at': self.clock() + expiry,
                    'client_id': self.config.client_id, 'profile_id': self.config.profile_id}
-        self.state.put('oauth_tokens', {'encrypted': self.config.seal(payload), 'refresh_pending': False})
+        record = {'encrypted': self.config.seal(payload), 'refresh_pending': False}
+        if previous is None:
+            # A new OAuth grant needs its own successful profile read. Invalidate
+            # the earlier evidence in the same guarded write as the new tokens.
+            self.state.guard()
+            self.state.commit({'oauth_tokens': record, 'connection': {}})
+        else:
+            self.state.put('oauth_tokens', record)
         return access
 
     def token(self):
